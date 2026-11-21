@@ -1,6 +1,7 @@
 import array
 import math
 import os
+import sys
 import threading
 import time
 import wave
@@ -22,7 +23,11 @@ from Chorus import ChorusProcessor, ChorusWindow
 from Compressor import CompressorProcessor, CompressorWindow
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.join(os.path.expanduser("~"), "Music", "Mini-DAW")
+    os.makedirs(BASE_DIR, exist_ok=True)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MIN_FADER_DB = -60.0
 MAX_FADER_DB = 6.0
@@ -1287,7 +1292,7 @@ class Window:
         # Build main Tkinter window
         self.root = tk.Tk()
         self.root.geometry("1120x788")
-        self.root.title("Audio Player and Mixer")
+        self.root.title("Mini-DAW")
         self.root.resizable(False, False)
         self.root.configure(bg=self.THEME["bg_root"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
