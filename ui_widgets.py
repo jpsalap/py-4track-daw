@@ -14,7 +14,7 @@ import math
 import os
 import time
 
-from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -51,8 +51,12 @@ def format_timecode(seconds):
 
 
 def format_ruler_time(seconds, step_sec):
-    """Format timeline ruler label, switching to tenths of a second when zoomed in or short."""
+    """Format timeline ruler label, adapting precision from whole seconds down to 10 ms when zoomed in."""
     sec = max(0.0, float(seconds))
+    if step_sec < 0.1:
+        mins = int(sec // 60)
+        rem = sec - mins * 60
+        return f"{mins:02d}:{rem:05.2f}"
     if step_sec < 1.0:
         mins = int(sec // 60)
         rem = sec - mins * 60
@@ -1152,7 +1156,10 @@ class _TimelineCanvas(QWidget):
     seekRequested = Signal(float)
     positionScrubbed = Signal(float)
     zoomChanged = Signal(float)
+    detailRequested = Signal(float, float, int)
     fileDroppedOnChannel = Signal(int, str)
+
+    MAX_ZOOM = 50.0
 
     # (accent_stripe, clip_bg, header_bg, peak_fill, rms_fill)
     TRACK_THEMES = [
@@ -1183,6 +1190,7 @@ class _TimelineCanvas(QWidget):
         self._scroll_frac = 0.0
 
         self._tracks = [None, None, None, None]
+        self._track_details = [None, None, None, None]  # (bins, start_sec, end_sec) for zoomed high-res slice
         self._audible = [True, True, True, True]
 
         self._rec_armed = []
@@ -1196,6 +1204,27 @@ class _TimelineCanvas(QWidget):
         self._static_cache = None
         self._cache_dpr = 0.0
         self._cache_dirty = True
+
+        # Debounced high-res zoomed waveform detail request
+        self._detail_timer = QTimer(self)
+        self._detail_timer.setSingleShot(True)
+        self._detail_timer.setInterval(55)
+        self._detail_timer.timeout.connect(self._emit_detail_request)
+
+    def _schedule_detail_refresh(self):
+        if self._zoom > 1.5 and self._duration > 0.0 and any(t is not None for t in self._tracks):
+            self._detail_timer.start()
+        else:
+            self._detail_timer.stop()
+            self._track_details = [None, None, None, None]
+
+    def _emit_detail_request(self):
+        if self._zoom <= 1.5 or self._duration <= 0.0:
+            return
+        start_sec, end_sec, _ = self._visible_window()
+        if end_sec > start_sec:
+            target_bins = max(400, int(self._lane_span() * 1.25))
+            self.detailRequested.emit(start_sec, end_sec, target_bins)
 
     def invalidate_cache(self):
         self._cache_dirty = True
@@ -1247,7 +1276,7 @@ class _TimelineCanvas(QWidget):
         return idx if 0 <= idx < 4 else -1
 
     def set_zoom(self, zoom, anchor_frac=None):
-        new_zoom = max(1.0, min(12.0, float(zoom)))
+        new_zoom = max(1.0, min(self.MAX_ZOOM, float(zoom)))
         if abs(new_zoom - self._zoom) < 1e-4:
             return
         old_vis = 1.0 / self._zoom
@@ -1267,6 +1296,7 @@ class _TimelineCanvas(QWidget):
         self._scroll_frac = max(0.0, min(1.0 - new_vis, anchor_global - anchor_frac * new_vis))
         self.zoomChanged.emit(self._zoom)
         self.invalidate_cache()
+        self._schedule_detail_refresh()
 
     def set_scroll_frac(self, frac):
         max_scroll = max(0.0, 1.0 - 1.0 / self._zoom)
@@ -1274,6 +1304,7 @@ class _TimelineCanvas(QWidget):
         if abs(clamped - self._scroll_frac) > 1e-5:
             self._scroll_frac = clamped
             self.invalidate_cache()
+            self._schedule_detail_refresh()
 
     def zoom(self):
         return self._zoom
@@ -1294,6 +1325,7 @@ class _TimelineCanvas(QWidget):
             self._scroll_frac = max(0.0, min(max_scroll, pos_frac - vis_frac * 0.15))
             self._cache_dirty = True
             self.zoomChanged.emit(self._zoom)
+            self._schedule_detail_refresh()
 
     def _update_playhead_region(self):
         """Trigger a minimal dirty-rect repaint covering only old + new playhead x positions."""
@@ -1345,11 +1377,25 @@ class _TimelineCanvas(QWidget):
             return
         super().mouseReleaseEvent(event)
 
+    def event(self, ev):
+        if ev.type() == QEvent.Type.NativeGesture:
+            if ev.gestureType() == Qt.NativeGestureType.ZoomNativeGesture:
+                if self._effective_duration() > 0.0:
+                    anchor = max(0.0, min(1.0, (ev.position().x() - self.HEADER_W) / self._lane_span()))
+                    factor = max(0.5, min(2.0, 1.0 + float(ev.value())))
+                    self.set_zoom(self._zoom * factor, anchor_frac=anchor)
+                ev.accept()
+                return True
+        return super().event(ev)
+
     def wheelEvent(self, event):
         if self._effective_duration() <= 0.0:
             return
         dy = event.angleDelta().y()
         dx = event.angleDelta().x()
+        if dy == 0 and dx == 0:
+            dy = event.pixelDelta().y() * 3
+            dx = event.pixelDelta().x() * 3
         mods = event.modifiers()
 
         if (abs(dx) > abs(dy) or (mods & Qt.KeyboardModifier.ShiftModifier)) and self._zoom > 1.0:
@@ -1362,7 +1408,8 @@ class _TimelineCanvas(QWidget):
 
         if dy != 0:
             anchor = max(0.0, min(1.0, (event.position().x() - self.HEADER_W) / self._lane_span()))
-            factor = 1.18 if dy > 0 else (1.0 / 1.18)
+            # Smooth proportional zoom: works naturally for both trackpads and mouse wheels
+            factor = max(0.76, min(1.32, 1.003 ** dy))
             self.set_zoom(self._zoom * factor, anchor_frac=anchor)
             event.accept()
 
@@ -1544,7 +1591,6 @@ class _TimelineCanvas(QWidget):
                 p.setPen(QPen(QColor("#243c54"), 1.0))
                 p.drawLine(QPointF(clip_rect.left() + 1.0, wf_mid), QPointF(clip_rect.right() - 1.0, wf_mid))
 
-                n_bins = len(envelope)
                 vis_t0 = max(0.0, start_sec)
                 vis_t1 = min(track_dur, end_sec)
                 if vis_t1 <= vis_t0:
@@ -1553,10 +1599,28 @@ class _TimelineCanvas(QWidget):
                 vx0 = self._sec_to_x(vis_t0)
                 vx1 = self._sec_to_x(vis_t1)
                 vis_w = max(2.0, vx1 - vx0)
-                n_pts = max(2, min(n_bins, int(vis_w / 1.5)))
 
-                b_start = (vis_t0 / track_dur) * (n_bins - 1)
-                b_end = (vis_t1 / track_dur) * (n_bins - 1)
+                # Use high-res zoomed detail slice if it covers the visible window, else base envelope
+                src_env = envelope
+                src_t0 = 0.0
+                src_t1 = track_dur
+                detail = self._track_details[ch]
+                if detail is not None:
+                    d_bins, d_s, d_e = detail
+                    if d_bins and d_e > d_s:
+                        tol = max(0.02, (vis_t1 - vis_t0) * 0.05)
+                        if d_s <= vis_t0 + tol and d_e >= vis_t1 - tol:
+                            src_env = d_bins
+                            src_t0 = d_s
+                            src_t1 = d_e
+
+                n_bins = len(src_env)
+                src_span = max(1e-6, src_t1 - src_t0)
+                n_pts = max(2, min(int(vis_w / 1.25), max(2, n_bins)))
+
+                b_start = max(0.0, (vis_t0 - src_t0) / src_span) * (n_bins - 1)
+                b_end = min(1.0, (vis_t1 - src_t0) / src_span) * (n_bins - 1)
+                bins_per_pt = (b_end - b_start) / float(max(1, n_pts - 1))
 
                 pk_top = []
                 pk_bot = []
@@ -1565,14 +1629,47 @@ class _TimelineCanvas(QWidget):
 
                 for idx_p in range(n_pts):
                     frac_p = idx_p / float(max(1, n_pts - 1))
-                    b_idx = int(round(b_start + frac_p * (b_end - b_start)))
-                    b_idx = max(0, min(n_bins - 1, b_idx))
-                    item = envelope[b_idx]
-                    if isinstance(item, tuple):
-                        lo_v, hi_v, rms_v = item
+                    center_b = b_start + frac_p * (b_end - b_start)
+                    if bins_per_pt > 1.2:
+                        # Aggregate true min/max/RMS across all bins mapped to this pixel (zero aliasing!)
+                        i0 = max(0, int(math.floor(center_b - 0.5 * bins_per_pt)))
+                        i1 = min(n_bins - 1, int(math.ceil(center_b + 0.5 * bins_per_pt)))
+                        lo_v = 0.0
+                        hi_v = 0.0
+                        rms_v = 0.0
+                        for bi in range(i0, i1 + 1):
+                            it = src_env[bi]
+                            if isinstance(it, tuple):
+                                l_b, h_b, r_b = it
+                            else:
+                                v = float(it)
+                                l_b, h_b, r_b = -v, v, v * 0.65
+                            if l_b < lo_v:
+                                lo_v = l_b
+                            if h_b > hi_v:
+                                hi_v = h_b
+                            if r_b > rms_v:
+                                rms_v = r_b
                     else:
-                        v = float(item)
-                        lo_v, hi_v, rms_v = -v, v, v * 0.65
+                        # Linearly interpolate between adjacent bins when zoomed past bin resolution
+                        i0 = max(0, min(n_bins - 1, int(math.floor(center_b))))
+                        i1 = min(n_bins - 1, i0 + 1)
+                        f_b = max(0.0, min(1.0, center_b - i0))
+                        it0 = src_env[i0]
+                        it1 = src_env[i1]
+                        if isinstance(it0, tuple):
+                            l0, h0, r0 = it0
+                        else:
+                            v = float(it0)
+                            l0, h0, r0 = -v, v, v * 0.65
+                        if isinstance(it1, tuple):
+                            l1, h1, r1 = it1
+                        else:
+                            v = float(it1)
+                            l1, h1, r1 = -v, v, v * 0.65
+                        lo_v = l0 + (l1 - l0) * f_b
+                        hi_v = h0 + (h1 - h0) * f_b
+                        rms_v = r0 + (r1 - r0) * f_b
 
                     px = vx0 + frac_p * vis_w
                     y_hi = wf_mid - max(0.0, hi_v) * max_amp
@@ -1712,9 +1809,10 @@ class _TimelineCanvas(QWidget):
 
 
 class WaveformTimeline(QFrame):
-    """4-track DAW waveform arrange view with cached QPixmap rendering, zoom, scrubbing & drag-and-drop."""
+    """4-track DAW waveform arrange view with cached QPixmap rendering, dynamic zoom, scrubbing & drag-and-drop."""
 
     fileDroppedOnChannel = Signal(int, str)
+    detailRequested = Signal(float, float, int)
 
     def __init__(self, parent=None, on_seek=None):
         super().__init__(parent)
@@ -1797,7 +1895,7 @@ class WaveformTimeline(QFrame):
 
         self.zoom_reset_btn = QPushButton("100%", top_bar)
         self.zoom_reset_btn.setProperty("class", "zoomBtn")
-        self.zoom_reset_btn.setFixedWidth(44)
+        self.zoom_reset_btn.setFixedWidth(52)
         self.zoom_reset_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.zoom_reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.zoom_reset_btn.setToolTip("Reset timeline zoom to 100%")
@@ -1849,6 +1947,7 @@ class WaveformTimeline(QFrame):
         self.canvas.positionScrubbed.connect(self._on_scrub_pos)
         self.canvas.seekRequested.connect(self._on_seek_emit)
         self.canvas.zoomChanged.connect(self._sync_zoom_ui)
+        self.canvas.detailRequested.connect(self.detailRequested.emit)
         self.canvas.fileDroppedOnChannel.connect(self.fileDroppedOnChannel.emit)
 
     def _set_pos_text(self, pos_sec):
@@ -1877,18 +1976,19 @@ class WaveformTimeline(QFrame):
             self.hscroll.setVisible(False)
             self.hscroll.setRange(0, 0)
         else:
-            page = int(round(1000.0 / zoom_val))
-            max_val = max(0, 1000 - page)
+            scale = 10000.0
+            page = max(10, int(round(scale / zoom_val)))
+            max_val = max(0, int(scale) - page)
             self.hscroll.setVisible(True)
             self.hscroll.setPageStep(page)
             self.hscroll.setRange(0, max_val)
-            self.hscroll.setValue(int(round(self.canvas.scroll_frac() * 1000.0)))
+            self.hscroll.setValue(int(round(self.canvas.scroll_frac() * scale)))
         self._updating_scroll = False
 
     def _on_scrollbar_moved(self, val):
         if self._updating_scroll:
             return
-        self.canvas.set_scroll_frac(val / 1000.0)
+        self.canvas.set_scroll_frac(val / 10000.0)
 
     def reset_zoom(self):
         self.canvas.set_zoom(1.0)
@@ -1900,11 +2000,20 @@ class WaveformTimeline(QFrame):
     def set_track_waveform(self, channel_idx, peaks, duration_sec, label=""):
         if 0 <= channel_idx < 4:
             self.canvas._tracks[channel_idx] = (list(peaks), float(duration_sec), label)
+            self.canvas._track_details[channel_idx] = None
+            self.canvas.invalidate_cache()
+            self.canvas._schedule_detail_refresh()
+
+    def set_track_detail(self, channel_idx, detail_bins, start_sec, end_sec):
+        """Apply high-resolution zoomed waveform slice for the visible window."""
+        if 0 <= channel_idx < 4 and self.canvas._tracks[channel_idx] is not None:
+            self.canvas._track_details[channel_idx] = (list(detail_bins), float(start_sec), float(end_sec))
             self.canvas.invalidate_cache()
 
     def clear_track(self, channel_idx):
         if 0 <= channel_idx < 4:
             self.canvas._tracks[channel_idx] = None
+            self.canvas._track_details[channel_idx] = None
             self.canvas.invalidate_cache()
 
     def set_audible_flags(self, audible_flags):

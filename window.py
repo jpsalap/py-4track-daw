@@ -227,9 +227,10 @@ def resample_linear(samples, target_len):
     return out
 
 
-def extract_waveform_peaks(filepath, num_bins=600):
+def extract_waveform_peaks(filepath, num_bins=2400, start_sec=None, end_sec=None):
     """
     Fast stdlib WAV envelope extractor for pro DAW waveform display.
+    Supports both full-file overview extraction and high-resolution zoomed window extraction.
     Returns (bins_list, duration_sec) where each bin is (min_val, max_val, rms_val) in [-1.0, 1.0].
     """
     with wave.open(filepath, "rb") as wf:
@@ -241,33 +242,72 @@ def extract_waveform_peaks(filepath, num_bins=600):
         if nframes <= 0:
             return [], 0.0
 
-        bins = min(int(num_bins), nframes)
-        frames_per_bin = nframes / float(bins)
-        sample_cap = 256
+        if start_sec is None:
+            win_start_f = 0
+        else:
+            win_start_f = max(0, min(nframes - 1, int(math.floor(float(start_sec) * fr))))
+
+        if end_sec is None:
+            win_end_f = nframes
+        else:
+            win_end_f = max(win_start_f + 1, min(nframes, int(math.ceil(float(end_sec) * fr))))
+
+        span_frames = win_end_f - win_start_f
+        if span_frames <= 0:
+            return [], duration_sec
+
+        bins = min(int(num_bins), span_frames)
+        frames_per_bin = span_frames / float(bins)
+        # Read every sample when zoomed in; cap per-bin read for fast full-file overview
+        sample_cap = 256 if start_sec is None else 512
         envelope = [(0.0, 0.0, 0.0)] * bins
 
-        for b in range(bins):
-            start_f = int(b * frames_per_bin)
-            end_f = int((b + 1) * frames_per_bin)
-            count = max(1, min(sample_cap, end_f - start_f))
-            if frames_per_bin > sample_cap:
+        if frames_per_bin <= sample_cap:
+            # Contiguous read: seek once and decode chunks sequentially (very fast when zoomed in!)
+            wf.setpos(win_start_f)
+            prev_f = win_start_f
+            for b in range(bins):
+                end_f = win_start_f + int((b + 1) * frames_per_bin)
+                count = max(1, end_f - prev_f)
+                prev_f += count
+                raw = wf.readframes(count)
+                if not raw:
+                    break
+                mono = decode_pcm_to_mono_float(raw, sw, nch)
+                if mono:
+                    lo = 0.0
+                    hi = 0.0
+                    sum_sq = 0.0
+                    for s in mono:
+                        if s < lo:
+                            lo = s
+                        if s > hi:
+                            hi = s
+                        sum_sq += s * s
+                    rms = math.sqrt(sum_sq / float(len(mono)))
+                    envelope[b] = (max(-1.0, lo), min(1.0, hi), min(1.0, rms))
+        else:
+            for b in range(bins):
+                start_f = win_start_f + int(b * frames_per_bin)
+                end_f = win_start_f + int((b + 1) * frames_per_bin)
+                count = max(1, min(sample_cap, end_f - start_f))
                 wf.setpos(start_f)
-            raw = wf.readframes(count)
-            if not raw:
-                break
-            mono = decode_pcm_to_mono_float(raw, sw, nch)
-            if mono:
-                lo = 0.0
-                hi = 0.0
-                sum_sq = 0.0
-                for s in mono:
-                    if s < lo:
-                        lo = s
-                    if s > hi:
-                        hi = s
-                    sum_sq += s * s
-                rms = math.sqrt(sum_sq / float(len(mono)))
-                envelope[b] = (max(-1.0, lo), min(1.0, hi), min(1.0, rms))
+                raw = wf.readframes(count)
+                if not raw:
+                    break
+                mono = decode_pcm_to_mono_float(raw, sw, nch)
+                if mono:
+                    lo = 0.0
+                    hi = 0.0
+                    sum_sq = 0.0
+                    for s in mono:
+                        if s < lo:
+                            lo = s
+                        if s > hi:
+                            hi = s
+                        sum_sq += s * s
+                    rms = math.sqrt(sum_sq / float(len(mono)))
+                    envelope[b] = (max(-1.0, lo), min(1.0, hi), min(1.0, rms))
 
         return envelope, duration_sec
 
@@ -706,8 +746,10 @@ class Window:
         outer_layout.addWidget(self.splitter, 1)
 
         # Top: 4-Track Waveform Arrange View
+        self._zoom_detail_gen = 0
         self.timeline = WaveformTimeline(self.splitter, on_seek=self.seek_to_seconds)
         self.timeline.fileDroppedOnChannel.connect(self.load_channel_file_path)
+        self.timeline.detailRequested.connect(self._load_zoomed_waveforms_async)
         self.splitter.addWidget(self.timeline)
 
         # Native menu bar (built after timeline exists)
@@ -901,13 +943,13 @@ class Window:
 
         view_menu = menubar.addMenu("&View")
         zoom_in_act = QAction("Zoom In Timeline", self.root)
-        zoom_in_act.setShortcut(QKeySequence.StandardKey.ZoomIn)
-        zoom_in_act.triggered.connect(lambda: self.timeline.canvas.set_zoom(self.timeline.canvas.zoom() * 1.35))
+        zoom_in_act.setShortcuts([QKeySequence.StandardKey.ZoomIn, QKeySequence("Ctrl+=")])
+        zoom_in_act.triggered.connect(lambda: self.timeline.canvas.set_zoom(self.timeline.canvas.zoom() * 1.4))
         view_menu.addAction(zoom_in_act)
 
         zoom_out_act = QAction("Zoom Out Timeline", self.root)
-        zoom_out_act.setShortcut(QKeySequence.StandardKey.ZoomOut)
-        zoom_out_act.triggered.connect(lambda: self.timeline.canvas.set_zoom(self.timeline.canvas.zoom() / 1.35))
+        zoom_out_act.setShortcuts([QKeySequence.StandardKey.ZoomOut, QKeySequence("Ctrl+-")])
+        zoom_out_act.triggered.connect(lambda: self.timeline.canvas.set_zoom(self.timeline.canvas.zoom() / 1.4))
         view_menu.addAction(zoom_out_act)
 
         zoom_reset_act = QAction("Reset Timeline Zoom", self.root)
@@ -1712,11 +1754,11 @@ class Window:
         self._set_status(f"Loaded Ch {channel_idx + 1}: {os.path.basename(filepath)}")
 
     def _load_channel_waveform_async(self, channel_idx, filepath):
-        """Extract waveform envelope on a background thread and paint it on the Arrange view."""
+        """Extract high-resolution waveform envelope on a background thread and paint it on the Arrange view."""
 
         def _worker():
             try:
-                peaks, dur = extract_waveform_peaks(filepath, num_bins=600)
+                peaks, dur = extract_waveform_peaks(filepath, num_bins=2400)
             except Exception as exc:
                 print(f"Waveform extraction skipped: {exc}")
                 return
@@ -1731,6 +1773,43 @@ class Window:
             )
 
         threading.Thread(target=_worker, name=f"WaveformCh{channel_idx + 1}", daemon=True).start()
+
+    def _load_zoomed_waveforms_async(self, start_sec, end_sec, num_bins):
+        """Extract sample-accurate zoomed waveform detail for the currently visible timeline window."""
+        self._zoom_detail_gen += 1
+        gen = self._zoom_detail_gen
+        paths = [ch.get_filepath() for ch in self.channel_states]
+        if not any(paths):
+            return
+
+        def _worker():
+            for ch_idx, path in enumerate(paths):
+                if self._closing or gen != self._zoom_detail_gen:
+                    return
+                if not path:
+                    continue
+                try:
+                    with wave.open(path, "rb") as wf:
+                        track_dur = wf.getnframes() / float(max(1, wf.getframerate()))
+                    vis_s = max(0.0, float(start_sec))
+                    vis_e = min(track_dur, float(end_sec))
+                    if vis_e <= vis_s:
+                        continue
+                    bins, _ = extract_waveform_peaks(
+                        path,
+                        num_bins=max(200, int(num_bins)),
+                        start_sec=vis_s,
+                        end_sec=vis_e,
+                    )
+                except Exception:
+                    continue
+                if self._closing or gen != self._zoom_detail_gen:
+                    return
+                if self.channel_states[ch_idx].get_filepath() != path:
+                    continue
+                self._ui_call(self.timeline.set_track_detail, ch_idx, bins, vis_s, vis_e)
+
+        threading.Thread(target=_worker, name=f"WaveformZoom{gen}", daemon=True).start()
 
     def clear_channel_file(self, channel_idx):
         """Clear the loaded WAV file from a channel without needing to load another."""
