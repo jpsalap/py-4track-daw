@@ -1,8 +1,8 @@
-# Tremolo Effect (DSP Processor + Tkinter Popup Window)
+# Tremolo Effect (DSP Processor + PySide6 Parameter Dialog)
 import math
 import threading
-import tkinter as tk
-from tkinter import ttk
+
+from fx_dialog_base import EffectDialogBase
 
 
 class TremoloProcessor:
@@ -69,8 +69,8 @@ class TremoloProcessor:
         return out
 
 
-class TremoloWindow:
-    """Non-blocking Toplevel popup to control a channel's TremoloProcessor."""
+class TremoloWindow(EffectDialogBase):
+    """Non-blocking PySide6 dialog to control a channel's TremoloProcessor."""
 
     BG_DARK = "#1c332d"
     BG_HEADER = "#152722"
@@ -79,114 +79,54 @@ class TremoloWindow:
 
     def __init__(self, parent=None, processor=None, channel_num=None, on_close=None):
         self.processor = processor if processor is not None else TremoloProcessor()
-        self.on_close_callback = on_close
-        self._standalone = parent is None
-
-        if self._standalone:
-            self.window = tk.Tk()
-        else:
-            self.window = tk.Toplevel(parent)
-            self.window.transient(parent)
-
         title = f"Tremolo - Channel {channel_num}" if channel_num is not None else "Tremolo"
-        self.window.title(title)
-        self.window.geometry("320x220")
-        self.window.resizable(False, False)
-        self.window.configure(bg=self.BG_DARK)
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
 
-        # Header bar
-        header = tk.Frame(self.window, bg=self.BG_HEADER, height=30)
-        header.pack(fill=tk.X)
-        header.pack_propagate(False)
-        tk.Label(
-            header, text=title.upper(), bg=self.BG_HEADER, fg=self.ACCENT,
-            font=("Helvetica", 10, "bold")
-        ).pack(expand=True)
+        super().__init__(
+            title=title,
+            bg_dark=self.BG_DARK,
+            bg_header=self.BG_HEADER,
+            bg_well=self.BG_WELL,
+            accent=self.ACCENT,
+            btn_reset_bg="#2a4d43",
+            btn_reset_hover="#376659",
+            btn_close_bg="#246e4c",
+            btn_close_hover="#2e8a60",
+            parent=parent,
+            on_close=on_close,
+            width=340,
+        )
 
         rate, depth = self.processor.get_params()
 
-        self.rate_label_var = tk.StringVar(value=f"Rate: {rate:.2f} Hz")
-        self.depth_label_var = tk.StringVar(value=f"Depth: {int(depth * 100)}%")
-
-        container = tk.Frame(self.window, bg=self.BG_DARK, padx=16, pady=12)
-        container.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(container, textvariable=self.rate_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.rate_slider = tk.Scale(
-            container, from_=0.5, to=15.0, resolution=0.1, orient=tk.HORIZONTAL,
-            length=275, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_rate_change
+        self.rate_slider, _ = self.add_param_slider(
+            "Rate",
+            0.5,
+            15.0,
+            0.1,
+            rate,
+            TremoloProcessor.DEFAULT_RATE,
+            lambda v: f"{v:.2f} Hz",
+            lambda v: self.processor.set_params(rate=v),
         )
-        self.rate_slider.set(rate)
-        self.rate_slider.pack(fill=tk.X, pady=(2, 10))
-
-        tk.Label(container, textvariable=self.depth_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.depth_slider = tk.Scale(
-            container, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL,
-            length=275, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_depth_change
+        self.depth_slider, _ = self.add_param_slider(
+            "Depth",
+            0.0,
+            1.0,
+            0.01,
+            depth,
+            TremoloProcessor.DEFAULT_DEPTH,
+            lambda v: f"{int(round(v * 100))}%",
+            lambda v: self.processor.set_params(depth=v),
         )
-        self.depth_slider.set(depth)
-        self.depth_slider.pack(fill=tk.X, pady=(2, 14))
 
-        btn_frame = tk.Frame(container, bg=self.BG_DARK)
-        btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
-        self._make_btn(btn_frame, "Reset", self._reset_defaults, "#2a4d43", "#376659").pack(side=tk.LEFT)
-        self._make_btn(btn_frame, "Close", self.close, "#246e4c", "#2e8a60").pack(side=tk.RIGHT)
-
-        if self._standalone:
-            self.window.mainloop()
-
-    def _make_btn(self, parent, text, command, bg, hover_bg):
-        lbl = tk.Label(
-            parent, text=text, bg=bg, fg="#ffffff", font=("Helvetica", 9, "bold"),
-            padx=14, pady=5, cursor="hand2"
-        )
-        lbl.bind("<Enter>", lambda _e: lbl.config(bg=hover_bg))
-        lbl.bind("<Leave>", lambda _e: lbl.config(bg=bg))
-        lbl.bind("<ButtonRelease-1>", lambda _e: command())
-        return lbl
-
-    def _on_rate_change(self, value):
-        val = float(value)
-        self.processor.set_params(rate=val)
-        self.rate_label_var.set(f"Rate: {val:.2f} Hz")
-
-    def _on_depth_change(self, value):
-        val = float(value)
-        self.processor.set_params(depth=val)
-        self.depth_label_var.set(f"Depth: {int(round(val * 100))}%")
+        self.reset_btn.clicked.connect(self._reset_defaults)
+        self.finalize_and_show()
 
     def _reset_defaults(self):
         self.processor.reset_defaults()
         rate, depth = self.processor.get_params()
-        self.rate_slider.set(rate)
-        self.depth_slider.set(depth)
-
-    def focus(self):
-        if self.is_open():
-            self.window.deiconify()
-            self.window.lift()
-            self.window.focus_force()
-
-    def is_open(self):
-        try:
-            return bool(self.window.winfo_exists())
-        except tk.TclError:
-            return False
-
-    def close(self):
-        if self.on_close_callback is not None:
-            cb = self.on_close_callback
-            self.on_close_callback = None
-            cb()
-        if self.is_open():
-            self.window.destroy()
+        self.rate_slider.set_value_float(rate)
+        self.depth_slider.set_value_float(depth)
 
 
 # Backward-compatible alias

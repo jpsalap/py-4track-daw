@@ -2,19 +2,64 @@
 import os
 import sys
 
-portaudio_lib = os.path.join(sys.prefix, "lib", "libportaudio.dylib")
-extra_binaries = [(portaudio_lib, ".")] if os.path.exists(portaudio_lib) else []
+_portaudio_candidates = [
+    os.path.join(sys.prefix, "lib", "libportaudio.dylib"),
+    "/opt/homebrew/opt/portaudio/lib/libportaudio.dylib",
+    "/usr/local/opt/portaudio/lib/libportaudio.dylib",
+]
+extra_binaries = []
+for _candidate in _portaudio_candidates:
+    if os.path.exists(_candidate):
+        extra_binaries.append((_candidate, "."))
+        break
 
 a = Analysis(
     ["window.py"],
     pathex=[],
     binaries=extra_binaries,
     datas=[],
-    hiddenimports=["pyaudio", "Delay", "Tremolo", "Chorus", "Compressor"],
+    hiddenimports=[
+        "pyaudio",
+        "Delay",
+        "Tremolo",
+        "Chorus",
+        "Compressor",
+        "fx_dialog_base",
+        "ui_widgets",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        "tkinter",
+        "_tkinter",
+        "PySide6.Qt3DCore",
+        "PySide6.Qt3DRender",
+        "PySide6.QtCharts",
+        "PySide6.QtDBus",
+        "PySide6.QtDesigner",
+        "PySide6.QtHelp",
+        "PySide6.QtMultimedia",
+        "PySide6.QtMultimediaWidgets",
+        "PySide6.QtNetwork",
+        "PySide6.QtOpenGL",
+        "PySide6.QtOpenGLWidgets",
+        "PySide6.QtPdf",
+        "PySide6.QtPositioning",
+        "PySide6.QtPrintSupport",
+        "PySide6.QtQml",
+        "PySide6.QtQuick",
+        "PySide6.QtQuickWidgets",
+        "PySide6.QtSensors",
+        "PySide6.QtSql",
+        "PySide6.QtSvg",
+        "PySide6.QtTest",
+        "PySide6.QtWebChannel",
+        "PySide6.QtWebEngineCore",
+        "PySide6.QtWebEngineWidgets",
+        "PySide6.QtWebSockets",
+        "PySide6.QtXml",
+    ],
     noarchive=False,
     optimize=0,
 )
@@ -57,8 +102,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "Mini-DAW",
         "CFBundleDisplayName": "Mini-DAW",
-        "CFBundleShortVersionString": "1.0.0",
-        "CFBundleVersion": "1.0.0",
+        "CFBundleShortVersionString": "2.0.0",
+        "CFBundleVersion": "2.0.0",
         "NSHighResolutionCapable": True,
         "NSMicrophoneUsageDescription": "Mini-DAW needs microphone access to record audio tracks.",
     },

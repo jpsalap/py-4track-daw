@@ -1,8 +1,8 @@
-# Compressor Effect (DSP Processor + Tkinter Popup Window)
+# Compressor Effect (DSP Processor + PySide6 Parameter Dialog)
 import math
 import threading
-import tkinter as tk
-from tkinter import ttk
+
+from fx_dialog_base import EffectDialogBase
 
 
 class CompressorProcessor:
@@ -119,8 +119,8 @@ class CompressorProcessor:
         return out
 
 
-class CompressorWindow:
-    """Non-blocking Toplevel popup to control a channel's CompressorProcessor."""
+class CompressorWindow(EffectDialogBase):
+    """Non-blocking PySide6 dialog to control a channel's CompressorProcessor."""
 
     BG_DARK = "#451e24"
     BG_HEADER = "#33151a"
@@ -129,167 +129,87 @@ class CompressorWindow:
 
     def __init__(self, parent=None, processor=None, channel_num=None, on_close=None):
         self.processor = processor if processor is not None else CompressorProcessor()
-        self.on_close_callback = on_close
-        self._standalone = parent is None
-
-        if self._standalone:
-            self.window = tk.Tk()
-        else:
-            self.window = tk.Toplevel(parent)
-            self.window.transient(parent)
-
         title = f"Compressor - Channel {channel_num}" if channel_num is not None else "Compressor"
-        self.window.title(title)
-        self.window.geometry("330x370")
-        self.window.resizable(False, False)
-        self.window.configure(bg=self.BG_DARK)
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
 
-        header = tk.Frame(self.window, bg=self.BG_HEADER, height=30)
-        header.pack(fill=tk.X)
-        header.pack_propagate(False)
-        tk.Label(
-            header, text=title.upper(), bg=self.BG_HEADER, fg=self.ACCENT,
-            font=("Helvetica", 10, "bold")
-        ).pack(expand=True)
+        super().__init__(
+            title=title,
+            bg_dark=self.BG_DARK,
+            bg_header=self.BG_HEADER,
+            bg_well=self.BG_WELL,
+            accent=self.ACCENT,
+            btn_reset_bg="#662d36",
+            btn_reset_hover="#803944",
+            btn_close_bg="#9b2c2c",
+            btn_close_hover="#bd3737",
+            parent=parent,
+            on_close=on_close,
+            width=350,
+        )
 
         thresh, ratio, attack, release, makeup = self.processor.get_params()
 
-        self.thresh_label_var = tk.StringVar(value=f"Threshold: {thresh:.1f} dB")
-        self.ratio_label_var = tk.StringVar(value=f"Ratio: {ratio:.1f}:1")
-        self.attack_label_var = tk.StringVar(value=f"Attack: {attack:.0f} ms")
-        self.release_label_var = tk.StringVar(value=f"Release: {release:.0f} ms")
-        self.makeup_label_var = tk.StringVar(value=f"Makeup Gain: +{makeup:.1f} dB")
-
-        container = tk.Frame(self.window, bg=self.BG_DARK, padx=16, pady=12)
-        container.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(container, textvariable=self.thresh_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.thresh_slider = tk.Scale(
-            container, from_=-40.0, to=0.0, resolution=0.5, orient=tk.HORIZONTAL,
-            length=285, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_thresh_change
+        self.thresh_slider, _ = self.add_param_slider(
+            "Threshold",
+            -40.0,
+            0.0,
+            0.5,
+            thresh,
+            CompressorProcessor.DEFAULT_THRESHOLD_DB,
+            lambda v: f"{v:.1f} dB",
+            lambda v: self.processor.set_params(threshold_db=v),
         )
-        self.thresh_slider.set(thresh)
-        self.thresh_slider.pack(fill=tk.X, pady=(1, 6))
-
-        tk.Label(container, textvariable=self.ratio_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.ratio_slider = tk.Scale(
-            container, from_=1.0, to=20.0, resolution=0.5, orient=tk.HORIZONTAL,
-            length=285, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_ratio_change
+        self.ratio_slider, _ = self.add_param_slider(
+            "Ratio",
+            1.0,
+            20.0,
+            0.5,
+            ratio,
+            CompressorProcessor.DEFAULT_RATIO,
+            lambda v: f"{v:.1f}:1",
+            lambda v: self.processor.set_params(ratio=v),
         )
-        self.ratio_slider.set(ratio)
-        self.ratio_slider.pack(fill=tk.X, pady=(1, 6))
-
-        tk.Label(container, textvariable=self.attack_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.attack_slider = tk.Scale(
-            container, from_=1.0, to=100.0, resolution=1.0, orient=tk.HORIZONTAL,
-            length=285, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_attack_change
+        self.attack_slider, _ = self.add_param_slider(
+            "Attack",
+            1.0,
+            100.0,
+            1.0,
+            attack,
+            CompressorProcessor.DEFAULT_ATTACK_MS,
+            lambda v: f"{v:.0f} ms",
+            lambda v: self.processor.set_params(attack_ms=v),
         )
-        self.attack_slider.set(attack)
-        self.attack_slider.pack(fill=tk.X, pady=(1, 6))
-
-        tk.Label(container, textvariable=self.release_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.release_slider = tk.Scale(
-            container, from_=10.0, to=500.0, resolution=5.0, orient=tk.HORIZONTAL,
-            length=285, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_release_change
+        self.release_slider, _ = self.add_param_slider(
+            "Release",
+            10.0,
+            500.0,
+            5.0,
+            release,
+            CompressorProcessor.DEFAULT_RELEASE_MS,
+            lambda v: f"{v:.0f} ms",
+            lambda v: self.processor.set_params(release_ms=v),
         )
-        self.release_slider.set(release)
-        self.release_slider.pack(fill=tk.X, pady=(1, 6))
-
-        tk.Label(container, textvariable=self.makeup_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.makeup_slider = tk.Scale(
-            container, from_=0.0, to=24.0, resolution=0.5, orient=tk.HORIZONTAL,
-            length=285, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_makeup_change
+        self.makeup_slider, _ = self.add_param_slider(
+            "Makeup Gain",
+            0.0,
+            24.0,
+            0.5,
+            makeup,
+            CompressorProcessor.DEFAULT_MAKEUP_DB,
+            lambda v: f"+{v:.1f} dB",
+            lambda v: self.processor.set_params(makeup_db=v),
         )
-        self.makeup_slider.set(makeup)
-        self.makeup_slider.pack(fill=tk.X, pady=(1, 12))
 
-        btn_frame = tk.Frame(container, bg=self.BG_DARK)
-        btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
-        self._make_btn(btn_frame, "Reset", self._reset_defaults, "#662d36", "#803944").pack(side=tk.LEFT)
-        self._make_btn(btn_frame, "Close", self.close, "#9b2c2c", "#bd3737").pack(side=tk.RIGHT)
-
-        if self._standalone:
-            self.window.mainloop()
-
-    def _make_btn(self, parent, text, command, bg, hover_bg):
-        lbl = tk.Label(
-            parent, text=text, bg=bg, fg="#ffffff", font=("Helvetica", 9, "bold"),
-            padx=14, pady=5, cursor="hand2"
-        )
-        lbl.bind("<Enter>", lambda _e: lbl.config(bg=hover_bg))
-        lbl.bind("<Leave>", lambda _e: lbl.config(bg=bg))
-        lbl.bind("<ButtonRelease-1>", lambda _e: command())
-        return lbl
-
-    def _on_thresh_change(self, value):
-        val = float(value)
-        self.processor.set_params(threshold_db=val)
-        self.thresh_label_var.set(f"Threshold: {val:.1f} dB")
-
-    def _on_ratio_change(self, value):
-        val = float(value)
-        self.processor.set_params(ratio=val)
-        self.ratio_label_var.set(f"Ratio: {val:.1f}:1")
-
-    def _on_attack_change(self, value):
-        val = float(value)
-        self.processor.set_params(attack_ms=val)
-        self.attack_label_var.set(f"Attack: {val:.0f} ms")
-
-    def _on_release_change(self, value):
-        val = float(value)
-        self.processor.set_params(release_ms=val)
-        self.release_label_var.set(f"Release: {val:.0f} ms")
-
-    def _on_makeup_change(self, value):
-        val = float(value)
-        self.processor.set_params(makeup_db=val)
-        self.makeup_label_var.set(f"Makeup Gain: +{val:.1f} dB")
+        self.reset_btn.clicked.connect(self._reset_defaults)
+        self.finalize_and_show()
 
     def _reset_defaults(self):
         self.processor.reset_defaults()
         thresh, ratio, attack, release, makeup = self.processor.get_params()
-        self.thresh_slider.set(thresh)
-        self.ratio_slider.set(ratio)
-        self.attack_slider.set(attack)
-        self.release_slider.set(release)
-        self.makeup_slider.set(makeup)
-
-    def focus(self):
-        if self.is_open():
-            self.window.deiconify()
-            self.window.lift()
-            self.window.focus_force()
-
-    def is_open(self):
-        try:
-            return bool(self.window.winfo_exists())
-        except tk.TclError:
-            return False
-
-    def close(self):
-        if self.on_close_callback is not None:
-            cb = self.on_close_callback
-            self.on_close_callback = None
-            cb()
-        if self.is_open():
-            self.window.destroy()
+        self.thresh_slider.set_value_float(thresh)
+        self.ratio_slider.set_value_float(ratio)
+        self.attack_slider.set_value_float(attack)
+        self.release_slider.set_value_float(release)
+        self.makeup_slider.set_value_float(makeup)
 
 
 # Backward-compatible alias

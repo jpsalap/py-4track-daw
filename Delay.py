@@ -1,7 +1,7 @@
-# Delay Effect (DSP Processor + Tkinter Popup Window)
+# Delay Effect (DSP Processor + PySide6 Parameter Dialog)
 import threading
-import tkinter as tk
-from tkinter import ttk
+
+from fx_dialog_base import EffectDialogBase
 
 
 class DelayProcessor:
@@ -104,8 +104,8 @@ class DelayProcessor:
         return out
 
 
-class DelayWindow:
-    """Non-blocking Toplevel popup to control a channel's DelayProcessor."""
+class DelayWindow(EffectDialogBase):
+    """Non-blocking PySide6 dialog to control a channel's DelayProcessor."""
 
     BG_DARK = "#1b304a"
     BG_HEADER = "#142438"
@@ -114,131 +114,65 @@ class DelayWindow:
 
     def __init__(self, parent=None, processor=None, channel_num=None, on_close=None):
         self.processor = processor if processor is not None else DelayProcessor()
-        self.on_close_callback = on_close
-        self._standalone = parent is None
-
-        if self._standalone:
-            self.window = tk.Tk()
-        else:
-            self.window = tk.Toplevel(parent)
-            self.window.transient(parent)
-
         title = f"Delay - Channel {channel_num}" if channel_num is not None else "Delay"
-        self.window.title(title)
-        self.window.geometry("320x270")
-        self.window.resizable(False, False)
-        self.window.configure(bg=self.BG_DARK)
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
 
-        header = tk.Frame(self.window, bg=self.BG_HEADER, height=30)
-        header.pack(fill=tk.X)
-        header.pack_propagate(False)
-        tk.Label(
-            header, text=title.upper(), bg=self.BG_HEADER, fg=self.ACCENT,
-            font=("Helvetica", 10, "bold")
-        ).pack(expand=True)
+        super().__init__(
+            title=title,
+            bg_dark=self.BG_DARK,
+            bg_header=self.BG_HEADER,
+            bg_well=self.BG_WELL,
+            accent=self.ACCENT,
+            btn_reset_bg="#2a4669",
+            btn_reset_hover="#375c8a",
+            btn_close_bg="#245994",
+            btn_close_hover="#2e6eb5",
+            parent=parent,
+            on_close=on_close,
+            width=340,
+        )
 
         delay_ms, feedback, mix = self.processor.get_params()
 
-        self.time_label_var = tk.StringVar(value=f"Delay Time: {int(delay_ms)} ms")
-        self.fb_label_var = tk.StringVar(value=f"Feedback: {int(feedback * 100)}%")
-        self.mix_label_var = tk.StringVar(value=f"Wet/Dry Mix: {int(mix * 100)}%")
-
-        container = tk.Frame(self.window, bg=self.BG_DARK, padx=16, pady=12)
-        container.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(container, textvariable=self.time_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.time_slider = tk.Scale(
-            container, from_=10, to=1000, resolution=5, orient=tk.HORIZONTAL,
-            length=275, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_time_change
+        self.time_slider, _ = self.add_param_slider(
+            "Delay Time",
+            10.0,
+            1000.0,
+            5.0,
+            delay_ms,
+            DelayProcessor.DEFAULT_DELAY_MS,
+            lambda v: f"{int(round(v))} ms",
+            lambda v: self.processor.set_params(delay_ms=v),
         )
-        self.time_slider.set(delay_ms)
-        self.time_slider.pack(fill=tk.X, pady=(2, 8))
-
-        tk.Label(container, textvariable=self.fb_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.fb_slider = tk.Scale(
-            container, from_=0.0, to=0.85, resolution=0.01, orient=tk.HORIZONTAL,
-            length=275, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_fb_change
+        self.fb_slider, _ = self.add_param_slider(
+            "Feedback",
+            0.0,
+            0.85,
+            0.01,
+            feedback,
+            DelayProcessor.DEFAULT_FEEDBACK,
+            lambda v: f"{int(round(v * 100))}%",
+            lambda v: self.processor.set_params(feedback=v),
         )
-        self.fb_slider.set(feedback)
-        self.fb_slider.pack(fill=tk.X, pady=(2, 8))
-
-        tk.Label(container, textvariable=self.mix_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.mix_slider = tk.Scale(
-            container, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL,
-            length=275, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_mix_change
+        self.mix_slider, _ = self.add_param_slider(
+            "Wet/Dry Mix",
+            0.0,
+            1.0,
+            0.01,
+            mix,
+            DelayProcessor.DEFAULT_MIX,
+            lambda v: f"{int(round(v * 100))}%",
+            lambda v: self.processor.set_params(mix=v),
         )
-        self.mix_slider.set(mix)
-        self.mix_slider.pack(fill=tk.X, pady=(2, 14))
 
-        btn_frame = tk.Frame(container, bg=self.BG_DARK)
-        btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
-        self._make_btn(btn_frame, "Reset", self._reset_defaults, "#2a4669", "#375c8a").pack(side=tk.LEFT)
-        self._make_btn(btn_frame, "Close", self.close, "#245994", "#2e6eb5").pack(side=tk.RIGHT)
-
-        if self._standalone:
-            self.window.mainloop()
-
-    def _make_btn(self, parent, text, command, bg, hover_bg):
-        lbl = tk.Label(
-            parent, text=text, bg=bg, fg="#ffffff", font=("Helvetica", 9, "bold"),
-            padx=14, pady=5, cursor="hand2"
-        )
-        lbl.bind("<Enter>", lambda _e: lbl.config(bg=hover_bg))
-        lbl.bind("<Leave>", lambda _e: lbl.config(bg=bg))
-        lbl.bind("<ButtonRelease-1>", lambda _e: command())
-        return lbl
-
-    def _on_time_change(self, value):
-        val = float(value)
-        self.processor.set_params(delay_ms=val)
-        self.time_label_var.set(f"Delay Time: {int(round(val))} ms")
-
-    def _on_fb_change(self, value):
-        val = float(value)
-        self.processor.set_params(feedback=val)
-        self.fb_label_var.set(f"Feedback: {int(round(val * 100))}%")
-
-    def _on_mix_change(self, value):
-        val = float(value)
-        self.processor.set_params(mix=val)
-        self.mix_label_var.set(f"Wet/Dry Mix: {int(round(val * 100))}%")
+        self.reset_btn.clicked.connect(self._reset_defaults)
+        self.finalize_and_show()
 
     def _reset_defaults(self):
         self.processor.reset_defaults()
         delay_ms, feedback, mix = self.processor.get_params()
-        self.time_slider.set(delay_ms)
-        self.fb_slider.set(feedback)
-        self.mix_slider.set(mix)
-
-    def focus(self):
-        if self.is_open():
-            self.window.deiconify()
-            self.window.lift()
-            self.window.focus_force()
-
-    def is_open(self):
-        try:
-            return bool(self.window.winfo_exists())
-        except tk.TclError:
-            return False
-
-    def close(self):
-        if self.on_close_callback is not None:
-            cb = self.on_close_callback
-            self.on_close_callback = None
-            cb()
-        if self.is_open():
-            self.window.destroy()
+        self.time_slider.set_value_float(delay_ms)
+        self.fb_slider.set_value_float(feedback)
+        self.mix_slider.set_value_float(mix)
 
 
 # Backward-compatible alias
