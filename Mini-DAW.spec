@@ -107,7 +107,7 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "Mini-DAW",
         "CFBundleDisplayName": "Mini-DAW",
-        "CFBundleShortVersionString": "2.0.0",
+        "CFBundleShortVersionString": "2.0.0-beta.1",
         "CFBundleVersion": "2.0.0",
         "NSHighResolutionCapable": True,
         "NSMicrophoneUsageDescription": "Mini-DAW needs microphone access to record audio tracks.",
