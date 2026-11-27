@@ -2,7 +2,6 @@
 import math
 import threading
 import tkinter as tk
-from tkinter import ttk
 
 
 class CompressorProcessor:
@@ -234,7 +233,18 @@ class CompressorWindow:
         )
         lbl.bind("<Enter>", lambda _e: lbl.config(bg=hover_bg))
         lbl.bind("<Leave>", lambda _e: lbl.config(bg=bg))
-        lbl.bind("<ButtonRelease-1>", lambda _e: command())
+
+        def on_release(event):
+            try:
+                x = event.x_root - lbl.winfo_rootx()
+                y = event.y_root - lbl.winfo_rooty()
+                inside = 0 <= x <= lbl.winfo_width() and 0 <= y <= lbl.winfo_height()
+            except Exception:
+                inside = True
+            if inside:
+                command()
+
+        lbl.bind("<ButtonRelease-1>", on_release)
         return lbl
 
     def _on_thresh_change(self, value):

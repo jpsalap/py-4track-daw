@@ -2,7 +2,6 @@
 import math
 import threading
 import tkinter as tk
-from tkinter import ttk
 
 
 class TremoloProcessor:
@@ -107,7 +106,7 @@ class TremoloWindow:
         rate, depth = self.processor.get_params()
 
         self.rate_label_var = tk.StringVar(value=f"Rate: {rate:.2f} Hz")
-        self.depth_label_var = tk.StringVar(value=f"Depth: {int(depth * 100)}%")
+        self.depth_label_var = tk.StringVar(value=f"Depth: {int(round(depth * 100))}%")
 
         container = tk.Frame(self.window, bg=self.BG_DARK, padx=16, pady=12)
         container.pack(fill=tk.BOTH, expand=True)
@@ -115,7 +114,7 @@ class TremoloWindow:
         tk.Label(container, textvariable=self.rate_label_var, bg=self.BG_DARK, fg="#f0f6fc",
                  font=("Helvetica", 9, "bold")).pack(anchor="w")
         self.rate_slider = tk.Scale(
-            container, from_=0.5, to=15.0, resolution=0.1, orient=tk.HORIZONTAL,
+            container, from_=0.1, to=20.0, resolution=0.1, orient=tk.HORIZONTAL,
             length=275, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
             activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
             command=self._on_rate_change
@@ -149,7 +148,18 @@ class TremoloWindow:
         )
         lbl.bind("<Enter>", lambda _e: lbl.config(bg=hover_bg))
         lbl.bind("<Leave>", lambda _e: lbl.config(bg=bg))
-        lbl.bind("<ButtonRelease-1>", lambda _e: command())
+
+        def on_release(event):
+            try:
+                x = event.x_root - lbl.winfo_rootx()
+                y = event.y_root - lbl.winfo_rooty()
+                inside = 0 <= x <= lbl.winfo_width() and 0 <= y <= lbl.winfo_height()
+            except Exception:
+                inside = True
+            if inside:
+                command()
+
+        lbl.bind("<ButtonRelease-1>", on_release)
         return lbl
 
     def _on_rate_change(self, value):

@@ -2,7 +2,6 @@
 import math
 import threading
 import tkinter as tk
-from tkinter import ttk
 
 
 class ChorusProcessor:
@@ -114,7 +113,11 @@ class ChorusProcessor:
                 read_pos += buf_len
 
             idx0 = int(read_pos)
-            frac = read_pos - idx0
+            if idx0 >= buf_len:
+                idx0 = 0
+                frac = 0.0
+            else:
+                frac = read_pos - idx0
             idx1 = idx0 + 1
             if idx1 >= buf_len:
                 idx1 = 0
@@ -174,7 +177,7 @@ class ChorusWindow:
         self.rate_label_var = tk.StringVar(value=f"Rate: {rate:.2f} Hz")
         self.depth_label_var = tk.StringVar(value=f"Depth: {depth_ms:.1f} ms")
         self.delay_label_var = tk.StringVar(value=f"Base Delay: {base_delay_ms:.1f} ms")
-        self.mix_label_var = tk.StringVar(value=f"Wet/Dry Mix: {int(mix * 100)}%")
+        self.mix_label_var = tk.StringVar(value=f"Wet/Dry Mix: {int(round(mix * 100))}%")
 
         container = tk.Frame(self.window, bg=self.BG_DARK, padx=16, pady=12)
         container.pack(fill=tk.BOTH, expand=True)
@@ -238,7 +241,18 @@ class ChorusWindow:
         )
         lbl.bind("<Enter>", lambda _e: lbl.config(bg=hover_bg))
         lbl.bind("<Leave>", lambda _e: lbl.config(bg=bg))
-        lbl.bind("<ButtonRelease-1>", lambda _e: command())
+
+        def on_release(event):
+            try:
+                x = event.x_root - lbl.winfo_rootx()
+                y = event.y_root - lbl.winfo_rooty()
+                inside = 0 <= x <= lbl.winfo_width() and 0 <= y <= lbl.winfo_height()
+            except Exception:
+                inside = True
+            if inside:
+                command()
+
+        lbl.bind("<ButtonRelease-1>", on_release)
         return lbl
 
     def _on_rate_change(self, value):

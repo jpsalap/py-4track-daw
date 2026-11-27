@@ -1,13 +1,15 @@
 import array
 import math
 import os
+import queue
+import re
 import sys
 import threading
 import time
 import wave
 from collections import namedtuple
 import tkinter as tk
-from tkinter import ttk, font, messagebox
+from tkinter import font, messagebox
 from tkinter.filedialog import askopenfilename, asksaveasfilename
 
 try:
@@ -186,11 +188,136 @@ def resample_linear(samples, target_len):
     return out
 
 
+class StreamingWavReader:
+    """Phase-accurate streaming WAV reader with continuous linear resampling."""
+
+    def __init__(self, wf, dst_rate):
+        self.wf = wf
+        self.nch = wf.getnchannels()
+        self.sw = wf.getsampwidth()
+        self.src_rate = max(1, wf.getframerate())
+        self.dst_rate = max(1, int(dst_rate))
+        self.step = self.src_rate / float(self.dst_rate)
+        self._buf = []
+        self._pos = 0.0
+        self._eof = False
+
+    def read(self, out_frames):
+        """Read and resample up to out_frames mono floats at dst_rate with zero drift."""
+        if out_frames <= 0:
+            return []
+        if self.src_rate == self.dst_rate:
+            raw = self.wf.readframes(out_frames)
+            return decode_pcm_to_mono_float(raw, self.sw, self.nch) if raw else []
+
+        needed = int(math.floor(self._pos + (out_frames - 1) * self.step)) + 2
+        while not self._eof and len(self._buf) < needed:
+            to_read = max(256, needed - len(self._buf))
+            raw = self.wf.readframes(to_read)
+            if not raw:
+                self._eof = True
+                break
+            self._buf.extend(decode_pcm_to_mono_float(raw, self.sw, self.nch))
+
+        buf = self._buf
+        avail = len(buf)
+        if avail == 0:
+            return []
+
+        pos = self._pos
+        step = self.step
+        out = []
+        append = out.append
+        last = avail - 1
+
+        for _ in range(out_frames):
+            i0 = int(pos)
+            if i0 >= avail:
+                break
+            if i0 < last:
+                frac = pos - i0
+                append(buf[i0] * (1.0 - frac) + buf[i0 + 1] * frac)
+            else:
+                append(buf[last])
+            pos += step
+
+        drop = int(pos)
+        if drop > 0:
+            if drop >= avail:
+                self._buf = []
+                self._pos = 0.0 if self._eof else (pos - avail)
+            else:
+                del self._buf[:drop]
+                self._pos = pos - drop
+        else:
+            self._pos = pos
+        return out
+
+    def seek(self, target_sec):
+        """Seek to target_sec preserving fractional sample alignment."""
+        exact_frame = max(0.0, float(target_sec) * self.src_rate)
+        nframes = self.wf.getnframes()
+        if exact_frame >= nframes:
+            self.wf.setpos(nframes)
+            self._buf = []
+            self._pos = 0.0
+            self._eof = True
+        else:
+            base_frame = int(math.floor(exact_frame))
+            self.wf.setpos(base_frame)
+            self._buf = []
+            self._pos = exact_frame - base_frame
+            self._eof = False
+
+    def close(self):
+        self.wf.close()
+
+
+_INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+
+
+def sanitize_filename_stem(raw_name):
+    """Sanitize user-entered filename stem; returns empty string if nothing valid remains."""
+    name = (raw_name or "").strip()
+    if name.lower().endswith(".wav"):
+        name = name[:-4].strip()
+    name = _INVALID_FILENAME_RE.sub("_", name)
+    name = name.strip(" .")
+    if name in ("", ".", ".."):
+        return ""
+    return name
+
+
+def unique_recording_paths(base_dir, stem, armed_indices):
+    """Return non-colliding (filename, full_path) pairs for all armed channels in a take."""
+    suffix = ""
+    counter = 2
+    while True:
+        candidates = [
+            (f"{stem}{suffix}_ch{idx + 1}.wav", os.path.join(base_dir, f"{stem}{suffix}_ch{idx + 1}.wav"))
+            for idx in armed_indices
+        ]
+        if not any(os.path.exists(p) for _, p in candidates):
+            return candidates
+        suffix = f"_{counter}"
+        counter += 1
+
+
 def format_timecode(seconds):
     """Format seconds as MM:SS."""
     sec_int = max(0, int(seconds))
     mins, secs = divmod(sec_int, 60)
     return f"{mins:02d}:{secs:02d}"
+
+
+def format_ruler_time(seconds, show_tenths=False):
+    """Format ruler tick label as MM:SS or MM:SS.t when zoomed in."""
+    sec = max(0.0, float(seconds))
+    if not show_tenths:
+        return format_timecode(sec)
+    mins = int(sec // 60)
+    rem = sec - mins * 60
+    return f"{mins:02d}:{rem:04.1f}"
 
 
 def format_peak_db(linear_peak):
@@ -206,7 +333,7 @@ def format_peak_db(linear_peak):
     return f"{db:.1f} dB"
 
 
-def extract_waveform_peaks(filepath, num_bins=600):
+def extract_waveform_peaks(filepath, num_bins=2400):
     """
     Fast stdlib WAV envelope extractor for pro DAW waveform display.
     Returns (bins_list, duration_sec) where each bin is (min_val, max_val, rms_val) in [-1.0, 1.0].
@@ -733,8 +860,8 @@ class PeakReadout:
 class WaveformTimeline:
     """
     Pro Tools / Logic Pro-style 4-track waveform arrange view with dual-layer filled
-    Peak + RMS polygons, clip title bars, muted region dimming, time ruler, smooth
-    moving playhead, live recording waveform, and click/drag scrubbing.
+    Peak + RMS polygons, clip title bars, muted region dimming, time ruler, horizontal
+    zoom & pan scrollbar, smooth moving playhead, live recording waveform, and scrubbing.
     """
 
     # (accent_stripe, clip_bg, header_bg, peak_fill, rms_fill)
@@ -747,9 +874,12 @@ class WaveformTimeline:
     DIM_THEME = ("#586e82", "#17222d", "#1e2c3a", "#364b5e", "#4e677d")
     HEADER_W = 56
     RULER_H = 18
-    LANE_H = 42
+    LANE_H = 40
     CLIP_HDR_H = 11
     PAD_RIGHT = 8
+    SCROLL_H = 10
+    MIN_ZOOM = 1.0
+    MAX_ZOOM = 32.0
 
     def __init__(self, parent, on_seek, bg="#0e1822"):
         self.on_seek = on_seek
@@ -758,6 +888,12 @@ class WaveformTimeline:
         self._view_duration = 0.0
         self._position = 0.0
         self._dragging = False
+
+        # Horizontal zoom & viewport pan state
+        self._zoom = 1.0
+        self._view_start = 0.0
+        self._scroll_dragging = False
+        self._scroll_drag_offset = 0.0
 
         # Per-channel static loaded waveforms: (envelope_list, track_duration_sec, filename)
         self._tracks = [None, None, None, None]
@@ -778,14 +914,14 @@ class WaveformTimeline:
             highlightbackground="#3c5c78",
         )
 
-        # Compact header bar with timecode display
+        # Compact header bar with zoom controls and timecode display
         top_bar = tk.Frame(self.frame, bg="#1b2d3e", height=24, padx=10)
         top_bar.pack(fill=tk.X)
         top_bar.pack_propagate(False)
 
         tk.Label(
             top_bar,
-            text="ARRANGE  ·  WAVEFORMS  (CLICK OR DRAG TO SCRUB)",
+            text="ARRANGE  ·  WAVEFORMS  (DRAG TO SCRUB · SCROLL / ± TO ZOOM)",
             bg="#1b2d3e",
             fg="#8eb0cf",
             font=("Helvetica", 8, "bold"),
@@ -817,6 +953,42 @@ class WaveformTimeline:
             font=("Helvetica", 9, "bold"),
         ).pack(side=tk.RIGHT)
 
+        # Compact studio zoom controls: [ - ] [ 1.0x ] [ + ] [ Fit ]
+        zoom_bar = tk.Frame(top_bar, bg="#1b2d3e")
+        zoom_bar.pack(side=tk.RIGHT, padx=(0, 14))
+
+        self._make_zoom_btn(zoom_bar, "Fit", self.reset_zoom, padx=6).pack(
+            side=tk.RIGHT, padx=(3, 0)
+        )
+        self._make_zoom_btn(zoom_bar, "+", self.zoom_in, padx=6).pack(
+            side=tk.RIGHT, padx=(2, 0)
+        )
+
+        self.zoom_var = tk.StringVar(value="1.0×")
+        zoom_lbl = tk.Label(
+            zoom_bar,
+            textvariable=self.zoom_var,
+            bg="#12202d",
+            fg="#9bd2ff",
+            font=("Helvetica", 8, "bold"),
+            width=5,
+            cursor="hand2",
+            highlightthickness=1,
+            highlightbackground="#33506b",
+        )
+        zoom_lbl.pack(side=tk.RIGHT, padx=(2, 0))
+        zoom_lbl.bind("<Button-1>", lambda _e: self.reset_zoom())
+
+        self._make_zoom_btn(zoom_bar, "−", self.zoom_out, padx=6).pack(side=tk.RIGHT)
+
+        tk.Label(
+            zoom_bar,
+            text="ZOOM",
+            bg="#1b2d3e",
+            fg="#6e8fad",
+            font=("Helvetica", 7, "bold"),
+        ).pack(side=tk.RIGHT, padx=(0, 5))
+
         # Main 4-track waveform canvas
         self.canvas = tk.Canvas(
             self.frame,
@@ -827,6 +999,25 @@ class WaveformTimeline:
             cursor="hand2",
         )
         self.canvas.pack(fill=tk.X, expand=True)
+
+        # Slim horizontal overview / pan scrollbar below lanes
+        self.scroll_canvas = tk.Canvas(
+            self.frame,
+            height=self.SCROLL_H,
+            bg="#12202d",
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.scroll_canvas.pack(fill=tk.X)
+        self._scroll_thumb = self.scroll_canvas.create_rectangle(
+            self.HEADER_W,
+            2,
+            1080,
+            self.SCROLL_H - 2,
+            fill="#22364a",
+            outline="",
+        )
 
         # Persistent playhead items (only these 2 move at 30 FPS!)
         self._playhead_line = self.canvas.create_line(
@@ -854,8 +1045,52 @@ class WaveformTimeline:
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
+        self.canvas.bind("<Shift-MouseWheel>", self._on_shift_wheel)
+        self.canvas.bind("<Button-4>", self._on_wheel_up)
+        self.canvas.bind("<Button-5>", self._on_wheel_down)
+
+        self.scroll_canvas.bind("<Configure>", lambda _e: self._draw_scrollbar())
+        self.scroll_canvas.bind("<ButtonPress-1>", self._on_scroll_press)
+        self.scroll_canvas.bind("<B1-Motion>", self._on_scroll_drag)
+        self.scroll_canvas.bind("<ButtonRelease-1>", self._on_scroll_release)
 
         self.redraw_waveforms()
+
+    @staticmethod
+    def _make_zoom_btn(parent, text, command, padx=5):
+        base_bg = "#23384c"
+        hover_bg = "#304f6b"
+        active_bg = "#162636"
+        lbl = tk.Label(
+            parent,
+            text=text,
+            bg=base_bg,
+            fg="#dcecf9",
+            font=("Helvetica", 8, "bold"),
+            padx=padx,
+            pady=0,
+            cursor="hand2",
+            highlightthickness=1,
+            highlightbackground="#3c5c78",
+        )
+        lbl.bind("<Enter>", lambda _e: lbl.config(bg=hover_bg, fg="#ffffff"))
+        lbl.bind("<Leave>", lambda _e: lbl.config(bg=base_bg, fg="#dcecf9"))
+        lbl.bind("<ButtonPress-1>", lambda _e: lbl.config(bg=active_bg))
+
+        def on_release(event):
+            try:
+                x = event.x_root - lbl.winfo_rootx()
+                y = event.y_root - lbl.winfo_rooty()
+                inside = 0 <= x <= lbl.winfo_width() and 0 <= y <= lbl.winfo_height()
+            except Exception:
+                inside = True
+            lbl.config(bg=hover_bg if inside else base_bg, fg="#ffffff" if inside else "#dcecf9")
+            if inside:
+                command()
+
+        lbl.bind("<ButtonRelease-1>", on_release)
+        return lbl
 
     def _lane_span(self):
         w = self.canvas.winfo_width()
@@ -863,18 +1098,191 @@ class WaveformTimeline:
             w = 1090
         return w, max(1.0, float(w - self.HEADER_W - self.PAD_RIGHT))
 
-    def _x_to_sec(self, x):
-        _, span = self._lane_span()
-        eff_dur = self._effective_duration()
-        if eff_dur <= 0.0:
-            return 0.0
-        frac = max(0.0, min(1.0, (x - self.HEADER_W) / span))
-        return frac * eff_dur
-
     def _effective_duration(self):
         if self._rec_active:
             return max(self._duration, self._rec_elapsed, 8.0)
         return self._duration
+
+    def _visible_window(self):
+        eff_dur = self._effective_duration()
+        if eff_dur <= 0.0:
+            self._view_start = 0.0
+            return 0.0, 0.0, 0.0, 0.0
+        vis_dur = eff_dur / self._zoom
+        max_start = max(0.0, eff_dur - vis_dur)
+        if self._view_start < 0.0:
+            self._view_start = 0.0
+        elif self._view_start > max_start:
+            self._view_start = max_start
+        return self._view_start, self._view_start + vis_dur, vis_dur, eff_dur
+
+    def _sec_to_x(self, sec):
+        _, span = self._lane_span()
+        v_start, _, vis_dur, _ = self._visible_window()
+        if vis_dur <= 0.0:
+            return float(self.HEADER_W)
+        return self.HEADER_W + ((float(sec) - v_start) / vis_dur) * span
+
+    def _x_to_sec(self, x):
+        _, span = self._lane_span()
+        v_start, _, vis_dur, eff_dur = self._visible_window()
+        if eff_dur <= 0.0 or vis_dur <= 0.0:
+            return 0.0
+        frac = max(0.0, min(1.0, (x - self.HEADER_W) / span))
+        return max(0.0, min(eff_dur, v_start + frac * vis_dur))
+
+    # ---------- Zoom & Pan API ----------
+
+    def get_zoom(self):
+        return self._zoom
+
+    def set_zoom(self, new_zoom, anchor_sec=None, anchor_frac=None):
+        """Set horizontal zoom factor [1.0..32.0], keeping anchor_sec pinned at anchor_frac."""
+        clamped = max(self.MIN_ZOOM, min(self.MAX_ZOOM, float(new_zoom)))
+        if abs(clamped - 1.0) < 0.02:
+            clamped = 1.0
+
+        v_start, _, vis_dur, eff_dur = self._visible_window()
+        if eff_dur > 0.0:
+            if anchor_sec is None:
+                anchor_sec = self._position if (v_start <= self._position <= v_start + vis_dur) else (v_start + vis_dur * 0.5)
+            if anchor_frac is None:
+                anchor_frac = ((anchor_sec - v_start) / vis_dur) if vis_dur > 0.0 else 0.5
+            anchor_frac = max(0.0, min(1.0, float(anchor_frac)))
+            new_vis = eff_dur / clamped
+            new_start = anchor_sec - anchor_frac * new_vis
+            self._zoom = clamped
+            self._view_start = max(0.0, min(max(0.0, eff_dur - new_vis), new_start))
+        else:
+            self._zoom = clamped
+            self._view_start = 0.0
+
+        self.zoom_var.set(f"{self._zoom:.1f}×" if self._zoom < 10.0 else f"{int(round(self._zoom))}×")
+        self.redraw_waveforms()
+
+    def zoom_in(self, factor=1.5):
+        self.set_zoom(self._zoom * factor)
+
+    def zoom_out(self, factor=1.5):
+        self.set_zoom(self._zoom / factor)
+
+    def reset_zoom(self):
+        self._zoom = 1.0
+        self._view_start = 0.0
+        self.zoom_var.set("1.0×")
+        self.redraw_waveforms()
+
+    def zoom_at_x(self, factor, x):
+        _, span = self._lane_span()
+        frac = max(0.0, min(1.0, (x - self.HEADER_W) / span))
+        anchor_sec = self._x_to_sec(x)
+        self.set_zoom(self._zoom * factor, anchor_sec=anchor_sec, anchor_frac=frac)
+
+    def pan_by_fraction(self, view_frac):
+        """Pan viewport horizontally by a fraction of the current visible duration."""
+        if self._zoom <= 1.0:
+            return
+        v_start, _, vis_dur, eff_dur = self._visible_window()
+        if eff_dur <= 0.0:
+            return
+        max_start = max(0.0, eff_dur - vis_dur)
+        new_start = max(0.0, min(max_start, v_start + float(view_frac) * vis_dur))
+        if abs(new_start - self._view_start) > 1e-6:
+            self._view_start = new_start
+            self.redraw_waveforms()
+
+    def _on_mouse_wheel(self, event):
+        if self._effective_duration() <= 0.0:
+            return
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            return
+        step = 1 if delta > 0 else -1
+        if event.state & 0x0001:  # Shift held -> horizontal pan
+            self.pan_by_fraction(-step * 0.14)
+        else:
+            self.zoom_at_x(1.25 if step > 0 else (1.0 / 1.25), event.x)
+
+    def _on_shift_wheel(self, event):
+        if self._effective_duration() <= 0.0:
+            return
+        delta = getattr(event, "delta", 0)
+        if delta != 0:
+            step = 1 if delta > 0 else -1
+            self.pan_by_fraction(-step * 0.14)
+
+    def _on_wheel_up(self, event):
+        if self._effective_duration() <= 0.0:
+            return
+        if event.state & 0x0001:
+            self.pan_by_fraction(-0.14)
+        else:
+            self.zoom_at_x(1.25, event.x)
+
+    def _on_wheel_down(self, event):
+        if self._effective_duration() <= 0.0:
+            return
+        if event.state & 0x0001:
+            self.pan_by_fraction(0.14)
+        else:
+            self.zoom_at_x(1.0 / 1.25, event.x)
+
+    # ---------- Horizontal Overview Scrollbar ----------
+
+    def _thumb_bounds(self):
+        _, span = self._lane_span()
+        v_start, _, vis_dur, eff_dur = self._visible_window()
+        if eff_dur <= 0.0 or self._zoom <= 1.0:
+            return float(self.HEADER_W), float(self.HEADER_W) + span
+        thumb_w = max(24.0, (vis_dur / eff_dur) * span)
+        max_start = max(1e-9, eff_dur - vis_dur)
+        avail_travel = max(0.0, span - thumb_w)
+        x0 = self.HEADER_W + (v_start / max_start) * avail_travel
+        return x0, x0 + thumb_w
+
+    def _draw_scrollbar(self):
+        try:
+            x0, x1 = self._thumb_bounds()
+            fill = "#5489bd" if self._scroll_dragging else ("#3d6891" if self._zoom > 1.0 else "#22364a")
+            self.scroll_canvas.coords(self._scroll_thumb, x0, 2, x1, self.SCROLL_H - 2)
+            self.scroll_canvas.itemconfig(self._scroll_thumb, fill=fill)
+        except Exception:
+            pass
+
+    def _on_scroll_press(self, event):
+        if self._zoom <= 1.0 or self._effective_duration() <= 0.0:
+            return
+        x0, x1 = self._thumb_bounds()
+        self._scroll_dragging = True
+        if x0 <= event.x <= x1:
+            self._scroll_drag_offset = event.x - x0
+        else:
+            self._scroll_drag_offset = (x1 - x0) * 0.5
+            self._apply_scroll_x(event.x)
+        self._draw_scrollbar()
+
+    def _on_scroll_drag(self, event):
+        if not self._scroll_dragging:
+            return
+        self._apply_scroll_x(event.x)
+
+    def _on_scroll_release(self, _event):
+        if self._scroll_dragging:
+            self._scroll_dragging = False
+            self._draw_scrollbar()
+
+    def _apply_scroll_x(self, x):
+        _, span = self._lane_span()
+        _, _, vis_dur, eff_dur = self._visible_window()
+        if eff_dur <= 0.0 or self._zoom <= 1.0:
+            return
+        x0, x1 = self._thumb_bounds()
+        thumb_w = x1 - x0
+        avail_travel = max(1.0, span - thumb_w)
+        desired_x0 = max(float(self.HEADER_W), min(self.HEADER_W + avail_travel, x - self._scroll_drag_offset))
+        frac = (desired_x0 - self.HEADER_W) / avail_travel
+        self._view_start = frac * max(0.0, eff_dur - vis_dur)
+        self.redraw_waveforms()
 
     def _on_press(self, event):
         if self._rec_active or self._duration <= 0.0 or event.x < self.HEADER_W:
@@ -917,16 +1325,27 @@ class WaveformTimeline:
 
     def set_duration(self, duration_sec):
         self._duration = max(0.0, float(duration_sec))
+        if self._duration <= 0.0:
+            self._zoom = 1.0
+            self._view_start = 0.0
+            self.zoom_var.set("1.0×")
         if self._position > self._duration and not self._rec_active:
             self._position = self._duration
         self.dur_var.set(format_timecode(self._duration))
         self.redraw_waveforms()
 
-    def set_position(self, pos_sec):
+    def set_position(self, pos_sec, follow=False):
         if self._dragging:
             return
         eff = self._effective_duration()
         self._position = max(0.0, min(eff, float(pos_sec))) if eff > 0.0 else 0.0
+        if follow and self._zoom > 1.0 and eff > 0.0:
+            v_start, v_end, vis_dur, _ = self._visible_window()
+            if self._position < v_start or self._position > v_end - 0.05 * vis_dur:
+                max_start = max(0.0, eff - vis_dur)
+                self._view_start = max(0.0, min(max_start, self._position - 0.15 * vis_dur))
+                self.redraw_waveforms()
+                return
         self._move_playhead_only()
 
     def update_live_recording(self, active, armed_indices=(), peaks=(), elapsed_sec=0.0):
@@ -938,9 +1357,14 @@ class WaveformTimeline:
 
         if active:
             self._position = self._rec_elapsed
-            eff_dur = self._effective_duration()
+            v_start, v_end, vis_dur, eff_dur = self._visible_window()
             self.dur_var.set(format_timecode(eff_dur))
-            if abs(eff_dur - self._view_duration) > 0.5:
+            need_redraw = abs(eff_dur - self._view_duration) > 0.5
+            if self._zoom > 1.0 and (self._position < v_start or self._position > v_end - 0.05 * vis_dur):
+                max_start = max(0.0, eff_dur - vis_dur)
+                self._view_start = max(0.0, min(max_start, self._position - 0.80 * vis_dur))
+                need_redraw = True
+            if need_redraw:
                 self.redraw_waveforms()
             else:
                 self._draw_live_rec_overlay()
@@ -950,14 +1374,14 @@ class WaveformTimeline:
             self.redraw_waveforms()
 
     def redraw_waveforms(self):
-        """Redraw ruler, 4 track lanes, and loaded waveforms (called on load/clear/resize)."""
+        """Redraw ruler, 4 track lanes, and loaded waveforms for current zoom/pan viewport."""
         try:
             self.canvas.delete("static")
             self.canvas.delete("rec_live")
 
             w, span = self._lane_span()
             total_h = self.RULER_H + self.LANE_H * 4
-            eff_dur = self._effective_duration()
+            v_start, v_end, vis_dur, eff_dur = self._visible_window()
             self._view_duration = eff_dur
 
             # Time ruler background
@@ -970,10 +1394,12 @@ class WaveformTimeline:
 
             # Vertical time grid ticks in ruler + subtle guides across lanes
             num_ticks = 8
-            if eff_dur > 0.0:
+            if eff_dur > 0.0 and vis_dur > 0.0:
+                show_tenths = vis_dur < 16.0
                 for t_idx in range(num_ticks + 1):
                     frac = t_idx / float(num_ticks)
                     gx = self.HEADER_W + frac * span
+                    tick_sec = v_start + frac * vis_dur
                     self.canvas.create_line(
                         gx, self.RULER_H, gx, total_h, fill="#162635", tags=("static",)
                     )
@@ -981,7 +1407,7 @@ class WaveformTimeline:
                         self.canvas.create_text(
                             gx + 3,
                             self.RULER_H // 2,
-                            text=format_timecode(frac * eff_dur),
+                            text=format_ruler_time(tick_sec, show_tenths=show_tenths),
                             fill="#6e8fad",
                             font=("Helvetica", 7),
                             anchor="w",
@@ -1027,14 +1453,21 @@ class WaveformTimeline:
                     0, y1 - 1, w, y1 - 1, fill="#22364a", tags=("static",)
                 )
 
-                # Draw Pro DAW audio clip region (header + dual-layer Peak/RMS filled polygons)
+                # Draw Pro DAW audio clip region clipped to visible viewport [v_start, v_end]
                 track = self._tracks[ch]
-                if track is not None and eff_dur > 0.0:
+                if track is not None and eff_dur > 0.0 and vis_dur > 0.0:
                     envelope, track_dur, clip_label = track
                     if envelope and track_dur > 0.0:
-                        clip_w = max(6.0, min(span, (track_dur / eff_dur) * span))
-                        x_start = float(self.HEADER_W)
+                        clip_t0 = max(0.0, v_start)
+                        clip_t1 = min(track_dur, v_end)
+                        if clip_t1 <= clip_t0:
+                            continue
+
+                        x_start = self.HEADER_W + ((clip_t0 - v_start) / vis_dur) * span
+                        x_end = self.HEADER_W + ((clip_t1 - v_start) / vis_dur) * span
+                        clip_w = max(2.0, x_end - x_start)
                         x_end = x_start + clip_w
+
                         cy0 = y0 + 2
                         cy1 = y1 - 2
                         wf_y0 = cy0 + self.CLIP_HDR_H
@@ -1071,7 +1504,10 @@ class WaveformTimeline:
 
                         # Build continuous filled Peak & RMS polygons (~1.5px per vertex)
                         n_bins = len(envelope)
-                        n_pts = max(2, min(n_bins, int(clip_w / 1.5)))
+                        b_start_f = (clip_t0 / track_dur) * (n_bins - 1)
+                        b_end_f = (clip_t1 / track_dur) * (n_bins - 1)
+                        vis_bins = max(1.0, b_end_f - b_start_f)
+                        n_pts = max(2, min(int(clip_w / 1.5), max(2, int(math.ceil(vis_bins)) + 1)))
                         inner_w = max(1.0, clip_w - 2.0)
 
                         pk_top = []
@@ -1081,14 +1517,40 @@ class WaveformTimeline:
 
                         for p in range(n_pts):
                             frac_p = p / float(max(1, n_pts - 1))
-                            b_idx = int(frac_p * (n_bins - 1))
-                            item = envelope[b_idx]
-                            if isinstance(item, tuple):
-                                lo_v, hi_v, rms_v = item
+                            b_pos = b_start_f + frac_p * (b_end_f - b_start_f)
+                            if vis_bins > n_pts:
+                                # Aggregate min/max across covered bins so transients never vanish
+                                next_frac = (p + 1) / float(max(1, n_pts - 1))
+                                bi0 = max(0, min(n_bins - 1, int(b_pos)))
+                                bi1 = max(bi0 + 1, min(n_bins, int(b_start_f + next_frac * (b_end_f - b_start_f)) + 1))
+                                lo_v = 0.0
+                                hi_v = 0.0
+                                rms_v = 0.0
+                                for bi in range(bi0, bi1):
+                                    it = envelope[bi]
+                                    if isinstance(it, tuple):
+                                        if it[0] < lo_v:
+                                            lo_v = it[0]
+                                        if it[1] > hi_v:
+                                            hi_v = it[1]
+                                        if it[2] > rms_v:
+                                            rms_v = it[2]
+                                    else:
+                                        v = float(it)
+                                        if -v < lo_v:
+                                            lo_v = -v
+                                        if v > hi_v:
+                                            hi_v = v
+                                        if v * 0.65 > rms_v:
+                                            rms_v = v * 0.65
                             else:
-                                # Backward-compatible fallback if scalar peak list passed
-                                v = float(item)
-                                lo_v, hi_v, rms_v = -v, v, v * 0.65
+                                bi = max(0, min(n_bins - 1, int(round(b_pos))))
+                                item = envelope[bi]
+                                if isinstance(item, tuple):
+                                    lo_v, hi_v, rms_v = item
+                                else:
+                                    v = float(item)
+                                    lo_v, hi_v, rms_v = -v, v, v * 0.65
 
                             px = x_start + 1.0 + frac_p * inner_w
                             y_hi = wf_mid - max(0.0, hi_v) * max_amp
@@ -1124,6 +1586,7 @@ class WaveformTimeline:
             if self._rec_active:
                 self._draw_live_rec_overlay()
 
+            self._draw_scrollbar()
             self._move_playhead_only()
             self.canvas.tag_raise("playhead")
         except Exception:
@@ -1135,12 +1598,20 @@ class WaveformTimeline:
             if not self._rec_active or not self._rec_armed:
                 return
             _, span = self._lane_span()
-            eff_dur = self._effective_duration()
-            if eff_dur <= 0.0:
+            v_start, v_end, vis_dur, eff_dur = self._visible_window()
+            if eff_dur <= 0.0 or vis_dur <= 0.0:
                 return
-            clip_w = max(6.0, min(span, (self._rec_elapsed / eff_dur) * span))
-            x_start = float(self.HEADER_W)
-            x_end = x_start + clip_w
+
+            rec_dur = max(0.0, self._rec_elapsed)
+            clip_t0 = max(0.0, v_start)
+            clip_t1 = min(rec_dur, v_end)
+            if clip_t1 <= clip_t0 and rec_dur > 0.0:
+                return
+
+            x_start = self.HEADER_W + ((clip_t0 - v_start) / vis_dur) * span
+            x_end = self.HEADER_W + ((clip_t1 - v_start) / vis_dur) * span
+            clip_w = max(6.0, x_end - x_start)
+            x_end = min(self.HEADER_W + span, x_start + clip_w)
             peaks = self._rec_peaks
             n_peaks = len(peaks)
 
@@ -1173,14 +1644,16 @@ class WaveformTimeline:
                         anchor="w",
                         tags=("rec_live",),
                     )
-                if n_peaks >= 2:
+                if n_peaks >= 2 and rec_dur > 0.0:
+                    p_start_f = (clip_t0 / rec_dur) * (n_peaks - 1)
+                    p_end_f = (clip_t1 / rec_dur) * (n_peaks - 1)
                     n_pts = max(2, min(n_peaks, int(clip_w / 1.5)))
-                    inner_w = max(1.0, clip_w - 2.0)
+                    inner_w = max(1.0, (x_end - x_start) - 2.0)
                     poly_top = []
                     poly_bot = []
                     for p in range(n_pts):
                         frac_p = p / float(max(1, n_pts - 1))
-                        p_idx = int(frac_p * (n_peaks - 1))
+                        p_idx = max(0, min(n_peaks - 1, int(round(p_start_f + frac_p * (p_end_f - p_start_f)))))
                         amp = max(1.0, min(1.0, peaks[p_idx]) * max_amp)
                         px = x_start + 1.0 + frac_p * inner_w
                         poly_top.extend((px, wf_mid - amp))
@@ -1201,16 +1674,23 @@ class WaveformTimeline:
         try:
             _, span = self._lane_span()
             total_h = self.RULER_H + self.LANE_H * 4
-            eff_dur = self._effective_duration()
-            frac = (self._position / eff_dur) if eff_dur > 0.0 else 0.0
-            frac = max(0.0, min(1.0, frac))
+            v_start, v_end, vis_dur, eff_dur = self._visible_window()
+            if eff_dur > 0.0 and vis_dur > 0.0:
+                if self._position < v_start - 1e-6 or self._position > v_end + 1e-6:
+                    self.canvas.itemconfig(self._playhead_line, state="hidden")
+                    self.canvas.itemconfig(self._playhead_cap, state="hidden")
+                    return
+                frac = max(0.0, min(1.0, (self._position - v_start) / vis_dur))
+            else:
+                frac = 0.0
             cx = self.HEADER_W + frac * span
             cap_col = "#f24957" if self._rec_active else "#48d18a"
+            self.canvas.itemconfig(self._playhead_line, state="normal")
+            self.canvas.itemconfig(self._playhead_cap, state="normal", fill=cap_col)
             self.canvas.coords(self._playhead_line, cx, self.RULER_H - 2, cx, total_h)
             self.canvas.coords(
                 self._playhead_cap, cx - 5, 3, cx + 5, 3, cx, self.RULER_H - 1
             )
-            self.canvas.itemconfig(self._playhead_cap, fill=cap_col)
         except Exception:
             pass
 
@@ -1252,6 +1732,8 @@ class Window:
         self._pause_event = threading.Event()
         self._pause_event.set()  # Set = running, Cleared = paused
         self._active_thread = None
+        self._main_thread_id = threading.get_ident()
+        self._ui_queue = queue.Queue()
         self.playing = False
         self.paused = False
         self.recording = False
@@ -1277,6 +1759,9 @@ class Window:
         self._rec_wave_lock = threading.Lock()
         self._rec_wave_armed = []
         self._rec_wave_peaks = []
+        self._rec_wave_stride = 1
+        self._rec_wave_accum = 0.0
+        self._rec_wave_count = 0
         self._rec_wave_elapsed = 0.0
         self._rec_wave_active = False
 
@@ -1297,6 +1782,13 @@ class Window:
         self.root.configure(bg=self.THEME["bg_root"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<space>", self._on_space_key)
+        self.root.bind("<Button-1>", self._on_root_click, add="+")
+        for key in ("<plus>", "<equal>", "<KP_Add>"):
+            self.root.bind(key, lambda _e: self._on_zoom_key("in"))
+        for key in ("<minus>", "<KP_Subtract>"):
+            self.root.bind(key, lambda _e: self._on_zoom_key("out"))
+        for key in ("<Key-0>", "<KP_0>"):
+            self.root.bind(key, lambda _e: self._on_zoom_key("reset"))
 
         self.font_header = font.Font(family="Helvetica", weight="bold", size=11)
         self.font_section = font.Font(family="Helvetica", weight="bold", size=8)
@@ -1356,6 +1848,12 @@ class Window:
             return 0 <= x <= widget.winfo_width() and 0 <= y <= widget.winfo_height()
         except Exception:
             return True
+
+    @staticmethod
+    def _reset_scale(scale, value):
+        """Reset a tk.Scale on double-click and suppress default class click handling."""
+        scale.set(value)
+        return "break"
 
     def _make_flat_button(
         self,
@@ -1686,9 +2184,10 @@ class Window:
             hover_state["toggle"] = True
             refresh_visuals()
 
-        def on_toggle_leave(_e):
-            hover_state["toggle"] = False
-            refresh_visuals()
+        def on_toggle_leave(e):
+            if not self._pointer_in_widget(toggle_area, e):
+                hover_state["toggle"] = False
+                refresh_visuals()
 
         def on_edit_click(_e):
             self.open_effect_window(channel_idx, fx_key)
@@ -1945,7 +2444,7 @@ class Window:
                 command=lambda val, c=idx, lbl=pan_label_var: self._on_pan_change(c, val, lbl),
             )
             pan_scale.set(0.5)
-            pan_scale.bind("<Double-Button-1>", lambda _e, s=pan_scale: s.set(0.5))
+            pan_scale.bind("<Double-Button-1>", lambda _e, s=pan_scale: self._reset_scale(s, 0.5))
             pan_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
             tk.Label(
@@ -2003,7 +2502,7 @@ class Window:
                 ),
             )
             vol_scale.set(0.0)
-            vol_scale.bind("<Double-Button-1>", lambda _e, s=vol_scale: s.set(0.0))
+            vol_scale.bind("<Double-Button-1>", lambda _e, s=vol_scale: self._reset_scale(s, 0.0))
             vol_scale.pack(side=tk.LEFT, padx=(0, 2))
 
             ticks_frame = tk.Frame(fader_row, bg=T["bg_strip"], width=32, height=fader_len)
@@ -2184,20 +2683,20 @@ class Window:
         )
         self.master_vol_badge.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(3, 0))
 
-        # Stereo L/R VU meters + Master Fader + dB ticks
-        fader_len = 236
+        # Stereo L/R VU meters + Master Fader + dB ticks (sized to fill Master Bus strip)
+        fader_len = 332
         bus_row = tk.Frame(strip, bg="#263e54")
-        bus_row.pack(pady=(0, 4))
+        bus_row.pack(expand=True, pady=(2, 4))
 
         meters_col = tk.Frame(bus_row, bg="#263e54")
-        meters_col.pack(side=tk.LEFT, padx=(4, 6))
+        meters_col.pack(side=tk.LEFT, padx=(4, 8))
 
         lr_pair = tk.Frame(meters_col, bg="#263e54")
         lr_pair.pack()
 
-        meter_l = ChannelMeter(lr_pair, width=14, height=fader_len, segments=28)
-        meter_r = ChannelMeter(lr_pair, width=14, height=fader_len, segments=28)
-        meter_l.canvas.pack(side=tk.LEFT, padx=(0, 2))
+        meter_l = ChannelMeter(lr_pair, width=16, height=fader_len, segments=42)
+        meter_r = ChannelMeter(lr_pair, width=16, height=fader_len, segments=42)
+        meter_l.canvas.pack(side=tk.LEFT, padx=(0, 3))
         meter_r.canvas.pack(side=tk.LEFT)
         self._master_meters = [meter_l, meter_r]
 
@@ -2205,10 +2704,10 @@ class Window:
         lr_labels.pack(fill=tk.X, pady=(3, 0))
         tk.Label(
             lr_labels, text="L", bg="#263e54", fg=T["text_muted"], font=("Helvetica", 8, "bold")
-        ).pack(side=tk.LEFT, padx=(4, 0))
+        ).pack(side=tk.LEFT, padx=(5, 0))
         tk.Label(
             lr_labels, text="R", bg="#263e54", fg=T["text_muted"], font=("Helvetica", 8, "bold")
-        ).pack(side=tk.RIGHT, padx=(0, 4))
+        ).pack(side=tk.RIGHT, padx=(0, 5))
 
         fader_col = tk.Frame(bus_row, bg="#263e54")
         fader_col.pack(side=tk.LEFT, anchor="n")
@@ -2226,11 +2725,11 @@ class Window:
             activebackground="#ffd166",
             highlightthickness=0,
             bd=0,
-            sliderlength=24,
+            sliderlength=26,
             command=self._on_master_vol_change,
         )
         self.master_scale.set(0.0)
-        self.master_scale.bind("<Double-Button-1>", lambda _e: self.master_scale.set(0.0))
+        self.master_scale.bind("<Double-Button-1>", lambda _e: self._reset_scale(self.master_scale, 0.0))
         self.master_scale.pack(side=tk.LEFT, padx=(0, 2))
 
         ticks_frame = tk.Frame(fader_col, bg="#263e54", width=32, height=fader_len)
@@ -2243,12 +2742,14 @@ class Window:
             (0.0, "0"),
             (-6.0, "-6"),
             (-12.0, "-12"),
+            (-18.0, "-18"),
             (-24.0, "-24"),
-            (-42.0, "-42"),
+            (-36.0, "-36"),
+            (-48.0, "-48"),
             (MIN_FADER_DB, "-∞"),
         ):
             frac = (MAX_FADER_DB - tick_db) / db_span
-            rely = 0.06 + 0.88 * frac
+            rely = 0.04 + 0.92 * frac
             fg_col = T["unity_gold"] if tick_db == 0.0 else T["text_muted"]
             tk.Label(
                 ticks_frame,
@@ -2422,6 +2923,8 @@ class Window:
             highlightcolor="#63b3ed",
         )
         self.nameBox.pack(padx=12, pady=(0, 10), ipady=5, fill=tk.X)
+        self.nameBox.bind("<Return>", lambda _e: self.root.focus_set())
+        self.nameBox.bind("<Escape>", lambda _e: self.root.focus_set())
 
         self.export_button = self._make_flat_button(
             panel,
@@ -2480,8 +2983,8 @@ class Window:
 
         tips = (
             "• Click / drag top bar to scrub\n"
+            "• Scroll / ± keys to zoom waveform\n"
             "• Spacebar toggles Play / Pause\n"
-            "• Click ✕ to clear loaded audio\n"
             "• Double-click fader / pan to reset\n"
             "• Arm ● Rec (flashes), click REC"
         )
@@ -2500,10 +3003,24 @@ class Window:
     def _ui_call(self, fn, *args, **kwargs):
         if self._closing:
             return
-        try:
-            self.root.after(0, lambda: fn(*args, **kwargs))
-        except tk.TclError:
-            pass
+        if threading.get_ident() == self._main_thread_id:
+            try:
+                fn(*args, **kwargs)
+            except tk.TclError:
+                pass
+        else:
+            self._ui_queue.put((fn, args, kwargs))
+
+    def _drain_ui_queue(self):
+        while not self._closing:
+            try:
+                fn, args, kwargs = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args, **kwargs)
+            except tk.TclError:
+                pass
 
     def _set_status(self, text):
         self._ui_call(self.status_var.set, text)
@@ -2604,7 +3121,11 @@ class Window:
             self._set_status(f"Playhead: {format_timecode(clamped)}")
 
     def _poll_meters(self):
-        """30 FPS main-thread loop: VU meters, playhead sync, and armed Rec LED flashing."""
+        """30 FPS main-thread loop: UI queue drain, VU meters, playhead sync, and Rec LED flash."""
+        if self._closing:
+            return
+
+        self._drain_ui_queue()
         if self._closing:
             return
 
@@ -2652,7 +3173,7 @@ class Window:
             elif is_playing:
                 with self._seek_lock:
                     pos_sec = self._playhead_sec
-                self.timeline.set_position(pos_sec)
+                self.timeline.set_position(pos_sec, follow=True)
 
         # Synchronized ~2 Hz flash for armed Rec buttons (solid red while actively recording)
         self._blink_tick += 1
@@ -2682,6 +3203,31 @@ class Window:
         except tk.TclError:
             pass
 
+    def _on_root_click(self, event):
+        """Release focus from nameBox when clicking elsewhere so Spacebar shortcut keeps working."""
+        if hasattr(self, "nameBox") and event.widget is not self.nameBox:
+            try:
+                if self.root.focus_get() == self.nameBox:
+                    self.root.focus_set()
+            except Exception:
+                pass
+
+    def _on_zoom_key(self, action):
+        """Keyboard zoom shortcuts (+ / - / 0), ignored while typing in Name box."""
+        try:
+            if self.root.focus_get() == self.nameBox:
+                return
+        except Exception:
+            pass
+        if not hasattr(self, "timeline"):
+            return
+        if action == "in":
+            self.timeline.zoom_in()
+        elif action == "out":
+            self.timeline.zoom_out()
+        elif action == "reset":
+            self.timeline.reset_zoom()
+
     def _on_space_key(self, _event):
         """Spacebar shortcut to Play / Pause / Resume (ignored while typing in Name box)."""
         try:
@@ -2691,6 +3237,9 @@ class Window:
             pass
         with self._state_lock:
             is_playing = self.playing
+            is_busy_other = self.recording or self.bouncing
+        if is_busy_other:
+            return
         if is_playing:
             self.press_pause()
         else:
@@ -2783,6 +3332,14 @@ class Window:
     # ---------- File Loading ----------
 
     def open_channel_file(self, channel_idx):
+        if self._is_busy():
+            messagebox.showinfo(
+                "Mixer Busy",
+                "Please stop playback, recording, or bounce before loading a channel.",
+                parent=self.root,
+            )
+            return
+
         filepath = askopenfilename(
             parent=self.root,
             title=f"Load WAV for Channel {channel_idx + 1}",
@@ -2795,8 +3352,13 @@ class Window:
             with wave.open(filepath, "rb") as wf:
                 channels = wf.getnchannels()
                 samplefreq = wf.getframerate()
-                bitdepth = wf.getsampwidth() * 8
-                length = int(wf.getnframes() / max(1, samplefreq))
+                sampwidth = wf.getsampwidth()
+                bitdepth = sampwidth * 8
+                if channels <= 0 or samplefreq <= 0:
+                    raise ValueError(f"Invalid WAV header (channels={channels}, rate={samplefreq})")
+                if sampwidth not in (1, 2, 3, 4):
+                    raise ValueError(f"Unsupported WAV bit depth: {bitdepth}-bit")
+                length = int(wf.getnframes() / samplefreq)
         except Exception as exc:
             messagebox.showerror("Error loading WAV", f"Could not open file:\n{exc}", parent=self.root)
             return
@@ -2819,6 +3381,8 @@ class Window:
             f"  Bit Depth: {bitdepth}-bit\n"
             f"  Duration: {mins}:{secs:02d}"
         )
+        if hasattr(self, "timeline"):
+            self.timeline.clear_track(channel_idx)
         self._update_session_duration()
         self._load_channel_waveform_async(channel_idx, filepath)
         self._set_status(f"Loaded Ch {channel_idx + 1}: {os.path.basename(filepath)}")
@@ -2827,7 +3391,7 @@ class Window:
         """Extract waveform envelope on a background thread and paint it on the Arrange view."""
         def _worker():
             try:
-                peaks, dur = extract_waveform_peaks(filepath, num_bins=600)
+                peaks, dur = extract_waveform_peaks(filepath, num_bins=2400)
             except Exception as exc:
                 print(f"Waveform extraction skipped: {exc}")
                 return
@@ -2888,26 +3452,52 @@ class Window:
             return False
         return True
 
+    @staticmethod
+    def _audible_delay_indices(snapshots, master_gain=1.0):
+        """Return indices of loaded, audible channels that have Delay enabled."""
+        if float(master_gain) <= 0.0:
+            return []
+        any_solo = any(s.solo for s in snapshots)
+        return [
+            idx
+            for idx, s in enumerate(snapshots)
+            if s.filepath
+            and s.delay_enabled
+            and (not s.mute)
+            and (not any_solo or s.solo)
+            and s.volume > 0.0
+        ]
+
     def press_play(self):
         if not self._require_pyaudio("playback"):
             return
 
+        resumed = False
+        busy = False
+        already_playing = False
         with self._state_lock:
             if self.playing:
+                already_playing = True
                 if self.paused:
                     # Resume seamlessly from paused position
                     self.paused = False
                     self._pause_event.set()
-                    self._ui_call(self._set_pause_lit, False)
-                    self._ui_call(self._set_play_lit, True)
-                return
-            if self.recording or self.bouncing:
-                messagebox.showinfo(
-                    "Mixer Busy",
-                    "Please stop recording or wait for bounce to finish before playing.",
-                    parent=self.root,
-                )
-                return
+                    resumed = True
+            elif self.recording or self.bouncing:
+                busy = True
+
+        if already_playing:
+            if resumed:
+                self._ui_call(self._set_pause_lit, False)
+                self._ui_call(self._set_play_lit, True)
+            return
+        if busy:
+            messagebox.showinfo(
+                "Mixer Busy",
+                "Please stop recording or wait for bounce to finish before playing.",
+                parent=self.root,
+            )
+            return
 
         loaded = [ch.get_filepath() for ch in self.channel_states if ch.get_filepath()]
         if not loaded:
@@ -2962,7 +3552,7 @@ class Window:
         pa = None
         stream = None
         wav_handles = [None] * 4
-        wav_meta = [None] * 4  # (nchannels, sampwidth, framerate)
+        readers = [None] * 4
 
         try:
             print("Now playing...")
@@ -2973,10 +3563,9 @@ class Window:
                 if path:
                     wf = wave.open(path, "rb")
                     wav_handles[idx] = wf
-                    meta = (wf.getnchannels(), wf.getsampwidth(), wf.getframerate())
-                    wav_meta[idx] = meta
-                    if session_rate is None and meta[2] > 0:
-                        session_rate = meta[2]
+                    fr = wf.getframerate()
+                    if session_rate is None and fr > 0:
+                        session_rate = fr
 
             if session_rate is None:
                 session_rate = self.rate
@@ -3001,15 +3590,15 @@ class Window:
                     frames_per_buffer=self.buffer,
                 )
 
+            for idx, wf in enumerate(wav_handles):
+                if wf is not None:
+                    readers[idx] = StreamingWavReader(wf, session_rate)
+
             def _apply_seek(target_sec):
                 nonlocal frames_played, in_tail, tail_frames_remaining, tail_frames_emitted
-                for i, wf_h in enumerate(wav_handles):
-                    if wf_h is None:
-                        continue
-                    fr_i = max(1, wav_meta[i][2])
-                    pos_frame = int(round(target_sec * fr_i))
-                    pos_frame = max(0, min(wf_h.getnframes(), pos_frame))
-                    wf_h.setpos(pos_frame)
+                for rdr in readers:
+                    if rdr is not None:
+                        rdr.seek(target_sec)
                 for ch_s in self.channel_states:
                     ch_s.reset_effects()
                 frames_played = int(round(target_sec * session_rate))
@@ -3081,35 +3670,28 @@ class Window:
                 chunks = [[] for _ in range(4)]
                 any_data = False
 
-                for idx, wf in enumerate(wav_handles):
-                    if wf is None:
+                for idx, rdr in enumerate(readers):
+                    if rdr is None:
                         continue
-                    nch, sw, fr = wav_meta[idx]
-                    read_frames = (
-                        self.buffer
-                        if fr == session_rate
-                        else max(1, int(round(self.buffer * (fr / float(session_rate)))))
-                    )
-                    raw = wf.readframes(read_frames)
-                    if not raw:
+                    mono = rdr.read(self.buffer)
+                    if not mono:
                         continue
                     any_data = True
-                    mono = decode_pcm_to_mono_float(raw, sw, nch)
-                    if fr != session_rate:
-                        target = max(1, int(round(len(mono) * (session_rate / float(fr)))))
-                        mono = resample_linear(mono, target)
                     chunks[idx] = mono
 
                 snapshots = [ch.snapshot() for ch in self.channel_states]
+                master_gain = self._get_master_volume()
 
                 if not any_data:
                     if not in_tail:
-                        delay_snaps = [s for s in snapshots if s.filepath and s.delay_enabled]
-                        if not delay_snaps:
+                        delay_indices = self._audible_delay_indices(snapshots, master_gain)
+                        if not delay_indices:
                             print("Audio ended")
                             break
                         in_tail = True
-                        max_delay_ms = max(s.delay.get_params()[0] for s in delay_snaps)
+                        max_delay_ms = max(
+                            snapshots[i].delay.get_params()[0] for i in delay_indices
+                        )
                         min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + self.buffer
                         tail_frames_remaining = max(int(session_rate * 2.5), min_tail_frames * 2)
                     if tail_frames_remaining <= 0:
@@ -3118,16 +3700,19 @@ class Window:
                     tail_chunk_len = min(self.buffer, tail_frames_remaining)
                     tail_frames_remaining -= tail_chunk_len
                     tail_frames_emitted += tail_chunk_len
-                    for idx, s in enumerate(snapshots):
-                        if s.filepath and s.delay_enabled:
-                            chunks[idx] = [0.0] * tail_chunk_len
+                    delay_indices = self._audible_delay_indices(snapshots, master_gain)
+                    if not delay_indices:
+                        print("Audio ended")
+                        break
+                    for idx in delay_indices:
+                        chunks[idx] = [0.0] * tail_chunk_len
 
                 pcm_bytes = mix_stereo_chunk(
                     chunks,
                     snapshots,
                     session_rate,
                     out_levels=chunk_levels,
-                    master_gain=self._get_master_volume(),
+                    master_gain=master_gain,
                     out_master_levels=master_levels,
                     out_peaks=chunk_true_peaks,
                     out_master_peaks=master_true_peaks,
@@ -3149,7 +3734,8 @@ class Window:
                     frames_played += len(pcm_bytes) // 4  # 2 channels * 2 bytes
                     if hasattr(self, "_seek_lock"):
                         with self._seek_lock:
-                            self._playhead_sec = frames_played / float(session_rate)
+                            if self._pending_seek_sec is None:
+                                self._playhead_sec = frames_played / float(session_rate)
 
                 now = time.monotonic()
                 if now - last_ui_update >= 0.25:
@@ -3208,19 +3794,26 @@ class Window:
         if not self._require_pyaudio("recording"):
             return
 
+        stopping = False
+        busy = False
         with self._state_lock:
             if self.recording:
                 # Clicking Rec again stops recording
                 self._stop_event.set()
-                self._set_status("Stopping recording...")
-                return
-            if self.playing or self.bouncing:
-                messagebox.showinfo(
-                    "Mixer Busy",
-                    "Please stop playback or wait for bounce to finish before recording.",
-                    parent=self.root,
-                )
-                return
+                stopping = True
+            elif self.playing or self.bouncing:
+                busy = True
+
+        if stopping:
+            self._set_status("Stopping recording...")
+            return
+        if busy:
+            messagebox.showinfo(
+                "Mixer Busy",
+                "Please stop playback or wait for bounce to finish before recording.",
+                parent=self.root,
+            )
+            return
 
         armed_indices = [
             idx for idx, ch in enumerate(self.channel_states) if ch.snapshot().rec_armed
@@ -3228,18 +3821,27 @@ class Window:
         if not armed_indices:
             messagebox.showinfo(
                 "No Channel Armed",
-                "Please arm at least one channel by checking its 'Rec' checkbox before recording.",
+                "Please arm at least one channel by enabling its '● Rec' button before recording.",
                 parent=self.root,
             )
             return
 
-        base_name = self.nameEntry.get().strip()
-        if not base_name:
+        raw_name = self.nameEntry.get().strip()
+        if not raw_name:
             base_name = f"recording_{time.strftime('%Y%m%d_%H%M%S')}"
-        elif base_name.lower().endswith(".wav"):
-            base_name = base_name[:-4]
+        else:
+            base_name = sanitize_filename_stem(raw_name)
+            if not base_name:
+                messagebox.showerror(
+                    "Invalid Recording Name",
+                    "Please enter a valid filename (avoid slashes or special path characters).",
+                    parent=self.root,
+                )
+                return
 
         with self._state_lock:
+            if self.playing or self.recording or self.bouncing:
+                return
             self.recording = True
             self._stop_event.clear()
 
@@ -3262,8 +3864,9 @@ class Window:
         in_stream = None
         out_stream = None
         wav_handles = [None] * 4
-        wav_meta = [None] * 4
+        readers = [None] * 4
         recorded_frames = []
+        armed_set = set(armed_indices)
 
         try:
             print(f"Recording started on channel(s): {[i + 1 for i in armed_indices]}")
@@ -3291,13 +3894,13 @@ class Window:
             # Open non-armed loaded channels for synchronized overdub playback
             has_overdub = False
             for idx, ch in enumerate(self.channel_states):
-                if idx in armed_indices:
+                if idx in armed_set:
                     continue
                 path = ch.get_filepath()
                 if path:
                     wf = wave.open(path, "rb")
                     wav_handles[idx] = wf
-                    wav_meta[idx] = (wf.getnchannels(), wf.getsampwidth(), wf.getframerate())
+                    readers[idx] = StreamingWavReader(wf, session_rate)
                     has_overdub = True
 
             if has_overdub:
@@ -3315,6 +3918,10 @@ class Window:
 
             frames_recorded = 0
             last_ui_update = 0.0
+            overdub_in_tail = False
+            overdub_tail_rem = 0
+            overdub_tail_emitted = 0
+            overdub_min_tail = 0
             chunk_levels = [0.0, 0.0, 0.0, 0.0]
             master_levels = [0.0, 0.0]
             chunk_true_peaks = [0.0, 0.0, 0.0, 0.0]
@@ -3324,6 +3931,9 @@ class Window:
                 with self._rec_wave_lock:
                     self._rec_wave_armed = list(armed_indices)
                     self._rec_wave_peaks = []
+                    self._rec_wave_stride = 1
+                    self._rec_wave_accum = 0.0
+                    self._rec_wave_count = 0
                     self._rec_wave_elapsed = 0.0
                     self._rec_wave_active = True
 
@@ -3357,42 +3967,86 @@ class Window:
                 master_true_peaks[0] = 0.0
                 master_true_peaks[1] = 0.0
 
-                # Play back other tracks in sync if available
+                # Play back non-armed tracks in sync if available
                 if out_stream is not None:
                     chunks = [[] for _ in range(4)]
                     any_data = False
-                    for idx, wf in enumerate(wav_handles):
-                        if wf is None:
+                    for idx, rdr in enumerate(readers):
+                        if rdr is None:
                             continue
-                        nch, sw, fr = wav_meta[idx]
-                        read_frames = (
-                            self.buffer
-                            if fr == session_rate
-                            else max(1, int(round(self.buffer * (fr / float(session_rate)))))
-                        )
-                        raw = wf.readframes(read_frames)
-                        if not raw:
+                        mono = rdr.read(self.buffer)
+                        if not mono:
                             continue
                         any_data = True
-                        mono = decode_pcm_to_mono_float(raw, sw, nch)
-                        if fr != session_rate:
-                            target = max(1, int(round(len(mono) * (session_rate / float(fr)))))
-                            mono = resample_linear(mono, target)
                         chunks[idx] = mono
-                    if any_data:
-                        snapshots = [ch.snapshot() for ch in self.channel_states]
+
+                    raw_snaps = [ch.snapshot() for ch in self.channel_states]
+                    # Mask armed channels so Solo on an armed track cannot silence backing tracks
+                    snapshots = [
+                        s._replace(solo=False, mute=True, filepath=None)
+                        if idx in armed_set
+                        else s
+                        for idx, s in enumerate(raw_snaps)
+                    ]
+                    master_gain = self._get_master_volume()
+
+                    close_overdub = False
+                    if not any_data:
+                        if not overdub_in_tail:
+                            delay_indices = self._audible_delay_indices(snapshots, master_gain)
+                            if not delay_indices:
+                                close_overdub = True
+                            else:
+                                overdub_in_tail = True
+                                max_delay_ms = max(
+                                    snapshots[i].delay.get_params()[0] for i in delay_indices
+                                )
+                                overdub_min_tail = (
+                                    int(max_delay_ms * session_rate / 1000.0) + self.buffer
+                                )
+                                overdub_tail_rem = max(
+                                    int(session_rate * 2.5), overdub_min_tail * 2
+                                )
+                        if not close_overdub:
+                            if overdub_tail_rem <= 0:
+                                close_overdub = True
+                            else:
+                                delay_indices = self._audible_delay_indices(snapshots, master_gain)
+                                if not delay_indices:
+                                    close_overdub = True
+                                else:
+                                    tail_len = min(self.buffer, overdub_tail_rem)
+                                    overdub_tail_rem -= tail_len
+                                    overdub_tail_emitted += tail_len
+                                    for idx in delay_indices:
+                                        chunks[idx] = [0.0] * tail_len
+
+                    if not close_overdub:
                         pcm_bytes = mix_stereo_chunk(
                             chunks,
                             snapshots,
                             session_rate,
                             out_levels=chunk_levels,
-                            master_gain=self._get_master_volume(),
+                            master_gain=master_gain,
                             out_master_levels=master_levels,
                             out_peaks=chunk_true_peaks,
                             out_master_peaks=master_true_peaks,
                         )
-                        if pcm_bytes:
+                        if overdub_in_tail and overdub_tail_emitted > overdub_min_tail and pcm_bytes:
+                            check = array.array("h")
+                            check.frombytes(pcm_bytes)
+                            if max(abs(v) for v in check) < 4:
+                                close_overdub = True
+                        if not close_overdub and pcm_bytes:
                             out_stream.write(pcm_bytes)
+
+                    if close_overdub:
+                        try:
+                            out_stream.stop_stream()
+                            out_stream.close()
+                        except Exception:
+                            pass
+                        out_stream = None
 
                 for idx in armed_indices:
                     chunk_levels[idx] = in_vu
@@ -3403,13 +4057,25 @@ class Window:
 
                 if hasattr(self, "_rec_wave_lock"):
                     with self._rec_wave_lock:
-                        self._rec_wave_peaks.append(in_pk)
-                        # Keep live peak list bounded for fast drawing on very long recordings
-                        if len(self._rec_wave_peaks) > 1200:
-                            self._rec_wave_peaks = [
-                                max(self._rec_wave_peaks[k], self._rec_wave_peaks[k + 1])
-                                for k in range(0, len(self._rec_wave_peaks) - 1, 2)
-                            ]
+                        # Uniform stride accumulation keeps live waveform linearly aligned with ruler
+                        if in_pk > self._rec_wave_accum:
+                            self._rec_wave_accum = in_pk
+                        self._rec_wave_count += 1
+                        if self._rec_wave_count >= self._rec_wave_stride:
+                            self._rec_wave_peaks.append(self._rec_wave_accum)
+                            self._rec_wave_accum = 0.0
+                            self._rec_wave_count = 0
+                            if len(self._rec_wave_peaks) >= 1200:
+                                n_p = len(self._rec_wave_peaks)
+                                compacted = [
+                                    max(self._rec_wave_peaks[k], self._rec_wave_peaks[k + 1])
+                                    for k in range(0, n_p - 1, 2)
+                                ]
+                                if n_p % 2 == 1:
+                                    self._rec_wave_accum = self._rec_wave_peaks[-1]
+                                    self._rec_wave_count = self._rec_wave_stride
+                                self._rec_wave_peaks = compacted
+                                self._rec_wave_stride *= 2
                         self._rec_wave_elapsed = frames_recorded / float(session_rate)
 
                 now = time.monotonic()
@@ -3421,38 +4087,40 @@ class Window:
 
             # Save recorded WAV file(s) and load them into armed channels
             raw_all = b"".join(recorded_frames)
-            saved_files = []
-            for idx in armed_indices:
-                filename = f"{base_name}_ch{idx + 1}.wav"
-                out_path = os.path.join(BASE_DIR, filename)
-                with wave.open(out_path, "wb") as wf_out:
-                    wf_out.setnchannels(1)
-                    wf_out.setsampwidth(2)
-                    wf_out.setframerate(session_rate)
-                    wf_out.writeframes(raw_all)
-                self.channel_states[idx].set_filepath(out_path)
-                short_name = filename if len(filename) <= 17 else filename[:14] + "..."
-                self._ui_call(self._ch_widgets[idx]["file_var"].set, short_name)
-                if "meta_var" in self._ch_widgets[idx]:
-                    self._ui_call(
-                        self._ch_widgets[idx]["meta_var"].set,
-                        format_audio_meta(session_rate, 16, 1),
-                    )
-                saved_files.append(filename)
-                print(f"Saved recording to {out_path}")
+            if not raw_all:
+                self._set_status("Recording cancelled")
+            else:
+                saved_files = []
+                out_targets = unique_recording_paths(BASE_DIR, base_name, armed_indices)
+                for idx, (filename, out_path) in zip(armed_indices, out_targets):
+                    with wave.open(out_path, "wb") as wf_out:
+                        wf_out.setnchannels(1)
+                        wf_out.setsampwidth(2)
+                        wf_out.setframerate(session_rate)
+                        wf_out.writeframes(raw_all)
+                    self.channel_states[idx].set_filepath(out_path)
+                    short_name = filename if len(filename) <= 17 else filename[:14] + "..."
+                    self._ui_call(self._ch_widgets[idx]["file_var"].set, short_name)
+                    if "meta_var" in self._ch_widgets[idx]:
+                        self._ui_call(
+                            self._ch_widgets[idx]["meta_var"].set,
+                            format_audio_meta(session_rate, 16, 1),
+                        )
+                    saved_files.append(filename)
+                    print(f"Saved recording to {out_path}")
 
-            if hasattr(self, "_rec_wave_lock"):
-                with self._rec_wave_lock:
-                    self._rec_wave_active = False
-            if hasattr(self, "timeline"):
-                self._ui_call(self.timeline.update_live_recording, False)
-            if hasattr(self, "_seek_lock"):
-                self._update_session_duration()
-            for idx in armed_indices:
-                path = self.channel_states[idx].get_filepath()
-                if path:
-                    self._load_channel_waveform_async(idx, path)
-            self._set_status(f"Saved: {', '.join(saved_files)}")
+                if hasattr(self, "_rec_wave_lock"):
+                    with self._rec_wave_lock:
+                        self._rec_wave_active = False
+                if hasattr(self, "timeline"):
+                    self._ui_call(self.timeline.update_live_recording, False)
+                if hasattr(self, "_seek_lock"):
+                    self._update_session_duration()
+                for idx in armed_indices:
+                    path = self.channel_states[idx].get_filepath()
+                    if path:
+                        self._load_channel_waveform_async(idx, path)
+                self._set_status(f"Saved: {', '.join(saved_files)}")
 
         except Exception as exc:
             print(f"Recording error: {exc}")
@@ -3502,7 +4170,7 @@ class Window:
 
     def stop(self):
         with self._state_lock:
-            active = self.playing or self.recording
+            active = self.playing or self.recording or self.bouncing
             self.paused = False
         if active:
             self._stop_event.set()
@@ -3533,20 +4201,33 @@ class Window:
             )
             return
 
-        with self._state_lock:
-            if self.playing or self.recording or self.bouncing:
-                messagebox.showinfo(
-                    "Mixer Busy",
-                    "Please stop playback/recording before bouncing.",
+        if self._is_busy():
+            messagebox.showinfo(
+                "Mixer Busy",
+                "Please stop playback/recording before bouncing.",
+                parent=self.root,
+            )
+            return
+
+        raw_name = self.nameEntry.get().strip()
+        if raw_name:
+            stem = sanitize_filename_stem(raw_name)
+            if not stem:
+                messagebox.showerror(
+                    "Invalid Mix Name",
+                    "Please enter a valid filename (avoid slashes or special path characters).",
                     parent=self.root,
                 )
                 return
-
-        entry_name = self.nameEntry.get().strip()
-        if entry_name:
-            if not entry_name.lower().endswith(".wav"):
-                entry_name += ".wav"
-            out_path = os.path.join(BASE_DIR, entry_name)
+            out_path = os.path.join(BASE_DIR, f"{stem}.wav")
+            if os.path.exists(out_path):
+                overwrite = messagebox.askyesno(
+                    "Overwrite File?",
+                    f"'{os.path.basename(out_path)}' already exists.\nDo you want to overwrite it?",
+                    parent=self.root,
+                )
+                if not overwrite:
+                    return
         else:
             out_path = asksaveasfilename(
                 parent=self.root,
@@ -3558,8 +4239,21 @@ class Window:
             if not out_path:
                 return
 
+        busy_now = False
         with self._state_lock:
-            self.bouncing = True
+            if self.playing or self.recording or self.bouncing:
+                busy_now = True
+            else:
+                self.bouncing = True
+                self._stop_event.clear()
+
+        if busy_now:
+            messagebox.showinfo(
+                "Mixer Busy",
+                "Please stop playback/recording before bouncing.",
+                parent=self.root,
+            )
+            return
 
         self._set_status("Bouncing... 0%")
         if hasattr(self, "_bounce_canvas"):
@@ -3575,39 +4269,46 @@ class Window:
 
     def _bounce_worker(self, out_path):
         wav_handles = [None] * 4
-        wav_meta = [None] * 4
+        readers = [None] * 4
         chunk_size = 4096
+        cancelled = False
 
         try:
             print(f"Bouncing audio to {out_path}...")
             session_rate = None
             snapshots = [ch.snapshot() for ch in self.channel_states]
             offline_procs = [ch.clone_processors_for_offline() for ch in self.channel_states]
+            frozen_master_gain = self._get_master_volume()
 
             for idx, snap in enumerate(snapshots):
                 if snap.filepath:
                     wf = wave.open(snap.filepath, "rb")
                     wav_handles[idx] = wf
-                    meta = (wf.getnchannels(), wf.getsampwidth(), wf.getframerate())
-                    wav_meta[idx] = meta
-                    if session_rate is None and meta[2] > 0:
-                        session_rate = meta[2]
+                    fr = wf.getframerate()
+                    if session_rate is None and fr > 0:
+                        session_rate = fr
 
             if session_rate is None:
                 session_rate = self.rate
+
+            for idx, wf in enumerate(wav_handles):
+                if wf is not None:
+                    readers[idx] = StreamingWavReader(wf, session_rate)
 
             # Estimate total output frames for progress bar accuracy
             total_frames = 0
             for idx, wf in enumerate(wav_handles):
                 if wf is None:
                     continue
-                fr = max(1, wav_meta[idx][2])
+                fr = max(1, wf.getframerate())
                 scaled = int(round(wf.getnframes() * (session_rate / float(fr))))
                 if scaled > total_frames:
                     total_frames = scaled
-            delay_snaps_init = [s for s in snapshots if s.filepath and s.delay_enabled]
-            if delay_snaps_init:
-                est_delay_ms = max(s.delay.get_params()[0] for s in delay_snaps_init)
+            delay_indices_init = self._audible_delay_indices(snapshots, frozen_master_gain)
+            if delay_indices_init:
+                est_delay_ms = max(
+                    offline_procs[i][3].get_params()[0] for i in delay_indices_init
+                )
                 total_frames += int(est_delay_ms * session_rate / 1000.0)
             total_frames = max(1, total_frames)
 
@@ -3625,35 +4326,30 @@ class Window:
                 bounce_wf.setframerate(int(session_rate))
 
                 while True:
+                    if self._stop_event.is_set():
+                        cancelled = True
+                        break
+
                     chunks = [[] for _ in range(4)]
                     any_data = False
 
-                    for idx, wf in enumerate(wav_handles):
-                        if wf is None:
+                    for idx, rdr in enumerate(readers):
+                        if rdr is None:
                             continue
-                        nch, sw, fr = wav_meta[idx]
-                        read_frames = (
-                            chunk_size
-                            if fr == session_rate
-                            else max(1, int(round(chunk_size * (fr / float(session_rate)))))
-                        )
-                        raw = wf.readframes(read_frames)
-                        if not raw:
+                        mono = rdr.read(chunk_size)
+                        if not mono:
                             continue
                         any_data = True
-                        mono = decode_pcm_to_mono_float(raw, sw, nch)
-                        if fr != session_rate:
-                            target = max(1, int(round(len(mono) * (session_rate / float(fr)))))
-                            mono = resample_linear(mono, target)
                         chunks[idx] = mono
 
                     if not any_data:
                         if not in_tail:
-                            delay_snaps = [s for s in snapshots if s.filepath and s.delay_enabled]
-                            if not delay_snaps:
+                            if not delay_indices_init:
                                 break
                             in_tail = True
-                            max_delay_ms = max(s.delay.get_params()[0] for s in delay_snaps)
+                            max_delay_ms = max(
+                                offline_procs[i][3].get_params()[0] for i in delay_indices_init
+                            )
                             min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + chunk_size
                             tail_frames_remaining = max(int(session_rate * 2.5), min_tail_frames * 2)
                         if tail_frames_remaining <= 0:
@@ -3661,16 +4357,15 @@ class Window:
                         tail_chunk_len = min(chunk_size, tail_frames_remaining)
                         tail_frames_remaining -= tail_chunk_len
                         tail_frames_emitted += tail_chunk_len
-                        for idx, s in enumerate(snapshots):
-                            if s.filepath and s.delay_enabled:
-                                chunks[idx] = [0.0] * tail_chunk_len
+                        for idx in delay_indices_init:
+                            chunks[idx] = [0.0] * tail_chunk_len
 
                     pcm_bytes = mix_stereo_chunk(
                         chunks,
                         snapshots,
                         session_rate,
                         offline_processors=offline_procs,
-                        master_gain=self._get_master_volume(),
+                        master_gain=frozen_master_gain,
                     )
                     if in_tail and tail_frames_emitted > min_tail_frames and pcm_bytes:
                         check = array.array("h")
@@ -3696,16 +4391,27 @@ class Window:
                                     "#48d18a",
                                 )
 
-            print("Bounce completed successfully")
-            if hasattr(self, "_bounce_canvas"):
-                self._ui_call(self._set_bounce_progress, 1.0, "Bounce complete (100%)", "#7ef2b8")
-            self._set_status(f"Bounced: {os.path.basename(out_path)}")
-            self._ui_call(
-                messagebox.showinfo,
-                "Bounce Complete",
-                f"Mix successfully exported to:\n{out_path}",
-                parent=self.root,
-            )
+            if cancelled:
+                try:
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
+                except OSError:
+                    pass
+                print("Bounce cancelled")
+                if hasattr(self, "_bounce_canvas"):
+                    self._ui_call(self._set_bounce_progress, 0.0, "Bounce cancelled", "#f5c542")
+                self._set_status("Bounce cancelled")
+            else:
+                print("Bounce completed successfully")
+                if hasattr(self, "_bounce_canvas"):
+                    self._ui_call(self._set_bounce_progress, 1.0, "Bounce complete (100%)", "#7ef2b8")
+                self._set_status(f"Bounced: {os.path.basename(out_path)}")
+                self._ui_call(
+                    messagebox.showinfo,
+                    "Bounce Complete",
+                    f"Mix successfully exported to:\n{out_path}",
+                    parent=self.root,
+                )
 
         except Exception as exc:
             print(f"Bounce error: {exc}")

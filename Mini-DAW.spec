@@ -2,8 +2,15 @@
 import os
 import sys
 
-portaudio_lib = os.path.join(sys.prefix, "lib", "libportaudio.dylib")
-extra_binaries = [(portaudio_lib, ".")] if os.path.exists(portaudio_lib) else []
+portaudio_candidates = [
+    os.path.join(sys.prefix, "lib", "libportaudio.dylib"),
+    "/opt/homebrew/lib/libportaudio.dylib",
+    "/opt/homebrew/opt/portaudio/lib/libportaudio.dylib",
+    "/usr/local/lib/libportaudio.dylib",
+    "/usr/local/opt/portaudio/lib/libportaudio.dylib",
+]
+portaudio_lib = next((p for p in portaudio_candidates if os.path.exists(p)), None)
+extra_binaries = [(portaudio_lib, ".")] if portaudio_lib else []
 
 a = Analysis(
     ["window.py"],
@@ -57,8 +64,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "Mini-DAW",
         "CFBundleDisplayName": "Mini-DAW",
-        "CFBundleShortVersionString": "1.0.0",
-        "CFBundleVersion": "1.0.0",
+        "CFBundleShortVersionString": "1.1.0",
+        "CFBundleVersion": "1.1.0",
         "NSHighResolutionCapable": True,
         "NSMicrophoneUsageDescription": "Mini-DAW needs microphone access to record audio tracks.",
     },
