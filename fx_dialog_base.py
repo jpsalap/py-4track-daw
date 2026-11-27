@@ -1,9 +1,9 @@
-"""Shared PySide6 base dialog and precision float slider for Mini-DAW DSP effect popups."""
+"""Shared PySide6 base dialog and fast custom-painted float slider for Mini-DAW DSP effect popups."""
 
 import sys
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -18,28 +18,34 @@ from PySide6.QtWidgets import (
 
 
 class FloatSlider(QSlider):
-    """Horizontal QSlider mapped to floating-point values with double-click default reset."""
+    """Fast custom-painted horizontal float slider with direct click-drag & double-click reset."""
 
     floatValueChanged = Signal(float)
 
-    def __init__(self, min_val, max_val, step, default_val, parent=None):
+    def __init__(self, min_val, max_val, step, default_val, well_color="#101e2e", accent_color="#63b3ed", parent=None):
         super().__init__(Qt.Orientation.Horizontal, parent)
         self._min = float(min_val)
         self._max = float(max_val)
         self._step = float(step)
         self._default = float(default_val)
         self._steps = max(1, int(round((self._max - self._min) / self._step)))
+        self._well_col = QColor(well_color)
+        self._accent_col = QColor(accent_color)
+        self._border_col = QColor(255, 255, 255, 42)
+        self._handle_col = QColor("#f0f6fc")
 
         self.setRange(0, self._steps)
         self.setSingleStep(1)
         self.setPageStep(max(1, self._steps // 10))
+        self.setFixedHeight(24)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setToolTip("Drag to adjust · Double-click to reset to default")
         self._dragging = False
         self.valueChanged.connect(self._emit_float)
 
     def _x_to_step(self, x):
-        margin = 8.0
+        margin = 9.0
         span = max(1.0, float(self.width()) - 2.0 * margin)
         frac = max(0.0, min(1.0, (float(x) - margin) / span))
         return int(round(frac * self._steps))
@@ -85,8 +91,38 @@ class FloatSlider(QSlider):
         self.setValue(self._to_int(val))
 
     def mouseDoubleClickEvent(self, event):
+        self._dragging = False
         self.set_value_float(self._default)
         event.accept()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w = float(self.width())
+        h = float(self.height())
+        cy = h * 0.5
+        margin = 9.0
+        span = max(10.0, w - 2.0 * margin)
+        frac = self.value() / float(self._steps)
+        hx = margin + frac * span
+
+        # Track groove
+        p.setPen(QPen(self._border_col, 1.0))
+        p.setBrush(self._well_col)
+        p.drawRoundedRect(QRectF(margin, cy - 3.0, span, 6.0), 3.0, 3.0)
+
+        # Active fill
+        fill_w = hx - margin
+        if fill_w > 1.0:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(self._accent_col)
+            p.drawRoundedRect(QRectF(margin, cy - 3.0, fill_w, 6.0), 3.0, 3.0)
+
+        # Handle
+        p.setPen(QPen(self._accent_col, 2.0))
+        p.setBrush(QColor("#ffffff") if self._dragging else self._handle_col)
+        p.drawEllipse(QPointF(hx, cy), 7.0, 7.0)
 
 
 class EffectDialogBase(QDialog):
@@ -111,6 +147,7 @@ class EffectDialogBase(QDialog):
         self._owns_app = False
         if self._standalone and QApplication.instance() is None:
             self._app = QApplication(sys.argv)
+            self._app.setStyle("Fusion")
             self._owns_app = True
         else:
             self._app = QApplication.instance()
@@ -118,6 +155,8 @@ class EffectDialogBase(QDialog):
         super().__init__(parent)
         self.on_close_callback = on_close
         self._is_open = True
+        self._bg_well = bg_well
+        self._accent = accent
 
         self.setWindowTitle(title)
         self.setMinimumWidth(width)
@@ -156,29 +195,6 @@ class EffectDialogBase(QDialog):
                 padding: 2px 7px;
                 font-size: 11px;
                 font-weight: 700;
-            }}
-            QSlider {{
-                background-color: transparent;
-            }}
-            QSlider::groove:horizontal {{
-                height: 6px;
-                background: {bg_well};
-                border-radius: 3px;
-            }}
-            QSlider::sub-page:horizontal {{
-                background: {accent};
-                border-radius: 3px;
-            }}
-            QSlider::handle:horizontal {{
-                background: #f0f6fc;
-                border: 2px solid {accent};
-                width: 14px;
-                height: 14px;
-                margin: -5px 0;
-                border-radius: 8px;
-            }}
-            QSlider::handle:horizontal:hover {{
-                background: #ffffff;
             }}
             QPushButton#btnReset {{
                 background-color: {btn_reset_bg};
@@ -222,12 +238,12 @@ class EffectDialogBase(QDialog):
         hdr_layout.addWidget(title_lbl)
         root_layout.addWidget(header)
 
-        body = QWidget(self)
-        body.setObjectName("fxBody")
-        self._body_layout = QVBoxLayout(body)
+        self._body = QWidget(self)
+        self._body.setObjectName("fxBody")
+        self._body_layout = QVBoxLayout(self._body)
         self._body_layout.setContentsMargins(16, 14, 16, 14)
         self._body_layout.setSpacing(10)
-        root_layout.addWidget(body, 1)
+        root_layout.addWidget(self._body, 1)
 
         self._params_layout = QVBoxLayout()
         self._params_layout.setSpacing(10)
@@ -236,13 +252,17 @@ class EffectDialogBase(QDialog):
 
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(0, 6, 0, 0)
-        self.reset_btn = QPushButton("Reset", self)
+        self.reset_btn = QPushButton("Reset", self._body)
         self.reset_btn.setObjectName("btnReset")
+        self.reset_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.close_btn = QPushButton("Close", self)
+
+        self.close_btn = QPushButton("Close", self._body)
         self.close_btn.setObjectName("btnClose")
+        self.close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.close_btn.clicked.connect(self.close)
+        self.close_btn.clicked.connect(self.reject)
+
         btn_row.addWidget(self.reset_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(self.close_btn)
@@ -269,9 +289,9 @@ class EffectDialogBase(QDialog):
 
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
-        name_lbl = QLabel(name, self)
+        name_lbl = QLabel(name, self._body)
         name_lbl.setProperty("class", "paramName")
-        val_lbl = QLabel(formatter(initial_val), self)
+        val_lbl = QLabel(formatter(initial_val), self._body)
         val_lbl.setProperty("class", "paramVal")
         val_lbl.setFont(self._mono_font)
         val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -280,7 +300,15 @@ class EffectDialogBase(QDialog):
         top.addWidget(val_lbl)
         block.addLayout(top)
 
-        slider = FloatSlider(min_val, max_val, step, default_val, self)
+        slider = FloatSlider(
+            min_val,
+            max_val,
+            step,
+            default_val,
+            well_color=self._bg_well,
+            accent_color=self._accent,
+            parent=self._body,
+        )
         slider.set_value_float(initial_val)
 
         def _handle(val):
@@ -316,8 +344,9 @@ class EffectDialogBase(QDialog):
             cb()
 
     def reject(self):
-        """Ensure pressing Escape closes the dialog cleanly and runs on_close_callback."""
-        self.close()
+        """Close cleanly on Escape or Close button without recursing through closeEvent."""
+        self._notify_close()
+        super().reject()
 
     def closeEvent(self, event):
         self._notify_close()

@@ -47,6 +47,7 @@ from ui_widgets import (
     MIN_FADER_DB,
     ChannelFileWell,
     ChannelMeter,
+    FaderBadge,
     FaderWithScale,
     InsertSlotWidget,
     PanSlider,
@@ -619,11 +620,12 @@ class Window:
         self.channels = 2
         self.rate = 44100
 
-        # Ensure a QApplication exists
+        # Ensure a QApplication exists (use Fusion style for fast, uniform dark controls on macOS)
         self._app = QApplication.instance()
         self._owns_app = False
         if self._app is None:
             self._app = QApplication(sys.argv)
+            self._app.setStyle("Fusion")
             self._owns_app = True
 
         # Thread synchronization
@@ -730,9 +732,11 @@ class Window:
         self._build_master_bus_strip(mixer_board)
         self._build_master_panel(mixer_board)
 
-        # 60 FPS UI timer (16 ms) for silky VU ballistics, playhead & Rec LED sync
+        self._last_bounce_color = "#48d18a"
+
+        # 30 FPS UI timer (33 ms) — smooth VU ballistics with minimal Python GIL overhead
         self._meter_timer = QTimer(self.root)
-        self._meter_timer.setInterval(16)
+        self._meter_timer.setInterval(33)
         self._meter_timer.timeout.connect(self._poll_meters)
         self._meter_timer.start()
 
@@ -1018,11 +1022,7 @@ class Window:
             peak_readout = PeakReadout(body)
             self._channel_peak_readouts.append(peak_readout)
 
-            vol_badge = QLabel("0.0 dB", body)
-            vol_badge.setProperty("class", "faderBadge")
-            vol_badge.setFont(self._mono_badge_font)
-            vol_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            vol_badge.setFixedHeight(22)
+            vol_badge = FaderBadge("0.0 dB", body)
 
             readout_row.addWidget(peak_readout, 1)
             readout_row.addWidget(vol_badge, 1)
@@ -1049,7 +1049,10 @@ class Window:
             # Channel toggle pads: Solo / Mute / Phase / Rec
             ctrl_grid = QGridLayout()
             ctrl_grid.setContentsMargins(0, 2, 0, 0)
-            ctrl_grid.setSpacing(4)
+            ctrl_grid.setHorizontalSpacing(4)
+            ctrl_grid.setVerticalSpacing(4)
+            ctrl_grid.setColumnStretch(0, 1)
+            ctrl_grid.setColumnStretch(1, 1)
 
             solo_pad = TogglePadButton(
                 "S  Solo", "#f5c542", "#332c19", "#473d22", "#fae08c", "#7a662b",
@@ -1157,11 +1160,7 @@ class Window:
         readout_row = QHBoxLayout()
         readout_row.setSpacing(4)
         self._master_peak_readout = PeakReadout(body)
-        self.master_vol_badge = QLabel("0.0 dB", body)
-        self.master_vol_badge.setProperty("class", "faderBadge")
-        self.master_vol_badge.setFont(self._mono_badge_font)
-        self.master_vol_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.master_vol_badge.setFixedHeight(22)
+        self.master_vol_badge = FaderBadge("0.0 dB", body)
         readout_row.addWidget(self._master_peak_readout, 1)
         readout_row.addWidget(self.master_vol_badge, 1)
         body_layout.addLayout(readout_row)
@@ -1440,26 +1439,11 @@ class Window:
         with self._master_lock:
             return self._master_volume
 
-    def _style_fader_badge(self, badge, db):
-        if db <= MIN_FADER_DB:
-            fg = self.THEME["text_muted"]
-        elif db > 0.05:
-            fg = self.THEME["boost_coral"]
-        elif abs(db) <= 0.05:
-            fg = self.THEME["unity_gold"]
-        else:
-            fg = self.THEME["text_primary"]
-        badge.setStyleSheet(
-            f"background-color: {self.THEME['bg_well']}; color: {fg}; "
-            "border: 1px solid #2c465e; border-radius: 4px; padding: 1px 4px;"
-        )
-
     def _on_master_vol_change(self, db):
         gain = db_to_linear(db)
         with self._master_lock:
             self._master_volume = gain
-        self.master_vol_badge.setText(format_fader_db(db))
-        self._style_fader_badge(self.master_vol_badge, db)
+        self.master_vol_badge.set_db_display(format_fader_db(db), db)
 
     def _update_session_duration(self):
         """Recompute total session duration (max length across loaded channels) and update playhead bar."""
@@ -1545,9 +1529,9 @@ class Window:
                 pos_sec = self._playhead_sec
             self.timeline.set_position(pos_sec)
 
-        # Synchronized ~2 Hz flash for armed Rec buttons (60 FPS -> toggle every 28 ticks)
+        # Synchronized ~2 Hz flash for armed Rec buttons (30 FPS -> toggle every 14 ticks)
         self._blink_tick += 1
-        blink_hi = (self._blink_tick // 28) % 2 == 0
+        blink_hi = (self._blink_tick // 14) % 2 == 0
         any_armed = False
         for idx, snap in enumerate(snaps_aud):
             armed = snap.rec_armed
@@ -1582,21 +1566,23 @@ class Window:
     def _set_bounce_progress(self, fraction, label=None, bar_color="#48d18a"):
         frac = max(0.0, min(1.0, float(fraction)))
         self._bounce_bar.setValue(int(round(frac * 1000)))
-        self._bounce_bar.setStyleSheet(
-            f"""
-            QProgressBar#bounceBar {{
-                background-color: {self.THEME['bg_well']};
-                border: 1px solid #38546e;
-                border-radius: 4px;
-                max-height: 12px;
-                min-height: 12px;
-            }}
-            QProgressBar#bounceBar::chunk {{
-                background-color: {bar_color};
-                border-radius: 3px;
-            }}
-            """
-        )
+        if bar_color != self._last_bounce_color:
+            self._last_bounce_color = bar_color
+            self._bounce_bar.setStyleSheet(
+                f"""
+                QProgressBar#bounceBar {{
+                    background-color: {self.THEME['bg_well']};
+                    border: 1px solid #38546e;
+                    border-radius: 4px;
+                    max-height: 12px;
+                    min-height: 12px;
+                }}
+                QProgressBar#bounceBar::chunk {{
+                    background-color: {bar_color};
+                    border-radius: 3px;
+                }}
+                """
+            )
         if label is not None:
             self._bounce_prog_lbl.setText(label)
 
@@ -1606,8 +1592,7 @@ class Window:
         val = float(db)
         self.channel_states[channel_idx].set_volume_db(val)
         if badge is not None:
-            badge.setText(format_fader_db(val))
-            self._style_fader_badge(badge, val)
+            badge.set_db_display(format_fader_db(val), val)
 
     def _on_pan_change(self, channel_idx, value, label_widget):
         val = float(value)
@@ -1695,11 +1680,8 @@ class Window:
             return
 
         self.channel_states[channel_idx].set_filepath(filepath)
-        short_name = os.path.basename(filepath)
-        if len(short_name) > 19:
-            short_name = short_name[:16] + "..."
         well = self._ch_widgets[channel_idx]["file_well"]
-        well.set_file_text(short_name)
+        well.set_file_text(os.path.basename(filepath))
         well.file_btn.setToolTip(filepath)
         well.set_meta_text(format_audio_meta(samplefreq, bitdepth, channels))
 
@@ -2290,9 +2272,9 @@ class Window:
                     wf_out.setframerate(session_rate)
                     wf_out.writeframes(raw_all)
                 self.channel_states[idx].set_filepath(out_path)
-                short_name = filename if len(filename) <= 19 else filename[:16] + "..."
                 well = self._ch_widgets[idx]["file_well"]
-                self._ui_call(well.set_file_text, short_name)
+                self._ui_call(well.set_file_text, filename)
+                self._ui_call(well.file_btn.setToolTip, out_path)
                 self._ui_call(well.set_meta_text, format_audio_meta(session_rate, 16, 1))
                 saved_files.append(filename)
                 print(f"Saved recording to {out_path}")
