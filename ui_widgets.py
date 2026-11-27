@@ -99,8 +99,9 @@ def _extract_dropped_wav(mime_data):
 class ChannelMeter(QWidget):
     """Fast segmented vertical LED dBFS level meter with peak-hold indicator (30 FPS)."""
 
-    def __init__(self, parent=None, width=16, height=154, segments=22):
+    def __init__(self, parent=None, width=16, height=154, segments=22, target_pitch=6.5):
         super().__init__(parent)
+        self._target_pitch = float(target_pitch) if target_pitch else None
         self._segments = int(segments)
         self._min_w = int(width)
         self._min_h = int(height)
@@ -109,6 +110,25 @@ class ChannelMeter(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
+        self._lit_colors = []
+        self._dim_colors = []
+        self._clip_idx = 0
+        self._rebuild_palette(self._segments)
+
+        self._bg_col = QColor("#0e1924")
+        self._border_pen = QPen(QColor("#36536e"), 1)
+        self._peak_clip_col = QColor("#ff7a85")
+        self._peak_norm_col = QColor("#eef7ff")
+
+        self._seg_rects = []
+        self._displayed_level = 0.0
+        self._peak_hold = 0.0
+        self._hold_ticks = 0
+        self._lit_count = 0
+        self._peak_seg = -1
+
+    def _rebuild_palette(self, count):
+        self._segments = max(8, int(count))
         self._lit_colors = []
         self._dim_colors = []
         self._clip_idx = int(self._segments * 0.88)
@@ -124,18 +144,6 @@ class ChannelMeter(QWidget):
                 self._lit_colors.append(QColor("#2ecc71"))
                 self._dim_colors.append(QColor("#163026"))
 
-        self._bg_col = QColor("#0e1924")
-        self._border_pen = QPen(QColor("#36536e"), 1)
-        self._peak_clip_col = QColor("#ff7a85")
-        self._peak_norm_col = QColor("#eef7ff")
-
-        self._seg_rects = []
-        self._displayed_level = 0.0
-        self._peak_hold = 0.0
-        self._hold_ticks = 0
-        self._lit_count = 0
-        self._peak_seg = -1
-
     def sizeHint(self):
         return QSize(self._min_w, self._min_h)
 
@@ -145,8 +153,18 @@ class ChannelMeter(QWidget):
         pad_x = 3
         pad_y = 3
         usable_h = max(10.0, float(h - 2 * pad_y))
+        if self._target_pitch is not None:
+            desired = max(8, int(round(usable_h / self._target_pitch)))
+            if desired != self._segments:
+                self._rebuild_palette(desired)
+                self._lit_count = min(self._segments, int(round(self._displayed_level * self._segments)))
+                self._peak_seg = (
+                    min(self._segments - 1, int(round(self._peak_hold * self._segments)) - 1)
+                    if self._peak_hold > 0.02
+                    else -1
+                )
         step = usable_h / float(self._segments)
-        gap = max(1.0, min(1.8, step * 0.22))
+        gap = 1.5
         seg_w = max(2, w - 2 * pad_x)
         rects = []
         for idx in range(self._segments):
@@ -512,46 +530,78 @@ class DawFader(QSlider):
 
 
 class _FaderScaleTicks(QWidget):
-    """Responsive painted dB tick marks aligned dynamically to a companion DawFader."""
+    """Responsive painted dB ruler with major labeled ticks, minor hash marks, and overlap guard."""
 
-    def __init__(self, fader, ticks, parent=None):
+    def __init__(self, fader, ticks, minor_step_db=3.0, parent=None):
         super().__init__(parent)
         self._fader = fader
         self._ticks = list(ticks)
-        self._font_reg = QFont("Helvetica", 8)
-        self._font_bold = QFont("Helvetica", 8)
+        self._minor_step = float(minor_step_db)
+        self._font_reg = QFont("Helvetica", 7)
+        self._font_bold = QFont("Helvetica", 7)
         self._font_bold.setBold(True)
-        self.setFixedWidth(28)
+        self.setFixedWidth(30)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
 
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
+        major_dbs = {db for db, _ in self._ticks}
+
+        # Subtle minor graduation hash marks (e.g. every 3 dB, or 1.5 dB on tall master faders)
+        top_y, bot_y, _ = self._fader._track_bounds()
+        px_per_db = (bot_y - top_y) / max(1.0, float(MAX_FADER_DB - MIN_FADER_DB))
+        step = self._minor_step * 0.5 if px_per_db >= 4.0 else self._minor_step
+        minor_pen = QPen(QColor("#4f6e8c"), 0.9)
+        p.setPen(minor_pen)
+        db = float(MAX_FADER_DB)
+        while db >= float(MIN_FADER_DB) - 1e-6:
+            if not any(abs(db - m) < 0.05 for m in major_dbs):
+                my = self._fader.db_to_y(db)
+                p.drawLine(QPointF(0.0, my), QPointF(3.0, my))
+            db -= step
+
+        # Major ticks + non-overlapping labels (prioritize 0.0 dB unity and +6 / -inf endpoints)
+        min_label_gap = 10.5
+        drawn_ys = []
+
+        # Reserve priority labels first so unity (0 dB) and endpoints are never skipped
+        priority = [t for t in self._ticks if t[0] in (0.0, MAX_FADER_DB, MIN_FADER_DB)]
+        others = [t for t in self._ticks if t[0] not in (0.0, MAX_FADER_DB, MIN_FADER_DB)]
+        label_allowed = set()
+        for tick_db, _ in priority + others:
+            y = self._fader.db_to_y(tick_db)
+            if all(abs(y - py) >= min_label_gap for py in drawn_ys):
+                drawn_ys.append(y)
+                label_allowed.add(tick_db)
+
         for tick_db, tick_txt in self._ticks:
             y = self._fader.db_to_y(tick_db)
             is_unity = tick_db == 0.0
-            col = QColor("#ffd166") if is_unity else QColor("#8eaac4")
-            p.setPen(QPen(col, 1.2 if is_unity else 1.0))
-            p.drawLine(QPointF(0.0, y), QPointF(4.0, y))
-            p.setFont(self._font_bold if is_unity else self._font_reg)
-            p.drawText(
-                QRectF(6.0, y - 6.0, self.width() - 6.0, 12.0),
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                tick_txt,
-            )
+            show_lbl = tick_db in label_allowed
+            col = QColor("#ffd166") if is_unity else (QColor("#9cb8d1") if show_lbl else QColor("#5d7d9c"))
+            p.setPen(QPen(col, 1.3 if is_unity else 1.0))
+            p.drawLine(QPointF(0.0, y), QPointF(5.0 if show_lbl else 3.5, y))
+            if show_lbl:
+                p.setFont(self._font_bold if is_unity else self._font_reg)
+                p.drawText(
+                    QRectF(7.0, y - 6.0, self.width() - 7.0, 12.0),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    tick_txt,
+                )
 
 
 class FaderWithScale(QWidget):
     """Combined DawFader + aligned painted dB scale."""
 
-    def __init__(self, ticks, accent_color="#4da3ff", parent=None):
+    def __init__(self, ticks, accent_color="#4da3ff", minor_step_db=3.0, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
         self.fader = DawFader(accent_color=accent_color, parent=self)
-        self._ticks = _FaderScaleTicks(self.fader, ticks, parent=self)
+        self._ticks = _FaderScaleTicks(self.fader, ticks, minor_step_db=minor_step_db, parent=self)
         layout.addWidget(self.fader)
         layout.addWidget(self._ticks)
 

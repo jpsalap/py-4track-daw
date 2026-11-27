@@ -1208,9 +1208,15 @@ class Window:
         ch_ticks = (
             (6.0, "+6"),
             (0.0, "0"),
+            (-6.0, "-6"),
             (-12.0, "-12"),
+            (-18.0, "-18"),
             (-24.0, "-24"),
+            (-30.0, "-30"),
+            (-36.0, "-36"),
             (-42.0, "-42"),
+            (-48.0, "-48"),
+            (-54.0, "-54"),
             (MIN_FADER_DB, "-∞"),
         )
 
@@ -1392,11 +1398,20 @@ class Window:
         T = self.THEME
         master_ticks = (
             (6.0, "+6"),
+            (3.0, "+3"),
             (0.0, "0"),
+            (-3.0, "-3"),
             (-6.0, "-6"),
+            (-9.0, "-9"),
             (-12.0, "-12"),
+            (-15.0, "-15"),
+            (-18.0, "-18"),
             (-24.0, "-24"),
+            (-30.0, "-30"),
+            (-36.0, "-36"),
             (-42.0, "-42"),
+            (-48.0, "-48"),
+            (-54.0, "-54"),
             (MIN_FADER_DB, "-∞"),
         )
 
@@ -1464,8 +1479,8 @@ class Window:
         meters_col.setSpacing(3)
         lr_pair = QHBoxLayout()
         lr_pair.setSpacing(3)
-        meter_l = ChannelMeter(body, width=14, height=230, segments=28)
-        meter_r = ChannelMeter(body, width=14, height=230, segments=28)
+        meter_l = ChannelMeter(body, width=16, height=230, segments=36)
+        meter_r = ChannelMeter(body, width=16, height=230, segments=36)
         lr_pair.addWidget(meter_l)
         lr_pair.addWidget(meter_r)
         self._master_meters = [meter_l, meter_r]
