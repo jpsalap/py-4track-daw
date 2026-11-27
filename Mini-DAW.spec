@@ -13,6 +13,10 @@ for _candidate in _portaudio_candidates:
         extra_binaries.append((_candidate, "."))
         break
 
+_dsp_lib = os.path.abspath("libminidaw_dsp.dylib")
+if os.path.exists(_dsp_lib):
+    extra_binaries.append((_dsp_lib, "."))
+
 a = Analysis(
     ["window.py"],
     pathex=[],
@@ -20,6 +24,7 @@ a = Analysis(
     datas=[],
     hiddenimports=[
         "pyaudio",
+        "dsp_accel",
         "Delay",
         "Tremolo",
         "Chorus",

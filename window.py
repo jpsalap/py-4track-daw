@@ -1,6 +1,7 @@
 """Mini-DAW: 4-Channel Python Audio Mixer, Multitrack Recorder & Waveform Arrange View (PySide6)."""
 
 import array
+import ctypes
 import math
 import os
 import re
@@ -9,8 +10,14 @@ import threading
 import time
 import wave
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+try:
+    import dsp_accel as _dsp
+except Exception:
+    _dsp = None
+
+from PySide6.QtCore import QEvent, QObject, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -124,10 +131,32 @@ ChannelSnapshot = namedtuple(
 )
 
 
+def _is_pcm_silent(pcm_bytes, threshold=4):
+    """Return True if all 16-bit PCM samples in pcm_bytes have abs(v) < threshold."""
+    if not pcm_bytes:
+        return True
+    if _dsp is not None and _dsp.AVAILABLE:
+        return bool(_dsp.LIB.dsp_is_silent_i16(pcm_bytes, len(pcm_bytes) // 2, int(threshold)))
+    check = array.array("h")
+    check.frombytes(pcm_bytes)
+    return max(abs(v) for v in check) < threshold
+
+
 def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels):
     """Decode PCM WAV bytes (8/16/24/32-bit, mono or multi-channel) to mono floats in [-1.0, 1.0]."""
     if not raw_bytes:
         return []
+
+    if _dsp is not None and _dsp.AVAILABLE and sampwidth in (1, 2, 3, 4) and nchannels > 0:
+        frame_bytes = sampwidth * nchannels
+        n_frames = len(raw_bytes) // frame_bytes
+        if n_frames == 0:
+            return []
+        out = _dsp.alloc_f64(n_frames)
+        _dsp.LIB.dsp_decode_pcm_to_mono_f64(
+            raw_bytes, len(raw_bytes), sampwidth, nchannels, _dsp.f64_ptr(out)
+        )
+        return out
 
     if sampwidth == 2:
         pcm = array.array("h")
@@ -227,6 +256,109 @@ def resample_linear(samples, target_len):
     return out
 
 
+class StreamingWavReader:
+    """Phase-accurate streaming WAV reader with continuous linear resampling."""
+
+    def __init__(self, wf, dst_rate):
+        self.wf = wf
+        self.nch = wf.getnchannels()
+        self.sw = wf.getsampwidth()
+        self.src_rate = max(1, wf.getframerate())
+        self.dst_rate = max(1, int(dst_rate))
+        self.step = self.src_rate / float(self.dst_rate)
+        self._use_c = _dsp is not None and _dsp.AVAILABLE
+        self._buf = array.array("d") if self._use_c else []
+        self._pos = 0.0
+        self._eof = False
+
+    def read(self, out_frames):
+        """Read and resample up to out_frames mono floats at dst_rate with zero drift."""
+        if out_frames <= 0:
+            return []
+        if self.src_rate == self.dst_rate:
+            raw = self.wf.readframes(out_frames)
+            return decode_pcm_to_mono_float(raw, self.sw, self.nch) if raw else []
+
+        needed = int(math.floor(self._pos + (out_frames - 1) * self.step)) + 2
+        while not self._eof and len(self._buf) < needed:
+            to_read = max(256, needed - len(self._buf))
+            raw = self.wf.readframes(to_read)
+            if not raw:
+                self._eof = True
+                break
+            self._buf.extend(decode_pcm_to_mono_float(raw, self.sw, self.nch))
+
+        buf = self._buf
+        avail = len(buf)
+        if avail == 0:
+            return []
+
+        if self._use_c:
+            out = _dsp.alloc_f64(out_frames)
+            out_pos = ctypes.c_double(self._pos)
+            produced = _dsp.LIB.dsp_resample_linear_f64(
+                _dsp.f64_ptr(buf),
+                avail,
+                self._pos,
+                self.step,
+                out_frames,
+                _dsp.f64_ptr(out),
+                ctypes.byref(out_pos),
+            )
+            pos = out_pos.value
+            if produced < out_frames:
+                out = out[:produced]
+        else:
+            pos = self._pos
+            step = self.step
+            out = []
+            append = out.append
+            last = avail - 1
+
+            for _ in range(out_frames):
+                i0 = int(pos)
+                if i0 >= avail:
+                    break
+                if i0 < last:
+                    frac = pos - i0
+                    append(buf[i0] * (1.0 - frac) + buf[i0 + 1] * frac)
+                else:
+                    append(buf[last])
+                pos += step
+
+        drop = int(pos)
+        if drop > 0:
+            if drop >= avail:
+                self._buf = array.array("d") if self._use_c else []
+                self._pos = 0.0 if self._eof else (pos - avail)
+            else:
+                del self._buf[:drop]
+                self._pos = pos - drop
+        else:
+            self._pos = pos
+        return out
+
+    def seek(self, target_sec):
+        """Seek to target_sec preserving fractional sample alignment."""
+        exact_frame = max(0.0, float(target_sec) * self.src_rate)
+        nframes = self.wf.getnframes()
+        empty = array.array("d") if self._use_c else []
+        if exact_frame >= nframes:
+            self.wf.setpos(nframes)
+            self._buf = empty
+            self._pos = 0.0
+            self._eof = True
+        else:
+            base_frame = int(math.floor(exact_frame))
+            self.wf.setpos(base_frame)
+            self._buf = empty
+            self._pos = exact_frame - base_frame
+            self._eof = False
+
+    def close(self):
+        self.wf.close()
+
+
 def extract_waveform_peaks(filepath, num_bins=2400, start_sec=None, end_sec=None):
     """
     Fast stdlib WAV envelope extractor for pro DAW waveform display.
@@ -322,6 +454,7 @@ def mix_stereo_chunk(
     out_master_levels=None,
     out_peaks=None,
     out_master_peaks=None,
+    fx_executor=None,
 ):
     """
     Process per-channel mono float chunks through enabled effects, polarity inversion,
@@ -350,24 +483,17 @@ def mix_stereo_chunk(
         return b""
 
     any_solo = any(snap.solo for snap in snapshots)
-    master_left = [0.0] * max_len
-    master_right = [0.0] * max_len
+    use_c = _dsp is not None and _dsp.AVAILABLE
+    master_left = _dsp.alloc_f64(max_len) if use_c else [0.0] * max_len
+    master_right = _dsp.alloc_f64(max_len) if use_c else [0.0] * max_len
+    if use_c:
+        ml_ptr = _dsp.f64_ptr(master_left)
+        mr_ptr = _dsp.f64_ptr(master_right)
     half_pi = math.pi * 0.5
     sqrt2 = 1.4142135623730951
     inv_len = 1.0 / float(max_len)
 
-    for i, snap in enumerate(snapshots):
-        chunk = channel_chunks[i]
-        if not chunk:
-            if snap.filepath and (snap.delay_enabled or snap.chorus_enabled):
-                samples = [0.0] * max_len
-            else:
-                continue
-        elif len(chunk) < max_len:
-            samples = chunk + [0.0] * (max_len - len(chunk))
-        else:
-            samples = chunk
-
+    def _process_channel_fx(i, snap, samples):
         if offline_processors is not None:
             comp_proc, chorus_proc, trem_proc, delay_proc = offline_processors[i]
         else:
@@ -385,7 +511,49 @@ def mix_stereo_chunk(
             samples = trem_proc.process(samples, sample_rate)
         if snap.delay_enabled:
             samples = delay_proc.process(samples, sample_rate)
+        return samples
 
+    prepared = []
+    for i, snap in enumerate(snapshots):
+        chunk = channel_chunks[i]
+        if not chunk:
+            if snap.filepath and (snap.delay_enabled or snap.chorus_enabled):
+                samples = _dsp.alloc_f64(max_len) if use_c else [0.0] * max_len
+            else:
+                continue
+        elif len(chunk) < max_len:
+            pad_len = max_len - len(chunk)
+            if use_c:
+                samples = _dsp.as_f64_array(chunk) + _dsp.alloc_f64(pad_len)
+            else:
+                samples = list(chunk) + [0.0] * pad_len
+        else:
+            samples = chunk
+        prepared.append((i, snap, samples))
+
+    has_parallel_fx = (
+        fx_executor is not None
+        and use_c
+        and sum(
+            1
+            for _, s, _ in prepared
+            if s.compressor_enabled or s.chorus_enabled or s.tremolo_enabled or s.delay_enabled
+        )
+        >= 2
+    )
+    if has_parallel_fx:
+        futures = [
+            (i, snap, fx_executor.submit(_process_channel_fx, i, snap, samples))
+            for i, snap, samples in prepared
+        ]
+        processed = [(i, snap, fut.result()) for i, snap, fut in futures]
+    else:
+        processed = [
+            (i, snap, _process_channel_fx(i, snap, samples))
+            for i, snap, samples in prepared
+        ]
+
+    for i, snap, samples in processed:
         is_audible = (not snap.mute) and (not any_solo or snap.solo)
         if not is_audible or snap.volume <= 0.0:
             continue
@@ -400,7 +568,41 @@ def mix_stereo_chunk(
         want_vu = out_levels is not None and i < len(out_levels)
         want_pk = out_peaks is not None and i < len(out_peaks)
 
-        if want_vu or want_pk:
+        if use_c:
+            s_arr = _dsp.as_f64_array(samples)
+            if want_vu or want_pk:
+                vu_c = ctypes.c_double(0.0)
+                pk_c = ctypes.c_double(0.0)
+                _dsp.LIB.dsp_mix_channel_accum(
+                    _dsp.f64_ptr(s_arr),
+                    max_len,
+                    l_gain,
+                    r_gain,
+                    abs_gain,
+                    ml_ptr,
+                    mr_ptr,
+                    1,
+                    ctypes.byref(vu_c),
+                    ctypes.byref(pk_c),
+                )
+                if want_vu:
+                    out_levels[i] = vu_c.value
+                if want_pk:
+                    out_peaks[i] = pk_c.value
+            else:
+                _dsp.LIB.dsp_mix_channel_accum(
+                    _dsp.f64_ptr(s_arr),
+                    max_len,
+                    l_gain,
+                    r_gain,
+                    abs_gain,
+                    ml_ptr,
+                    mr_ptr,
+                    0,
+                    None,
+                    None,
+                )
+        elif want_vu or want_pk:
             sum_sq = 0.0
             ch_peak = 0.0
             for j in range(max_len):
@@ -421,10 +623,51 @@ def mix_stereo_chunk(
                 master_left[j] += s * l_gain
                 master_right[j] += s * r_gain
 
-    stereo = array.array("h", [0] * (max_len * 2))
     m_gain = float(master_gain)
     want_m_vu = out_master_levels is not None and len(out_master_levels) >= 2
     want_m_pk = out_master_peaks is not None and len(out_master_peaks) >= 2
+
+    if use_c:
+        stereo = _dsp.alloc_i16(max_len * 2)
+        if want_m_vu or want_m_pk:
+            vl_c = ctypes.c_double(0.0)
+            vr_c = ctypes.c_double(0.0)
+            pl_c = ctypes.c_double(0.0)
+            pr_c = ctypes.c_double(0.0)
+            _dsp.LIB.dsp_master_pack_i16(
+                ml_ptr,
+                mr_ptr,
+                max_len,
+                m_gain,
+                _dsp.i16_ptr(stereo),
+                1,
+                ctypes.byref(vl_c),
+                ctypes.byref(vr_c),
+                ctypes.byref(pl_c),
+                ctypes.byref(pr_c),
+            )
+            if want_m_vu:
+                out_master_levels[0] = vl_c.value
+                out_master_levels[1] = vr_c.value
+            if want_m_pk:
+                out_master_peaks[0] = pl_c.value
+                out_master_peaks[1] = pr_c.value
+        else:
+            _dsp.LIB.dsp_master_pack_i16(
+                ml_ptr,
+                mr_ptr,
+                max_len,
+                m_gain,
+                _dsp.i16_ptr(stereo),
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+        return stereo.tobytes()
+
+    stereo = array.array("h", [0] * (max_len * 2))
 
     if want_m_vu or want_m_pk:
         l_sq = 0.0
@@ -1694,7 +1937,52 @@ class Window:
             channel_num=channel_idx + 1,
             on_close=on_popup_close,
         )
+        self._position_effect_window(popup)
         self._effect_windows[key] = popup
+
+    def _position_effect_window(self, popup):
+        """Tile newly opened effect popups side-by-side instead of stacking on top of each other."""
+        try:
+            screen = self.root.screen() or QApplication.primaryScreen()
+            avail = screen.availableGeometry() if screen is not None else self.root.frameGeometry()
+            root_geo = self.root.frameGeometry()
+
+            pw = max(popup.width(), popup.sizeHint().width(), 340)
+            ph = max(popup.height(), popup.sizeHint().height(), 240)
+            gap = 12
+
+            occupied = [
+                p.frameGeometry()
+                for p in self._effect_windows.values()
+                if p is not popup and p.is_open()
+            ]
+
+            start_x = max(avail.left() + gap, root_geo.left() + 24)
+            start_y = max(avail.top() + gap, root_geo.top() + 72)
+
+            # Search left-to-right, top-to-bottom for the first non-overlapping slot
+            y = start_y
+            placed = False
+            while y + ph <= avail.bottom() - gap:
+                x = start_x
+                while x + pw <= avail.right() - gap:
+                    cand = QRect(x, y, pw, ph)
+                    if not any(cand.adjusted(-6, -6, 6, 6).intersects(r) for r in occupied):
+                        popup.move(x, y)
+                        placed = True
+                        break
+                    x += pw + gap
+                if placed:
+                    break
+                y += ph + gap
+
+            if not placed:
+                offset = (len(occupied) % 6) * 28
+                cx = min(avail.right() - pw - gap, start_x + offset)
+                cy = min(avail.bottom() - ph - gap, start_y + offset)
+                popup.move(max(avail.left() + gap, cx), max(avail.top() + gap, cy))
+        except Exception:
+            pass
 
     def _close_effect_window(self, channel_idx, effect_key):
         key = (channel_idx, effect_key)
@@ -1922,11 +2210,27 @@ class Window:
             self._ui_call(self._set_play_lit, False)
             self._ui_call(self._set_pause_lit, True)
 
+    @staticmethod
+    def _audible_delay_indices(snapshots, master_gain=1.0):
+        """Return indices of loaded, audible channels that have Delay enabled."""
+        if float(master_gain) <= 0.0:
+            return []
+        any_solo = any(s.solo for s in snapshots)
+        return [
+            idx
+            for idx, s in enumerate(snapshots)
+            if s.filepath
+            and s.delay_enabled
+            and (not s.mute)
+            and (not any_solo or s.solo)
+            and s.volume > 0.0
+        ]
+
     def _play_worker(self):
         pa = None
         stream = None
         wav_handles = [None] * 4
-        wav_meta = [None] * 4
+        readers = [None] * 4
 
         try:
             print("Now playing...")
@@ -1937,10 +2241,9 @@ class Window:
                 if path:
                     wf = wave.open(path, "rb")
                     wav_handles[idx] = wf
-                    meta = (wf.getnchannels(), wf.getsampwidth(), wf.getframerate())
-                    wav_meta[idx] = meta
-                    if session_rate is None and meta[2] > 0:
-                        session_rate = meta[2]
+                    fr = wf.getframerate()
+                    if session_rate is None and fr > 0:
+                        session_rate = fr
 
             if session_rate is None:
                 session_rate = self.rate
@@ -1965,15 +2268,15 @@ class Window:
                     frames_per_buffer=self.buffer,
                 )
 
+            for idx, wf in enumerate(wav_handles):
+                if wf is not None:
+                    readers[idx] = StreamingWavReader(wf, session_rate)
+
             def _apply_seek(target_sec):
                 nonlocal frames_played, in_tail, tail_frames_remaining, tail_frames_emitted
-                for i, wf_h in enumerate(wav_handles):
-                    if wf_h is None:
-                        continue
-                    fr_i = max(1, wav_meta[i][2])
-                    pos_frame = int(round(target_sec * fr_i))
-                    pos_frame = max(0, min(wf_h.getnframes(), pos_frame))
-                    wf_h.setpos(pos_frame)
+                for rdr in readers:
+                    if rdr is not None:
+                        rdr.seek(target_sec)
                 for ch_s in self.channel_states:
                     ch_s.reset_effects()
                 frames_played = int(round(target_sec * session_rate))
@@ -2038,35 +2341,28 @@ class Window:
                 chunks = [[] for _ in range(4)]
                 any_data = False
 
-                for idx, wf in enumerate(wav_handles):
-                    if wf is None:
+                for idx, rdr in enumerate(readers):
+                    if rdr is None:
                         continue
-                    nch, sw, fr = wav_meta[idx]
-                    read_frames = (
-                        self.buffer
-                        if fr == session_rate
-                        else max(1, int(round(self.buffer * (fr / float(session_rate)))))
-                    )
-                    raw = wf.readframes(read_frames)
-                    if not raw:
+                    mono = rdr.read(self.buffer)
+                    if not mono:
                         continue
                     any_data = True
-                    mono = decode_pcm_to_mono_float(raw, sw, nch)
-                    if fr != session_rate:
-                        target = max(1, int(round(len(mono) * (session_rate / float(fr)))))
-                        mono = resample_linear(mono, target)
                     chunks[idx] = mono
 
                 snapshots = [ch.snapshot() for ch in self.channel_states]
+                master_gain = self._get_master_volume()
 
                 if not any_data:
                     if not in_tail:
-                        delay_snaps = [s for s in snapshots if s.filepath and s.delay_enabled]
-                        if not delay_snaps:
+                        delay_indices = self._audible_delay_indices(snapshots, master_gain)
+                        if not delay_indices:
                             print("Audio ended")
                             break
                         in_tail = True
-                        max_delay_ms = max(s.delay.get_params()[0] for s in delay_snaps)
+                        max_delay_ms = max(
+                            snapshots[i].delay.get_params()[0] for i in delay_indices
+                        )
                         min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + self.buffer
                         tail_frames_remaining = max(int(session_rate * 2.5), min_tail_frames * 2)
                     if tail_frames_remaining <= 0:
@@ -2075,16 +2371,19 @@ class Window:
                     tail_chunk_len = min(self.buffer, tail_frames_remaining)
                     tail_frames_remaining -= tail_chunk_len
                     tail_frames_emitted += tail_chunk_len
-                    for idx, s in enumerate(snapshots):
-                        if s.filepath and s.delay_enabled:
-                            chunks[idx] = [0.0] * tail_chunk_len
+                    delay_indices = self._audible_delay_indices(snapshots, master_gain)
+                    if not delay_indices:
+                        print("Audio ended")
+                        break
+                    for idx in delay_indices:
+                        chunks[idx] = [0.0] * tail_chunk_len
 
                 pcm_bytes = mix_stereo_chunk(
                     chunks,
                     snapshots,
                     session_rate,
                     out_levels=chunk_levels,
-                    master_gain=self._get_master_volume(),
+                    master_gain=master_gain,
                     out_master_levels=master_levels,
                     out_peaks=chunk_true_peaks,
                     out_master_peaks=master_true_peaks,
@@ -2094,9 +2393,7 @@ class Window:
                 )
 
                 if in_tail and tail_frames_emitted > min_tail_frames and pcm_bytes:
-                    check = array.array("h")
-                    check.frombytes(pcm_bytes)
-                    if max(abs(v) for v in check) < 4:
+                    if _is_pcm_silent(pcm_bytes, 4):
                         print("Audio ended")
                         break
 
@@ -2210,7 +2507,7 @@ class Window:
         in_stream = None
         out_stream = None
         wav_handles = [None] * 4
-        wav_meta = [None] * 4
+        readers = [None] * 4
         recorded_frames = []
 
         try:
@@ -2244,7 +2541,7 @@ class Window:
                 if path:
                     wf = wave.open(path, "rb")
                     wav_handles[idx] = wf
-                    wav_meta[idx] = (wf.getnchannels(), wf.getsampwidth(), wf.getframerate())
+                    readers[idx] = StreamingWavReader(wf, session_rate)
                     has_overdub = True
 
             if has_overdub:
@@ -2305,23 +2602,13 @@ class Window:
                 if out_stream is not None:
                     chunks = [[] for _ in range(4)]
                     any_data = False
-                    for idx, wf in enumerate(wav_handles):
-                        if wf is None:
+                    for idx, rdr in enumerate(readers):
+                        if rdr is None:
                             continue
-                        nch, sw, fr = wav_meta[idx]
-                        read_frames = (
-                            self.buffer
-                            if fr == session_rate
-                            else max(1, int(round(self.buffer * (fr / float(session_rate)))))
-                        )
-                        raw = wf.readframes(read_frames)
-                        if not raw:
+                        mono = rdr.read(self.buffer)
+                        if not mono:
                             continue
                         any_data = True
-                        mono = decode_pcm_to_mono_float(raw, sw, nch)
-                        if fr != session_rate:
-                            target = max(1, int(round(len(mono) * (session_rate / float(fr)))))
-                            mono = resample_linear(mono, target)
                         chunks[idx] = mono
                     if any_data:
                         snapshots = [ch.snapshot() for ch in self.channel_states]
@@ -2431,7 +2718,7 @@ class Window:
 
     def stop(self):
         with self._state_lock:
-            active = self.playing or self.recording
+            active = self.playing or self.recording or self.bouncing
             self.paused = False
         if active:
             self._stop_event.set()
@@ -2453,10 +2740,9 @@ class Window:
             self._show_info("No Audio Loaded", "Load at least one .wav file before bouncing.")
             return
 
-        with self._state_lock:
-            if self.playing or self.recording or self.bouncing:
-                self._show_info("Mixer Busy", "Please stop playback/recording before bouncing.")
-                return
+        if self._is_busy():
+            self._show_info("Mixer Busy", "Please stop playback/recording before bouncing.")
+            return
 
         entry_name = sanitize_filename(self.nameBox.text())
         if entry_name:
@@ -2475,9 +2761,17 @@ class Window:
             if not out_path.lower().endswith(".wav"):
                 out_path += ".wav"
 
+        busy_now = False
         with self._state_lock:
-            self.bouncing = True
-            self._stop_event.clear()
+            if self.playing or self.recording or self.bouncing:
+                busy_now = True
+            else:
+                self.bouncing = True
+                self._stop_event.clear()
+
+        if busy_now:
+            self._show_info("Mixer Busy", "Please stop playback/recording before bouncing.")
+            return
 
         self._set_status("Bouncing... 0%")
         self._ui_call(self._set_bounce_progress, 0.0, "Bouncing... 0%", "#48d18a")
@@ -2492,38 +2786,46 @@ class Window:
 
     def _bounce_worker(self, out_path):
         wav_handles = [None] * 4
-        wav_meta = [None] * 4
-        chunk_size = 4096
+        readers = [None] * 4
+        use_c = _dsp is not None and _dsp.AVAILABLE
+        chunk_size = 65536 if use_c else 4096
+        tail_step = 4096
 
         try:
             print(f"Bouncing audio to {out_path}...")
             session_rate = None
             snapshots = [ch.snapshot() for ch in self.channel_states]
             offline_procs = [ch.clone_processors_for_offline() for ch in self.channel_states]
+            frozen_master_gain = self._get_master_volume()
 
             for idx, snap in enumerate(snapshots):
                 if snap.filepath:
                     wf = wave.open(snap.filepath, "rb")
                     wav_handles[idx] = wf
-                    meta = (wf.getnchannels(), wf.getsampwidth(), wf.getframerate())
-                    wav_meta[idx] = meta
-                    if session_rate is None and meta[2] > 0:
-                        session_rate = meta[2]
+                    fr = wf.getframerate()
+                    if session_rate is None and fr > 0:
+                        session_rate = fr
 
             if session_rate is None:
                 session_rate = self.rate
+
+            for idx, wf in enumerate(wav_handles):
+                if wf is not None:
+                    readers[idx] = StreamingWavReader(wf, session_rate)
 
             total_frames = 0
             for idx, wf in enumerate(wav_handles):
                 if wf is None:
                     continue
-                fr = max(1, wav_meta[idx][2])
+                fr = max(1, wf.getframerate())
                 scaled = int(round(wf.getnframes() * (session_rate / float(fr))))
                 if scaled > total_frames:
                     total_frames = scaled
-            delay_snaps_init = [s for s in snapshots if s.filepath and s.delay_enabled]
-            if delay_snaps_init:
-                est_delay_ms = max(s.delay.get_params()[0] for s in delay_snaps_init)
+            delay_indices_init = self._audible_delay_indices(snapshots, frozen_master_gain)
+            if delay_indices_init:
+                est_delay_ms = max(
+                    offline_procs[i][3].get_params()[0] for i in delay_indices_init
+                )
                 total_frames += int(est_delay_ms * session_rate / 1000.0)
             total_frames = max(1, total_frames)
 
@@ -2536,84 +2838,79 @@ class Window:
             in_tail = False
 
             cancelled = False
-            with wave.open(out_path, "wb") as bounce_wf:
-                bounce_wf.setnchannels(2)
-                bounce_wf.setsampwidth(self.bitdepth // 8)
-                bounce_wf.setframerate(int(session_rate))
+            fx_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="BounceFX") if use_c else None
+            try:
+                with wave.open(out_path, "wb") as bounce_wf:
+                    bounce_wf.setnchannels(2)
+                    bounce_wf.setsampwidth(self.bitdepth // 8)
+                    bounce_wf.setframerate(int(session_rate))
 
-                while True:
-                    if self._stop_event.is_set():
-                        cancelled = True
-                        break
-                    chunks = [[] for _ in range(4)]
-                    any_data = False
+                    while True:
+                        if self._stop_event.is_set():
+                            cancelled = True
+                            break
+                        chunks = [[] for _ in range(4)]
+                        any_data = False
 
-                    for idx, wf in enumerate(wav_handles):
-                        if wf is None:
-                            continue
-                        nch, sw, fr = wav_meta[idx]
-                        read_frames = (
-                            chunk_size
-                            if fr == session_rate
-                            else max(1, int(round(chunk_size * (fr / float(session_rate)))))
-                        )
-                        raw = wf.readframes(read_frames)
-                        if not raw:
-                            continue
-                        any_data = True
-                        mono = decode_pcm_to_mono_float(raw, sw, nch)
-                        if fr != session_rate:
-                            target = max(1, int(round(len(mono) * (session_rate / float(fr)))))
-                            mono = resample_linear(mono, target)
-                        chunks[idx] = mono
+                        for idx, rdr in enumerate(readers):
+                            if rdr is None:
+                                continue
+                            mono = rdr.read(chunk_size)
+                            if not mono:
+                                continue
+                            any_data = True
+                            chunks[idx] = mono
 
-                    if not any_data:
-                        if not in_tail:
-                            delay_snaps = [s for s in snapshots if s.filepath and s.delay_enabled]
-                            if not delay_snaps:
+                        if not any_data:
+                            if not in_tail:
+                                if not delay_indices_init:
+                                    break
+                                in_tail = True
+                                max_delay_ms = max(
+                                    offline_procs[i][3].get_params()[0] for i in delay_indices_init
+                                )
+                                min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + tail_step
+                                tail_frames_remaining = max(int(session_rate * 2.5), min_tail_frames * 2)
+                            if tail_frames_remaining <= 0:
                                 break
-                            in_tail = True
-                            max_delay_ms = max(s.delay.get_params()[0] for s in delay_snaps)
-                            min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + chunk_size
-                            tail_frames_remaining = max(int(session_rate * 2.5), min_tail_frames * 2)
-                        if tail_frames_remaining <= 0:
-                            break
-                        tail_chunk_len = min(chunk_size, tail_frames_remaining)
-                        tail_frames_remaining -= tail_chunk_len
-                        tail_frames_emitted += tail_chunk_len
-                        for idx, s in enumerate(snapshots):
-                            if s.filepath and s.delay_enabled:
-                                chunks[idx] = [0.0] * tail_chunk_len
+                            tail_chunk_len = min(tail_step, tail_frames_remaining)
+                            tail_frames_remaining -= tail_chunk_len
+                            tail_frames_emitted += tail_chunk_len
+                            zero_chunk = _dsp.alloc_f64(tail_chunk_len) if use_c else [0.0] * tail_chunk_len
+                            for idx in delay_indices_init:
+                                chunks[idx] = zero_chunk
 
-                    pcm_bytes = mix_stereo_chunk(
-                        chunks,
-                        snapshots,
-                        session_rate,
-                        offline_processors=offline_procs,
-                        master_gain=self._get_master_volume(),
-                    )
-                    if in_tail and tail_frames_emitted > min_tail_frames and pcm_bytes:
-                        check = array.array("h")
-                        check.frombytes(pcm_bytes)
-                        if max(abs(v) for v in check) < 4:
-                            break
-                    if pcm_bytes:
-                        bounce_wf.writeframes(pcm_bytes)
-                        frames_written += len(pcm_bytes) // 4
+                        pcm_bytes = mix_stereo_chunk(
+                            chunks,
+                            snapshots,
+                            session_rate,
+                            offline_processors=offline_procs,
+                            master_gain=frozen_master_gain,
+                            fx_executor=fx_pool,
+                        )
+                        if in_tail and tail_frames_emitted > min_tail_frames and pcm_bytes:
+                            if _is_pcm_silent(pcm_bytes, 4):
+                                break
+                        if pcm_bytes:
+                            bounce_wf.writeframes(pcm_bytes)
+                            frames_written += len(pcm_bytes) // 4
 
-                        now = time.monotonic()
-                        frac = min(0.99, frames_written / float(total_frames))
-                        pct = int(frac * 100)
-                        if (pct - last_prog_pct >= 2 or now - last_prog_time >= 0.05) and pct != last_prog_pct:
-                            last_prog_pct = pct
-                            last_prog_time = now
-                            self._set_status(f"Bouncing... {pct}%")
-                            self._ui_call(
-                                self._set_bounce_progress,
-                                frac,
-                                f"Bouncing... {pct}%",
-                                "#48d18a",
-                            )
+                            now = time.monotonic()
+                            frac = min(0.99, frames_written / float(total_frames))
+                            pct = int(frac * 100)
+                            if (pct - last_prog_pct >= 2 or now - last_prog_time >= 0.05) and pct != last_prog_pct:
+                                last_prog_pct = pct
+                                last_prog_time = now
+                                self._set_status(f"Bouncing... {pct}%")
+                                self._ui_call(
+                                    self._set_bounce_progress,
+                                    frac,
+                                    f"Bouncing... {pct}%",
+                                    "#48d18a",
+                                )
+            finally:
+                if fx_pool is not None:
+                    fx_pool.shutdown(wait=True)
 
             if cancelled:
                 try:

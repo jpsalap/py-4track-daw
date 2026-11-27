@@ -162,6 +162,10 @@ class EffectDialogBase(QDialog):
         self.setMinimumWidth(width)
         self.setMaximumWidth(width + 80)
         self.setModal(False)
+        if not self._standalone:
+            # Floating utility panel stays above the main mixer window on macOS
+            # (matching Tkinter transient popups) so opening another effect won't bury earlier ones
+            self.setWindowFlag(Qt.WindowType.Tool, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
         self.setStyleSheet(

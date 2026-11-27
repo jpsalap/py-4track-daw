@@ -1,7 +1,13 @@
 # Delay Effect (DSP Processor + PySide6 Parameter Dialog)
+import ctypes
 import threading
 
 from fx_dialog_base import EffectDialogBase
+
+try:
+    import dsp_accel as _dsp
+except Exception:
+    _dsp = None
 
 
 class DelayProcessor:
@@ -44,7 +50,10 @@ class DelayProcessor:
 
     def reset(self):
         if self._buf_len > 0:
-            self._buffer = [0.0] * self._buf_len
+            if _dsp is not None and _dsp.AVAILABLE:
+                self._buffer = _dsp.alloc_f64(self._buf_len)
+            else:
+                self._buffer = [0.0] * self._buf_len
         self._write_idx = 0
 
     def clone_for_offline(self):
@@ -56,17 +65,41 @@ class DelayProcessor:
         if sr != self._sample_rate or self._buf_len == 0:
             self._sample_rate = sr
             self._buf_len = int(sr * self.MAX_DELAY_SEC) + 2
-            self._buffer = [0.0] * self._buf_len
+            if _dsp is not None and _dsp.AVAILABLE:
+                self._buffer = _dsp.alloc_f64(self._buf_len)
+            else:
+                self._buffer = [0.0] * self._buf_len
             self._write_idx = 0
 
     def process(self, samples, sample_rate):
-        """Apply feedback delay to a list of mono float samples in [-1.0, 1.0]."""
+        """Apply feedback delay to mono float samples in [-1.0, 1.0]."""
         n = len(samples)
         if n == 0:
             return samples
 
         self._ensure_buffer(sample_rate)
         delay_ms, feedback, mix = self.get_params()
+
+        if _dsp is not None and _dsp.AVAILABLE:
+            in_arr = _dsp.as_f64_array(samples)
+            out_arr = _dsp.alloc_f64(n)
+            buf_arr = _dsp.as_f64_array(self._buffer)
+            self._buffer = buf_arr
+            w_idx = ctypes.c_size_t(self._write_idx)
+            _dsp.LIB.dsp_delay_process(
+                _dsp.f64_ptr(in_arr),
+                _dsp.f64_ptr(out_arr),
+                n,
+                float(sample_rate),
+                delay_ms,
+                feedback,
+                mix,
+                _dsp.f64_ptr(buf_arr),
+                self._buf_len,
+                ctypes.byref(w_idx),
+            )
+            self._write_idx = w_idx.value
+            return out_arr
 
         buf = self._buffer
         buf_len = self._buf_len

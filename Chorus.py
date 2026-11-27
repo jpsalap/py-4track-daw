@@ -1,8 +1,14 @@
 # Chorus Effect (DSP Processor + PySide6 Parameter Dialog)
+import ctypes
 import math
 import threading
 
 from fx_dialog_base import EffectDialogBase
+
+try:
+    import dsp_accel as _dsp
+except Exception:
+    _dsp = None
 
 
 class ChorusProcessor:
@@ -58,7 +64,10 @@ class ChorusProcessor:
     def reset(self):
         self._phase = 0.0
         if self._buf_len > 0:
-            self._buffer = [0.0] * self._buf_len
+            if _dsp is not None and _dsp.AVAILABLE:
+                self._buffer = _dsp.alloc_f64(self._buf_len)
+            else:
+                self._buffer = [0.0] * self._buf_len
         self._write_idx = 0
 
     def clone_for_offline(self):
@@ -72,17 +81,45 @@ class ChorusProcessor:
         if sr != self._sample_rate or self._buf_len == 0:
             self._sample_rate = sr
             self._buf_len = int(sr * self.MAX_DELAY_SEC) + 4
-            self._buffer = [0.0] * self._buf_len
+            if _dsp is not None and _dsp.AVAILABLE:
+                self._buffer = _dsp.alloc_f64(self._buf_len)
+            else:
+                self._buffer = [0.0] * self._buf_len
             self._write_idx = 0
 
     def process(self, samples, sample_rate):
-        """Apply modulated chorus to a list of mono float samples in [-1.0, 1.0]."""
+        """Apply modulated chorus to mono float samples in [-1.0, 1.0]."""
         n = len(samples)
         if n == 0:
             return samples
 
         self._ensure_buffer(sample_rate)
         rate, depth_ms, base_delay_ms, mix = self.get_params()
+
+        if _dsp is not None and _dsp.AVAILABLE:
+            in_arr = _dsp.as_f64_array(samples)
+            out_arr = _dsp.alloc_f64(n)
+            buf_arr = _dsp.as_f64_array(self._buffer)
+            self._buffer = buf_arr
+            w_idx = ctypes.c_size_t(self._write_idx)
+            phase_c = ctypes.c_double(self._phase)
+            _dsp.LIB.dsp_chorus_process(
+                _dsp.f64_ptr(in_arr),
+                _dsp.f64_ptr(out_arr),
+                n,
+                float(sample_rate),
+                rate,
+                depth_ms,
+                base_delay_ms,
+                mix,
+                _dsp.f64_ptr(buf_arr),
+                self._buf_len,
+                ctypes.byref(w_idx),
+                ctypes.byref(phase_c),
+            )
+            self._write_idx = w_idx.value
+            self._phase = phase_c.value
+            return out_arr
 
         buf = self._buffer
         buf_len = self._buf_len
@@ -114,7 +151,11 @@ class ChorusProcessor:
                 read_pos += buf_len
 
             idx0 = int(read_pos)
-            frac = read_pos - idx0
+            if idx0 >= buf_len:
+                idx0 = 0
+                frac = 0.0
+            else:
+                frac = read_pos - idx0
             idx1 = idx0 + 1
             if idx1 >= buf_len:
                 idx1 = 0
