@@ -2464,6 +2464,68 @@ class Window:
         pad.set_flash_mode = set_flash_mode
         return pad
 
+    def _make_fader_ticks_canvas(
+        self,
+        parent,
+        bg,
+        fader_len,
+        pad_frac,
+        major_ticks,
+        minor_step_db=3.0,
+        width=32,
+    ):
+        """Crisp studio fader dB ruler canvas with major labels and minor hash marks."""
+        T = self.THEME
+        cv = tk.Canvas(
+            parent,
+            width=width,
+            height=fader_len,
+            bg=bg,
+            bd=0,
+            highlightthickness=0,
+        )
+        db_span = MAX_FADER_DB - MIN_FADER_DB
+        top_y = fader_len * pad_frac
+        span_y = fader_len * (1.0 - 2.0 * pad_frac)
+        major_dbs = {db for db, _ in major_ticks}
+
+        # Minor graduation dashes
+        db = float(MAX_FADER_DB)
+        while db >= float(MIN_FADER_DB) - 1e-6:
+            if not any(abs(db - m) < 0.05 for m in major_dbs):
+                y = top_y + ((MAX_FADER_DB - db) / db_span) * span_y
+                cv.create_line(0, y, 3, y, fill="#527494", width=1)
+            db -= float(minor_step_db)
+
+        # Major ticks + labels (non-overlapping guard prioritizing unity and endpoints)
+        min_gap = 10.5
+        drawn_ys = []
+        priority = [t for t in major_ticks if t[0] in (0.0, MAX_FADER_DB, MIN_FADER_DB)]
+        others = [t for t in major_ticks if t[0] not in (0.0, MAX_FADER_DB, MIN_FADER_DB)]
+        show_lbl = set()
+        for tick_db, _ in priority + others:
+            y = top_y + ((MAX_FADER_DB - tick_db) / db_span) * span_y
+            if all(abs(y - py) >= min_gap for py in drawn_ys):
+                drawn_ys.append(y)
+                show_lbl.add(tick_db)
+
+        for tick_db, tick_txt in major_ticks:
+            y = top_y + ((MAX_FADER_DB - tick_db) / db_span) * span_y
+            is_unity = tick_db == 0.0
+            has_lbl = tick_db in show_lbl
+            col = T["unity_gold"] if is_unity else (T["text_muted"] if has_lbl else "#5c7e9e")
+            cv.create_line(0, y, 5 if has_lbl else 3, y, fill=col, width=1.5 if is_unity else 1)
+            if has_lbl:
+                cv.create_text(
+                    7,
+                    y,
+                    text=tick_txt,
+                    fill=col,
+                    font=("Helvetica", 7, "bold" if is_unity else "normal"),
+                    anchor="w",
+                )
+        return cv
+
     def _build_channel_strips(self):
         T = self.THEME
 
@@ -2664,29 +2726,29 @@ class Window:
             vol_scale.bind("<Double-Button-1>", lambda _e, s=vol_scale: self._reset_scale(s, 0.0))
             vol_scale.pack(side=tk.LEFT, padx=(0, 2))
 
-            ticks_frame = tk.Frame(fader_row, bg=T["bg_strip"], width=32, height=fader_len)
-            ticks_frame.pack(side=tk.LEFT)
-            ticks_frame.pack_propagate(False)
-
-            db_span = MAX_FADER_DB - MIN_FADER_DB
-            for tick_db, tick_txt in (
+            ch_ticks = (
                 (6.0, "+6"),
                 (0.0, "0"),
+                (-6.0, "-6"),
                 (-12.0, "-12"),
+                (-18.0, "-18"),
                 (-24.0, "-24"),
+                (-30.0, "-30"),
+                (-36.0, "-36"),
                 (-42.0, "-42"),
+                (-48.0, "-48"),
+                (-54.0, "-54"),
                 (MIN_FADER_DB, "-∞"),
-            ):
-                frac = (MAX_FADER_DB - tick_db) / db_span
-                rely = 0.08 + 0.84 * frac
-                fg_col = T["unity_gold"] if tick_db == 0.0 else T["text_muted"]
-                tk.Label(
-                    ticks_frame,
-                    text=tick_txt,
-                    bg=T["bg_strip"],
-                    fg=fg_col,
-                    font=("Helvetica", 8, "bold" if tick_db == 0.0 else "normal"),
-                ).place(x=2, rely=rely, anchor="w")
+            )
+            ticks_cv = self._make_fader_ticks_canvas(
+                fader_row,
+                bg=T["bg_strip"],
+                fader_len=fader_len,
+                pad_frac=0.08,
+                major_ticks=ch_ticks,
+                minor_step_db=3.0,
+            )
+            ticks_cv.pack(side=tk.LEFT)
 
             # Channel control toggle pads pinned cleanly at bottom
             ctrl_grid = tk.Frame(frame, bg=T["bg_strip"])
@@ -2891,32 +2953,33 @@ class Window:
         self.master_scale.bind("<Double-Button-1>", lambda _e: self._reset_scale(self.master_scale, 0.0))
         self.master_scale.pack(side=tk.LEFT, padx=(0, 2))
 
-        ticks_frame = tk.Frame(fader_col, bg="#263e54", width=32, height=fader_len)
-        ticks_frame.pack(side=tk.LEFT)
-        ticks_frame.pack_propagate(False)
-
-        db_span = MAX_FADER_DB - MIN_FADER_DB
-        for tick_db, tick_txt in (
+        master_ticks = (
             (6.0, "+6"),
+            (3.0, "+3"),
             (0.0, "0"),
+            (-3.0, "-3"),
             (-6.0, "-6"),
+            (-9.0, "-9"),
             (-12.0, "-12"),
+            (-15.0, "-15"),
             (-18.0, "-18"),
             (-24.0, "-24"),
+            (-30.0, "-30"),
             (-36.0, "-36"),
+            (-42.0, "-42"),
             (-48.0, "-48"),
+            (-54.0, "-54"),
             (MIN_FADER_DB, "-∞"),
-        ):
-            frac = (MAX_FADER_DB - tick_db) / db_span
-            rely = 0.04 + 0.92 * frac
-            fg_col = T["unity_gold"] if tick_db == 0.0 else T["text_muted"]
-            tk.Label(
-                ticks_frame,
-                text=tick_txt,
-                bg="#263e54",
-                fg=fg_col,
-                font=("Helvetica", 8, "bold" if tick_db == 0.0 else "normal"),
-            ).place(x=2, rely=rely, anchor="w")
+        )
+        ticks_cv = self._make_fader_ticks_canvas(
+            fader_col,
+            bg="#263e54",
+            fader_len=fader_len,
+            pad_frac=0.04,
+            major_ticks=master_ticks,
+            minor_step_db=1.5,
+        )
+        ticks_cv.pack(side=tk.LEFT)
 
         # Unity reset shortcut button at bottom of Master Bus strip
         reset_btn = self._make_flat_button(
