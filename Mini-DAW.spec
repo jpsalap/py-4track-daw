@@ -11,7 +11,7 @@ portaudio_candidates = [
 ]
 portaudio_lib = next((p for p in portaudio_candidates if os.path.exists(p)), None)
 extra_binaries = [(portaudio_lib, ".")] if portaudio_lib else []
-dsp_lib = os.path.abspath("libminidaw_dsp.dylib")
+dsp_lib = os.path.join(SPECPATH, "libminidaw_dsp.dylib")
 if os.path.exists(dsp_lib):
     extra_binaries.append((dsp_lib, "."))
 
@@ -67,8 +67,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "Mini-DAW",
         "CFBundleDisplayName": "Mini-DAW",
-        "CFBundleShortVersionString": "1.3.0",
-        "CFBundleVersion": "1.3.0",
+        "CFBundleShortVersionString": "1.3.1",
+        "CFBundleVersion": "1.3.1",
         "NSHighResolutionCapable": True,
         "NSMicrophoneUsageDescription": "Mini-DAW needs microphone access to record audio tracks.",
     },

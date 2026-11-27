@@ -35,7 +35,10 @@ from Compressor import CompressorProcessor, CompressorWindow
 
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.join(os.path.expanduser("~"), "Music", "Mini-DAW")
-    os.makedirs(BASE_DIR, exist_ok=True)
+    try:
+        os.makedirs(BASE_DIR, exist_ok=True)
+    except OSError:
+        BASE_DIR = os.path.expanduser("~")
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -104,6 +107,28 @@ def _is_pcm_silent(pcm_bytes, threshold=4):
     return max(abs(v) for v in check) < threshold
 
 
+def _estimate_delay_tail_frames(delay_procs, session_rate, step_frames, max_tail_sec=15.0):
+    """Compute (min_tail_frames, max_tail_frames) accounting for delay time and feedback decay."""
+    max_delay_ms = 0.0
+    max_total_frames = 0
+    cap_frames = int(session_rate * max_tail_sec)
+    for proc in delay_procs:
+        delay_ms, fb, _mix = proc.get_params()
+        if delay_ms > max_delay_ms:
+            max_delay_ms = delay_ms
+        cycle_frames = max(1, int(delay_ms * session_rate / 1000.0))
+        if fb <= 1e-3:
+            cycles = 2
+        else:
+            cycles = max(2, int(math.ceil(math.log(1e-4) / math.log(min(0.99, fb)))) + 1)
+        est = min(cap_frames, cycle_frames * cycles + step_frames)
+        if est > max_total_frames:
+            max_total_frames = est
+    min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + step_frames
+    tail_frames = max(int(session_rate * 2.5), min_tail_frames * 2, max_total_frames)
+    return min_tail_frames, min(cap_frames, tail_frames)
+
+
 def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels):
     """Decode PCM WAV bytes (8/16/24/32-bit, mono or multi-channel) to mono floats in [-1.0, 1.0]."""
     if not raw_bytes:
@@ -121,8 +146,11 @@ def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels):
         return out
 
     if sampwidth == 2:
+        usable = (len(raw_bytes) // (2 * nchannels)) * (2 * nchannels)
+        if usable == 0:
+            return []
         pcm = array.array("h")
-        pcm.frombytes(raw_bytes)
+        pcm.frombytes(raw_bytes[:usable])
         scale = 1.0 / 32768.0
         if nchannels == 1:
             return [s * scale for s in pcm]
@@ -175,8 +203,11 @@ def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels):
         return out
 
     if sampwidth == 4:
+        usable = (len(raw_bytes) // (4 * nchannels)) * (4 * nchannels)
+        if usable == 0:
+            return []
         pcm = array.array("i")
-        pcm.frombytes(raw_bytes)
+        pcm.frombytes(raw_bytes[:usable])
         scale = 1.0 / 2147483648.0
         if nchannels == 1:
             return [s * scale for s in pcm]
@@ -693,6 +724,10 @@ def mix_stereo_chunk(
     for j in range(max_len):
         lv = master_left[j] * m_gain
         rv = master_right[j] * m_gain
+        if not math.isfinite(lv):
+            lv = 0.0
+        if not math.isfinite(rv):
+            rv = 0.0
         if want_m_vu or want_m_pk:
             l_sq += lv * lv
             r_sq += rv * rv
@@ -916,7 +951,7 @@ class ChannelMeter:
     @staticmethod
     def linear_to_norm(linear_peak):
         """Convert linear amplitude peak to normalized [0.0, 1.0] on a -60..0 dBFS scale."""
-        if linear_peak <= 1e-4:
+        if not math.isfinite(linear_peak) or linear_peak <= 1e-4:
             return 0.0
         db = 20.0 * math.log10(linear_peak)
         if db <= -60.0:
@@ -2850,6 +2885,14 @@ class Window:
                 on_border="#dec9ff",
                 on_change=lambda en, c=idx: self.channel_states[c].set_polarity_invert(en),
             )
+            def _on_rec_arm_toggle(en, c=idx, rv=rec_var):
+                with self._state_lock:
+                    rec_active = self.recording
+                if rec_active:
+                    rv.set(self.channel_states[c].snapshot().rec_armed)
+                    return
+                self.channel_states[c].set_rec_armed(en)
+
             rec_pad = self._make_toggle_pad(
                 ctrl_grid,
                 text="●  Rec",
@@ -2862,7 +2905,7 @@ class Window:
                 on_bg="#cc2431",
                 on_fg="#ffffff",
                 on_border="#ffb8bf",
-                on_change=lambda en, c=idx: self.channel_states[c].set_rec_armed(en),
+                on_change=_on_rec_arm_toggle,
             )
 
             solo_pad.grid(row=0, column=0, padx=2, pady=2, sticky="ew")
@@ -3498,83 +3541,90 @@ class Window:
         if self._closing:
             return
 
-        self._drain_ui_queue()
-        if self._closing:
-            return
-
-        with self._state_lock:
-            is_playing = self.playing
-            is_recording = self.recording
-
-        with self._meter_lock:
-            ch_peaks = list(self._channel_peaks)
-            m_peaks = list(self._master_peaks)
-            ch_true = list(self._channel_true_peaks)
-            m_true = list(self._master_true_peaks)
-            # Clear latched true peaks after reading so next tick gets fresh peaks
-            self._channel_true_peaks = [0.0, 0.0, 0.0, 0.0]
-            self._master_true_peaks = [0.0, 0.0]
-            if not is_playing and not is_recording:
-                self._channel_peaks = [0.0, 0.0, 0.0, 0.0]
-                self._master_peaks = [0.0, 0.0]
-
-        now = time.monotonic()
-        for idx, meter in enumerate(self._channel_meters):
-            meter.update_level(ch_peaks[idx])
-        for idx, readout in enumerate(self._channel_peak_readouts):
-            readout.update(ch_true[idx], now=now)
-        for idx, meter in enumerate(self._master_meters):
-            meter.update_level(m_peaks[idx])
-        if self._master_peak_readout is not None:
-            self._master_peak_readout.update(max(m_true[0], m_true[1]), now=now)
-
-        # Sync playhead indicator, muted clip dimming & live recording waveform overlay
-        if hasattr(self, "timeline"):
-            snaps_aud = [ch.snapshot() for ch in self.channel_states]
-            any_s = any(s.solo for s in snaps_aud)
-            self.timeline.set_audible_flags(
-                [(not s.mute) and (not any_s or s.solo) for s in snaps_aud]
-            )
-            if is_recording and hasattr(self, "_rec_wave_lock"):
-                with self._rec_wave_lock:
-                    r_act = self._rec_wave_active
-                    r_armed = list(self._rec_wave_armed)
-                    r_peaks = list(self._rec_wave_peaks)
-                    r_elapsed = self._rec_wave_elapsed
-                if r_act:
-                    self.timeline.update_live_recording(True, r_armed, r_peaks, r_elapsed)
-            elif is_playing:
-                with self._seek_lock:
-                    pos_sec = self._playhead_sec
-                self.timeline.set_position(pos_sec, follow=True)
-
-        # Synchronized ~2 Hz flash for armed Rec buttons (solid red while actively recording)
-        self._blink_tick += 1
-        blink_hi = (self._blink_tick // 14) % 2 == 0
-        any_armed = False
-        for idx, ch in enumerate(self.channel_states):
-            armed = ch.snapshot().rec_armed
-            if armed:
-                any_armed = True
-            if idx < len(self._rec_pad_modes):
-                if armed and is_recording:
-                    self._rec_pad_modes[idx]("solid")
-                elif armed:
-                    self._rec_pad_modes[idx]("blink_hi" if blink_hi else "blink_lo")
-                else:
-                    self._rec_pad_modes[idx](None)
-
-        if is_recording:
-            self._set_rec_mode("solid")
-        elif any_armed:
-            self._set_rec_mode("blink_hi" if blink_hi else "blink_lo")
-        else:
-            self._set_rec_mode("off")
-
         try:
-            self.root.after(33, self._poll_meters)
+            self._drain_ui_queue()
+            if self._closing:
+                return
+
+            with self._state_lock:
+                is_playing = self.playing
+                is_paused = self.paused
+                is_recording = self.recording
+
+            with self._meter_lock:
+                ch_peaks = list(self._channel_peaks)
+                m_peaks = list(self._master_peaks)
+                ch_true = list(self._channel_true_peaks)
+                m_true = list(self._master_true_peaks)
+                # Clear latched true peaks after reading so next tick gets fresh peaks
+                self._channel_true_peaks = [0.0, 0.0, 0.0, 0.0]
+                self._master_true_peaks = [0.0, 0.0]
+                if not is_playing and not is_recording:
+                    self._channel_peaks = [0.0, 0.0, 0.0, 0.0]
+                    self._master_peaks = [0.0, 0.0]
+
+            now = time.monotonic()
+            for idx, meter in enumerate(self._channel_meters):
+                meter.update_level(ch_peaks[idx])
+            for idx, readout in enumerate(self._channel_peak_readouts):
+                readout.update(ch_true[idx], now=now)
+            for idx, meter in enumerate(self._master_meters):
+                meter.update_level(m_peaks[idx])
+            if self._master_peak_readout is not None:
+                self._master_peak_readout.update(max(m_true[0], m_true[1]), now=now)
+
+            # Sync playhead indicator, muted clip dimming & live recording waveform overlay
+            if hasattr(self, "timeline"):
+                snaps_aud = [ch.snapshot() for ch in self.channel_states]
+                any_s = any(s.solo for s in snaps_aud)
+                self.timeline.set_audible_flags(
+                    [(not s.mute) and (not any_s or s.solo) for s in snaps_aud]
+                )
+                if is_recording and hasattr(self, "_rec_wave_lock"):
+                    with self._rec_wave_lock:
+                        r_act = self._rec_wave_active
+                        r_armed = list(self._rec_wave_armed)
+                        r_peaks = list(self._rec_wave_peaks)
+                        r_elapsed = self._rec_wave_elapsed
+                    if r_act:
+                        self.timeline.update_live_recording(True, r_armed, r_peaks, r_elapsed)
+                elif is_playing and not is_paused:
+                    with self._seek_lock:
+                        pos_sec = self._playhead_sec
+                    self.timeline.set_position(pos_sec, follow=True)
+
+            # Synchronized ~2 Hz flash for armed Rec buttons (solid red while actively recording)
+            self._blink_tick += 1
+            blink_hi = (self._blink_tick // 14) % 2 == 0
+            any_armed = False
+            for idx, ch in enumerate(self.channel_states):
+                armed = ch.snapshot().rec_armed
+                if armed:
+                    any_armed = True
+                if idx < len(self._rec_pad_modes):
+                    if armed and is_recording:
+                        self._rec_pad_modes[idx]("solid")
+                    elif armed:
+                        self._rec_pad_modes[idx]("blink_hi" if blink_hi else "blink_lo")
+                    else:
+                        self._rec_pad_modes[idx](None)
+
+            if is_recording:
+                self._set_rec_mode("solid")
+            elif any_armed:
+                self._set_rec_mode("blink_hi" if blink_hi else "blink_lo")
+            else:
+                self._set_rec_mode("off")
         except tk.TclError:
-            pass
+            return
+        except Exception as exc:
+            print(f"Meter loop warning: {exc}")
+        finally:
+            if not self._closing:
+                try:
+                    self.root.after(33, self._poll_meters)
+                except tk.TclError:
+                    pass
 
     def _on_root_click(self, event):
         """Release focus from nameBox when clicking elsewhere so Spacebar shortcut keeps working."""
@@ -3662,6 +3712,8 @@ class Window:
 
     def _on_effect_toggle(self, channel_idx, effect_key, var):
         enabled = bool(var.get())
+        if enabled and effect_key in ("delay", "chorus"):
+            self.channel_states[channel_idx].get_processor(effect_key).reset()
         self.channel_states[channel_idx].set_effect_enabled(effect_key, enabled)
         if enabled:
             self.open_effect_window(channel_idx, effect_key)
@@ -3718,7 +3770,7 @@ class Window:
             title=f"Load WAV for Channel {channel_idx + 1}",
             filetypes=(("WAV files", "*.wav"), ("All files", "*.*")),
         )
-        if not filepath:
+        if not filepath or self._closing or self._is_busy():
             return
 
         try:
@@ -3768,17 +3820,21 @@ class Window:
             except Exception as exc:
                 print(f"Waveform extraction skipped: {exc}")
                 return
-            # Only apply if channel still points to the same file
+            def _apply_waveform():
+                if self.channel_states[channel_idx].get_filepath() != filepath:
+                    return
+                if hasattr(self, "timeline"):
+                    self.timeline.set_track_waveform(
+                        channel_idx,
+                        peaks,
+                        dur,
+                        os.path.basename(filepath),
+                    )
+
+            # Only apply if channel still points to the same file (re-checked on main thread)
             if self.channel_states[channel_idx].get_filepath() != filepath:
                 return
-            if hasattr(self, "timeline"):
-                self._ui_call(
-                    self.timeline.set_track_waveform,
-                    channel_idx,
-                    peaks,
-                    dur,
-                    os.path.basename(filepath),
-                )
+            self._ui_call(_apply_waveform)
 
         threading.Thread(target=_worker, name=f"WaveformCh{channel_idx + 1}", daemon=True).start()
 
@@ -3926,6 +3982,7 @@ class Window:
         stream = None
         wav_handles = [None] * 4
         readers = [None] * 4
+        play_err = None
 
         try:
             print("Now playing...")
@@ -3937,7 +3994,7 @@ class Window:
                     wf = wave.open(path, "rb")
                     wav_handles[idx] = wf
                     fr = wf.getframerate()
-                    if session_rate is None and fr > 0:
+                    if fr > 0 and (session_rate is None or fr > session_rate):
                         session_rate = fr
 
             if session_rate is None:
@@ -4062,11 +4119,11 @@ class Window:
                             print("Audio ended")
                             break
                         in_tail = True
-                        max_delay_ms = max(
-                            snapshots[i].delay.get_params()[0] for i in delay_indices
+                        min_tail_frames, tail_frames_remaining = _estimate_delay_tail_frames(
+                            [snapshots[i].delay for i in delay_indices],
+                            session_rate,
+                            self.buffer,
                         )
-                        min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + self.buffer
-                        tail_frames_remaining = max(int(session_rate * 2.5), min_tail_frames * 2)
                     if tail_frames_remaining <= 0:
                         print("Audio ended")
                         break
@@ -4103,7 +4160,7 @@ class Window:
                 if pcm_bytes:
                     stream.write(pcm_bytes)
                     frames_played += len(pcm_bytes) // 4  # 2 channels * 2 bytes
-                    if hasattr(self, "_seek_lock"):
+                    if hasattr(self, "_seek_lock") and not self._stop_event.is_set():
                         with self._seek_lock:
                             if self._pending_seek_sec is None:
                                 self._playhead_sec = frames_played / float(session_rate)
@@ -4115,6 +4172,12 @@ class Window:
                     last_ui_update = now
 
             if self._stop_event.is_set():
+                if hasattr(self, "_seek_lock"):
+                    with self._seek_lock:
+                        self._playhead_sec = 0.0
+                        self._pending_seek_sec = None
+                if hasattr(self, "timeline"):
+                    self._ui_call(self.timeline.set_position, 0.0)
                 self._set_status("Stopped")
             else:
                 self._set_status("Playback finished")
@@ -4127,9 +4190,7 @@ class Window:
         except Exception as exc:
             print(f"Playback error: {exc}")
             self._set_status("Playback error")
-            self._ui_call(
-                messagebox.showerror, "Playback Error", f"An error occurred during playback:\n{exc}", parent=self.root
-            )
+            play_err = str(exc)
         finally:
             self._reset_meter_peaks()
             for wf in wav_handles:
@@ -4158,6 +4219,10 @@ class Window:
                 self._ui_call(self._set_play_lit, False)
             if hasattr(self, "_set_pause_lit"):
                 self._ui_call(self._set_pause_lit, False)
+        if play_err is not None:
+            self._ui_call(
+                messagebox.showerror, "Playback Error", f"An error occurred during playback:\n{play_err}", parent=self.root
+            )
 
     # ---------- Recording (Multithreaded, with Overdub Support) ----------
 
@@ -4238,6 +4303,7 @@ class Window:
         readers = [None] * 4
         recorded_frames = []
         armed_set = set(armed_indices)
+        rec_err = None
 
         try:
             print(f"Recording started on channel(s): {[i + 1 for i in armed_indices]}")
@@ -4369,14 +4435,10 @@ class Window:
                                 close_overdub = True
                             else:
                                 overdub_in_tail = True
-                                max_delay_ms = max(
-                                    snapshots[i].delay.get_params()[0] for i in delay_indices
-                                )
-                                overdub_min_tail = (
-                                    int(max_delay_ms * session_rate / 1000.0) + self.buffer
-                                )
-                                overdub_tail_rem = max(
-                                    int(session_rate * 2.5), overdub_min_tail * 2
+                                overdub_min_tail, overdub_tail_rem = _estimate_delay_tail_frames(
+                                    [snapshots[i].delay for i in delay_indices],
+                                    session_rate,
+                                    self.buffer,
                                 )
                         if not close_overdub:
                             if overdub_tail_rem <= 0:
@@ -4494,9 +4556,7 @@ class Window:
         except Exception as exc:
             print(f"Recording error: {exc}")
             self._set_status("Recording error")
-            self._ui_call(
-                messagebox.showerror, "Recording Error", f"An error occurred while recording:\n{exc}", parent=self.root
-            )
+            rec_err = str(exc)
         finally:
             if hasattr(self, "_rec_wave_lock"):
                 with self._rec_wave_lock:
@@ -4531,6 +4591,10 @@ class Window:
                 self.recording = False
             if hasattr(self, "_set_rec_lit"):
                 self._ui_call(self._set_rec_lit, False)
+        if rec_err is not None:
+            self._ui_call(
+                messagebox.showerror, "Recording Error", f"An error occurred while recording:\n{rec_err}", parent=self.root
+            )
 
     # Backward-compatible alias
     rec = press_rec
@@ -4608,6 +4672,29 @@ class Window:
             if not out_path:
                 return
 
+        if self._closing:
+            return
+
+        # Prevent overwriting any currently loaded channel WAV (would truncate source before reading)
+        loaded_now = [ch.get_filepath() for ch in self.channel_states if ch.get_filepath()]
+        if not loaded_now:
+            messagebox.showinfo(
+                "No Audio Loaded",
+                "Load at least one .wav file before bouncing.",
+                parent=self.root,
+            )
+            return
+        out_real = os.path.realpath(out_path)
+        for lp in loaded_now:
+            if os.path.realpath(lp) == out_real:
+                messagebox.showerror(
+                    "Invalid Bounce Destination",
+                    "Cannot overwrite a WAV file that is currently loaded in a channel.\n"
+                    "Choose a different output filename.",
+                    parent=self.root,
+                )
+                return
+
         busy_now = False
         with self._state_lock:
             if self.playing or self.recording or self.bouncing:
@@ -4649,6 +4736,9 @@ class Window:
         use_dither = bool(bounce_dither if bounce_dither is not None else getattr(self, "bounce_dither", bit_depth == 16)) and (bit_depth < 32)
         dither_rng = ctypes.c_uint64((time.time_ns() ^ 0xA0761D6478BD642F) & 0xFFFFFFFFFFFFFFFF or 1)
         cancelled = False
+        wrote_output = False
+        bounce_done_msg = None
+        bounce_err_msg = None
 
         try:
             dither_tag = "TPDF Dither" if use_dither else "No Dither"
@@ -4658,12 +4748,15 @@ class Window:
             offline_procs = [ch.clone_processors_for_offline() for ch in self.channel_states]
             frozen_master_gain = self._get_master_volume()
 
+            out_real = os.path.realpath(out_path)
             for idx, snap in enumerate(snapshots):
                 if snap.filepath:
+                    if os.path.realpath(snap.filepath) == out_real:
+                        raise ValueError("Cannot overwrite a WAV file that is currently loaded in a channel.")
                     wf = wave.open(snap.filepath, "rb")
                     wav_handles[idx] = wf
                     fr = wf.getframerate()
-                    if session_rate is None and fr > 0:
+                    if fr > 0 and (session_rate is None or fr > session_rate):
                         session_rate = fr
 
             if session_rate is None:
@@ -4703,6 +4796,7 @@ class Window:
             fx_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="BounceFX") if use_c else None
             try:
                 with wave.open(out_path, "wb") as bounce_wf:
+                    wrote_output = True
                     bounce_wf.setnchannels(2)
                     bounce_wf.setsampwidth(sampwidth)
                     bounce_wf.setframerate(int(session_rate))
@@ -4729,11 +4823,11 @@ class Window:
                                 if not delay_indices_init:
                                     break
                                 in_tail = True
-                                max_delay_ms = max(
-                                    offline_procs[i][3].get_params()[0] for i in delay_indices_init
+                                min_tail_frames, tail_frames_remaining = _estimate_delay_tail_frames(
+                                    [offline_procs[i][3] for i in delay_indices_init],
+                                    session_rate,
+                                    tail_step,
                                 )
-                                min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + tail_step
-                                tail_frames_remaining = max(int(session_rate * 2.5), min_tail_frames * 2)
                             if tail_frames_remaining <= 0:
                                 break
                             tail_chunk_len = min(tail_step, tail_frames_remaining)
@@ -4796,21 +4890,20 @@ class Window:
                 if hasattr(self, "_bounce_canvas"):
                     self._ui_call(self._set_bounce_progress, 1.0, f"Bounce complete ({bit_depth}-bit)", "#7ef2b8")
                 self._set_status(f"Bounced ({bit_depth}-bit): {os.path.basename(out_path)}")
-                self._ui_call(
-                    messagebox.showinfo,
-                    "Bounce Complete",
-                    f"Mix successfully exported to:\n{out_path}\n\nFormat: {meta_txt}",
-                    parent=self.root,
-                )
+                bounce_done_msg = f"Mix successfully exported to:\n{out_path}\n\nFormat: {meta_txt}"
 
         except Exception as exc:
             print(f"Bounce error: {exc}")
+            if wrote_output:
+                try:
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
+                except OSError:
+                    pass
             if hasattr(self, "_bounce_canvas"):
                 self._ui_call(self._set_bounce_progress, 0.0, "Bounce failed", "#fc8181")
             self._set_status("Bounce error")
-            self._ui_call(
-                messagebox.showerror, "Bounce Error", f"Could not export mix:\n{exc}", parent=self.root
-            )
+            bounce_err_msg = f"Could not export mix:\n{exc}"
         finally:
             self._reset_meter_peaks()
             for wf in wav_handles:
@@ -4821,6 +4914,11 @@ class Window:
                         pass
             with self._state_lock:
                 self.bouncing = False
+
+        if bounce_done_msg is not None:
+            self._ui_call(messagebox.showinfo, "Bounce Complete", bounce_done_msg, parent=self.root)
+        elif bounce_err_msg is not None:
+            self._ui_call(messagebox.showerror, "Bounce Error", bounce_err_msg, parent=self.root)
 
     # ---------- Graceful Shutdown ----------
 
