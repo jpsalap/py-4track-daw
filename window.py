@@ -903,11 +903,12 @@ class Window:
     TRACK_ACCENTS = ["#4da3ff", "#48d18a", "#f5c542", "#a375ff"]
 
     # (key, label, active_bg, led_color, inactive_bg, hover_bg, popup_cls)
+    # Ordered top-to-bottom to match the DSP signal flow: Compressor -> Chorus -> Tremolo -> Delay
     EFFECT_SPECS = [
-        ("delay", "Delay", "#245994", "#63b3ed", "#20354a", "#2a4561", DelayWindow),
-        ("tremolo", "Tremolo", "#246e4c", "#68d391", "#1e3736", "#274947", TremoloWindow),
-        ("chorus", "Chorus", "#1c747d", "#6be0eb", "#1c3742", "#244957", ChorusWindow),
         ("compressor", "Compressor", "#9b2c2c", "#fc8181", "#38242c", "#4c303b", CompressorWindow),
+        ("chorus", "Chorus", "#1c747d", "#6be0eb", "#1c3742", "#244957", ChorusWindow),
+        ("tremolo", "Tremolo", "#246e4c", "#68d391", "#1e3736", "#274947", TremoloWindow),
+        ("delay", "Delay", "#245994", "#63b3ed", "#20354a", "#2a4561", DelayWindow),
     ]
 
     def __init__(self, start_mainloop=True):
