@@ -29,6 +29,7 @@ class CompressorProcessor:
         makeup_db=DEFAULT_MAKEUP_DB,
     ):
         self._lock = threading.Lock()
+        self._proc_lock = threading.Lock()
         self._threshold_db = float(threshold_db)
         self._ratio = float(ratio)
         self._attack_ms = float(attack_ms)
@@ -76,7 +77,8 @@ class CompressorProcessor:
         )
 
     def reset(self):
-        self._env = 0.0
+        with self._proc_lock:
+            self._env = 0.0
 
     def clone_for_offline(self):
         t, r, a, rel, m = self.get_params()
@@ -86,6 +88,10 @@ class CompressorProcessor:
 
     def process(self, samples, sample_rate):
         """Apply dynamic compression to mono float samples in [-1.0, 1.0]."""
+        with self._proc_lock:
+            return self._process_unlocked(samples, sample_rate)
+
+    def _process_unlocked(self, samples, sample_rate):
         n = len(samples)
         if n == 0:
             return samples

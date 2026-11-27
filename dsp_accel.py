@@ -47,137 +47,137 @@ def _load_library():
             continue
         try:
             lib = ctypes.CDLL(path)
-        except OSError:
+
+            lib.dsp_decode_pcm_to_mono_f64.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_size_t,
+                ctypes.c_int,
+                ctypes.c_int,
+                _c_double_p,
+            ]
+            lib.dsp_decode_pcm_to_mono_f64.restype = ctypes.c_size_t
+
+            lib.dsp_resample_linear_f64.argtypes = [
+                _c_double_p,
+                ctypes.c_size_t,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_size_t,
+                _c_double_p,
+                _c_double_p,
+            ]
+            lib.dsp_resample_linear_f64.restype = ctypes.c_size_t
+
+            lib.dsp_compressor_process.argtypes = [
+                _c_double_p,
+                _c_double_p,
+                ctypes.c_size_t,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                _c_double_p,
+            ]
+            lib.dsp_compressor_process.restype = None
+
+            lib.dsp_chorus_process.argtypes = [
+                _c_double_p,
+                _c_double_p,
+                ctypes.c_size_t,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                _c_double_p,
+                ctypes.c_size_t,
+                _c_size_p,
+                _c_double_p,
+            ]
+            lib.dsp_chorus_process.restype = None
+
+            lib.dsp_tremolo_process.argtypes = [
+                _c_double_p,
+                _c_double_p,
+                ctypes.c_size_t,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                _c_double_p,
+            ]
+            lib.dsp_tremolo_process.restype = None
+
+            lib.dsp_delay_process.argtypes = [
+                _c_double_p,
+                _c_double_p,
+                ctypes.c_size_t,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                _c_double_p,
+                ctypes.c_size_t,
+                _c_size_p,
+            ]
+            lib.dsp_delay_process.restype = None
+
+            lib.dsp_mix_channel_accum.argtypes = [
+                _c_double_p,
+                ctypes.c_size_t,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                _c_double_p,
+                _c_double_p,
+                ctypes.c_int,
+                _c_double_p,
+                _c_double_p,
+            ]
+            lib.dsp_mix_channel_accum.restype = None
+
+            lib.dsp_master_pack_i16.argtypes = [
+                _c_double_p,
+                _c_double_p,
+                ctypes.c_size_t,
+                ctypes.c_double,
+                _c_int16_p,
+                ctypes.c_int,
+                _c_double_p,
+                _c_double_p,
+                _c_double_p,
+                _c_double_p,
+            ]
+            lib.dsp_master_pack_i16.restype = None
+
+            lib.dsp_master_pack_pcm.argtypes = [
+                _c_double_p,
+                _c_double_p,
+                ctypes.c_size_t,
+                ctypes.c_double,
+                ctypes.c_int,
+                ctypes.c_int,
+                _c_uint64_p,
+                _c_uint8_p,
+                ctypes.c_int,
+                _c_double_p,
+                _c_double_p,
+                _c_double_p,
+                _c_double_p,
+            ]
+            lib.dsp_master_pack_pcm.restype = None
+
+            lib.dsp_is_silent_i16.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_size_t,
+                ctypes.c_int,
+            ]
+            lib.dsp_is_silent_i16.restype = ctypes.c_int
+
+            return lib
+        except (OSError, AttributeError):
             continue
-
-        lib.dsp_decode_pcm_to_mono_f64.argtypes = [
-            ctypes.c_char_p,
-            ctypes.c_size_t,
-            ctypes.c_int,
-            ctypes.c_int,
-            _c_double_p,
-        ]
-        lib.dsp_decode_pcm_to_mono_f64.restype = ctypes.c_size_t
-
-        lib.dsp_resample_linear_f64.argtypes = [
-            _c_double_p,
-            ctypes.c_size_t,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_size_t,
-            _c_double_p,
-            _c_double_p,
-        ]
-        lib.dsp_resample_linear_f64.restype = ctypes.c_size_t
-
-        lib.dsp_compressor_process.argtypes = [
-            _c_double_p,
-            _c_double_p,
-            ctypes.c_size_t,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            _c_double_p,
-        ]
-        lib.dsp_compressor_process.restype = None
-
-        lib.dsp_chorus_process.argtypes = [
-            _c_double_p,
-            _c_double_p,
-            ctypes.c_size_t,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            _c_double_p,
-            ctypes.c_size_t,
-            _c_size_p,
-            _c_double_p,
-        ]
-        lib.dsp_chorus_process.restype = None
-
-        lib.dsp_tremolo_process.argtypes = [
-            _c_double_p,
-            _c_double_p,
-            ctypes.c_size_t,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            _c_double_p,
-        ]
-        lib.dsp_tremolo_process.restype = None
-
-        lib.dsp_delay_process.argtypes = [
-            _c_double_p,
-            _c_double_p,
-            ctypes.c_size_t,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            _c_double_p,
-            ctypes.c_size_t,
-            _c_size_p,
-        ]
-        lib.dsp_delay_process.restype = None
-
-        lib.dsp_mix_channel_accum.argtypes = [
-            _c_double_p,
-            ctypes.c_size_t,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            _c_double_p,
-            _c_double_p,
-            ctypes.c_int,
-            _c_double_p,
-            _c_double_p,
-        ]
-        lib.dsp_mix_channel_accum.restype = None
-
-        lib.dsp_master_pack_i16.argtypes = [
-            _c_double_p,
-            _c_double_p,
-            ctypes.c_size_t,
-            ctypes.c_double,
-            _c_int16_p,
-            ctypes.c_int,
-            _c_double_p,
-            _c_double_p,
-            _c_double_p,
-            _c_double_p,
-        ]
-        lib.dsp_master_pack_i16.restype = None
-
-        lib.dsp_master_pack_pcm.argtypes = [
-            _c_double_p,
-            _c_double_p,
-            ctypes.c_size_t,
-            ctypes.c_double,
-            ctypes.c_int,
-            ctypes.c_int,
-            _c_uint64_p,
-            _c_uint8_p,
-            ctypes.c_int,
-            _c_double_p,
-            _c_double_p,
-            _c_double_p,
-            _c_double_p,
-        ]
-        lib.dsp_master_pack_pcm.restype = None
-
-        lib.dsp_is_silent_i16.argtypes = [
-            ctypes.c_char_p,
-            ctypes.c_size_t,
-            ctypes.c_int,
-        ]
-        lib.dsp_is_silent_i16.restype = ctypes.c_int
-
-        return lib
     return None
 
 

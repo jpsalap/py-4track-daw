@@ -166,7 +166,7 @@ class EffectDialogBase(QDialog):
             # Floating utility panel stays above the main mixer window on macOS
             # (matching Tkinter transient popups) so opening another effect won't bury earlier ones
             self.setWindowFlag(Qt.WindowType.Tool, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
         self.setStyleSheet(
             f"""
@@ -314,6 +314,7 @@ class EffectDialogBase(QDialog):
             parent=self._body,
         )
         slider.set_value_float(initial_val)
+        val_lbl.setText(formatter(slider.value_float()))
 
         def _handle(val):
             on_change(val)
@@ -324,9 +325,22 @@ class EffectDialogBase(QDialog):
         self._params_layout.addLayout(block)
         return slider, val_lbl
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Space and not self._standalone:
+            ctrl = getattr(self.parentWidget(), "_controller", None)
+            if ctrl is not None and hasattr(ctrl, "_on_space_key"):
+                ctrl._on_space_key(ignore_focus=True)
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def finalize_and_show(self):
         self.adjustSize()
         self.setFixedHeight(self.sizeHint().height())
+        if not self._standalone:
+            ctrl = getattr(self.parentWidget(), "_controller", None)
+            if ctrl is not None and hasattr(ctrl, "_position_effect_window"):
+                ctrl._position_effect_window(self)
         self.show()
         if self._standalone and self._owns_app and self._app is not None:
             self._app.exec()
@@ -338,14 +352,18 @@ class EffectDialogBase(QDialog):
             self.activateWindow()
 
     def is_open(self):
-        return bool(self._is_open and self.isVisible())
+        return bool(self._is_open)
 
     def _notify_close(self):
+        if not self._is_open:
+            return
         self._is_open = False
         if self.on_close_callback is not None:
             cb = self.on_close_callback
             self.on_close_callback = None
             cb()
+        if not self._standalone:
+            self.deleteLater()
 
     def reject(self):
         """Close cleanly on Escape or Close button without recursing through closeEvent."""

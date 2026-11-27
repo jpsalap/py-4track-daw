@@ -180,7 +180,7 @@ class ChannelMeter(QWidget):
     @staticmethod
     def linear_to_norm(linear_peak):
         """Convert linear amplitude peak to normalized [0.0, 1.0] on a -60..0 dBFS scale."""
-        if linear_peak <= 1e-4:
+        if not math.isfinite(linear_peak) or linear_peak <= 1e-4:
             return 0.0
         db = 20.0 * math.log10(linear_peak)
         if db <= -60.0:
@@ -502,12 +502,13 @@ class DawFader(QSlider):
         if self._dragging:
             dy = y - self._last_drag_y
             self._last_drag_y = y
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                self._virtual_cap_y += dy * 0.25
-            else:
-                self._virtual_cap_y = y - self._grab_offset_y
             top_y, bot_y, _ = self._track_bounds()
-            self._virtual_cap_y = max(top_y, min(bot_y, self._virtual_cap_y))
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self._virtual_cap_y = max(top_y, min(bot_y, self._virtual_cap_y + dy * 0.25))
+                # Keep grab offset synced so releasing Shift mid-drag never snaps/jumps
+                self._grab_offset_y = y - self._virtual_cap_y
+            else:
+                self._virtual_cap_y = max(top_y, min(bot_y, y - self._grab_offset_y))
             self.set_db(self._y_to_db(self._virtual_cap_y))
             event.accept()
             return
@@ -535,7 +536,8 @@ class DawFader(QSlider):
         event.accept()
 
     def wheelEvent(self, event):
-        delta = event.angleDelta().y()
+        # macOS translates Shift+vertical wheel into horizontal angleDelta().x()
+        delta = event.angleDelta().y() or event.angleDelta().x()
         if delta == 0:
             super().wheelEvent(event)
             return
@@ -1678,7 +1680,7 @@ class _TimelineCanvas(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self._dragging and self._duration > 0.0:
+        if self._dragging and self._duration > 0.0 and not self._rec_active:
             self._position = self._x_to_sec(event.position().x())
             self.positionScrubbed.emit(self._position)
             self._update_playhead_region()
@@ -1689,7 +1691,7 @@ class _TimelineCanvas(QWidget):
     def mouseReleaseEvent(self, event):
         if self._dragging and event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
-            if self._duration > 0.0:
+            if self._duration > 0.0 and not self._rec_active:
                 self._position = self._x_to_sec(event.position().x())
                 self.positionScrubbed.emit(self._position)
                 self._update_playhead_region()
@@ -1736,11 +1738,13 @@ class _TimelineCanvas(QWidget):
 
     def dragEnterEvent(self, event):
         if _extract_dropped_wav(event.mimeData()):
-            self._drop_hover_ch = self._y_to_channel(event.position().y())
+            ch = self._y_to_channel(event.position().y())
+            self._drop_hover_ch = ch
             self.invalidate_cache()
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+            if 0 <= ch < 4:
+                event.acceptProposedAction()
+                return
+        event.ignore()
 
     def dragMoveEvent(self, event):
         if _extract_dropped_wav(event.mimeData()):
@@ -1748,9 +1752,10 @@ class _TimelineCanvas(QWidget):
             if ch != self._drop_hover_ch:
                 self._drop_hover_ch = ch
                 self.invalidate_cache()
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+            if 0 <= ch < 4:
+                event.acceptProposedAction()
+                return
+        event.ignore()
 
     def dragLeaveEvent(self, _event):
         self._drop_hover_ch = -1
@@ -2344,9 +2349,13 @@ class WaveformTimeline(QFrame):
             self.canvas.invalidate_cache()
 
     def set_duration(self, duration_sec):
+        old_dur = self.canvas._duration
         self.canvas._duration = max(0.0, float(duration_sec))
         if self.canvas._duration <= 0.0 and self.canvas.zoom() > 1.001:
             self.reset_zoom()
+        elif abs(self.canvas._duration - old_dur) > 1e-6 and self.canvas.zoom() > 1.001:
+            self.canvas._track_details = [None, None, None, None]
+            self.canvas._schedule_detail_refresh()
         if self.canvas._position > self.canvas._duration and not self.canvas._rec_active:
             self.canvas._position = self.canvas._duration
         self._set_dur_text(self.canvas._duration)
@@ -2364,6 +2373,8 @@ class WaveformTimeline(QFrame):
     def update_live_recording(self, active, armed_indices=(), peaks=(), elapsed_sec=0.0):
         was_active = self.canvas._rec_active
         self.canvas._rec_active = bool(active)
+        if active:
+            self.canvas._dragging = False
         self.canvas._rec_armed = list(armed_indices) if active else []
         self.canvas._rec_peaks = list(peaks) if active else []
         self.canvas._rec_elapsed = float(elapsed_sec) if active else 0.0

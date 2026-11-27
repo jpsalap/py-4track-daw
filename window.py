@@ -69,7 +69,10 @@ from ui_widgets import (
 
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.join(os.path.expanduser("~"), "Music", "Mini-DAW")
-    os.makedirs(BASE_DIR, exist_ok=True)
+    try:
+        os.makedirs(BASE_DIR, exist_ok=True)
+    except OSError:
+        BASE_DIR = os.path.expanduser("~")
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -102,11 +105,63 @@ def format_audio_meta(sample_rate, bit_depth, channels):
     return f"{sr_txt} · {bit_depth}-bit · {ch_txt}"
 
 
-def sanitize_filename(name):
-    """Strip directory traversal and invalid filename characters from user-typed recording/mix names."""
-    cleaned = os.path.basename(str(name).strip())
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", cleaned)
-    return cleaned.strip(" .")
+def sanitize_filename_stem(raw_name):
+    """Sanitize a user-entered filename stem (rejects paths, slashes, and control characters)."""
+    name = str(raw_name).strip()
+    if not name or "/" in name or "\\" in name or os.sep in name:
+        return ""
+    if name.lower().endswith(".wav"):
+        name = name[:-4].strip()
+    cleaned = re.sub(r'[<>:"|?*\x00-\x1f]', "_", name).strip(" .")
+    if cleaned in ("", ".", ".."):
+        return ""
+    return cleaned
+
+
+def unique_recording_paths(base_dir, base_name, armed_indices):
+    """Generate non-colliding WAV paths for all armed channels so earlier takes are never overwritten."""
+    suffix = ""
+    take = 1
+    while True:
+        candidates = []
+        collision = False
+        for idx in armed_indices:
+            fname = f"{base_name}{suffix}_ch{idx + 1}.wav"
+            fpath = os.path.join(base_dir, fname)
+            if os.path.exists(fpath):
+                collision = True
+                break
+            candidates.append((fname, fpath))
+        if not collision:
+            return candidates
+        take += 1
+        suffix = f"_{take}"
+
+
+def _estimate_delay_tail_frames(delay_procs, session_rate, step_frames, max_tail_sec=15.0):
+    """Compute (min_tail_frames, max_tail_frames) accounting for delay time and feedback decay."""
+    max_delay_ms = 0.0
+    max_total_frames = 0
+    cap_frames = int(session_rate * max_tail_sec)
+    for proc in delay_procs:
+        delay_ms, fb, _mix = proc.get_params()
+        if delay_ms > max_delay_ms:
+            max_delay_ms = delay_ms
+        cycle_frames = max(1, int(delay_ms * session_rate / 1000.0))
+        if fb <= 1e-3:
+            cycles = 2
+        else:
+            cycles = max(2, int(math.ceil(math.log(1e-4) / math.log(min(0.99, fb)))) + 1)
+        est = min(cap_frames, cycle_frames * cycles + step_frames)
+        if est > max_total_frames:
+            max_total_frames = est
+    min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + step_frames
+    tail_frames = max(int(session_rate * 2.5), min_tail_frames * 2, max_total_frames)
+    return min_tail_frames, min(cap_frames, tail_frames)
+
+
+# Backward-compatible alias
+sanitize_filename = sanitize_filename_stem
 
 
 ChannelSnapshot = namedtuple(
@@ -160,8 +215,11 @@ def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels):
         return out
 
     if sampwidth == 2:
+        usable = (len(raw_bytes) // (2 * nchannels)) * (2 * nchannels)
+        if usable == 0:
+            return []
         pcm = array.array("h")
-        pcm.frombytes(raw_bytes)
+        pcm.frombytes(raw_bytes[:usable])
         scale = 1.0 / 32768.0
         if nchannels == 1:
             return [s * scale for s in pcm]
@@ -214,8 +272,11 @@ def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels):
         return out
 
     if sampwidth == 4:
+        usable = (len(raw_bytes) // (4 * nchannels)) * (4 * nchannels)
+        if usable == 0:
+            return []
         pcm = array.array("i")
-        pcm.frombytes(raw_bytes)
+        pcm.frombytes(raw_bytes[:usable])
         scale = 1.0 / 2147483648.0
         if nchannels == 1:
             return [s * scale for s in pcm]
@@ -701,6 +762,10 @@ def mix_stereo_chunk(
     for j in range(max_len):
         lv = master_left[j] * m_gain
         rv = master_right[j] * m_gain
+        if not math.isfinite(lv):
+            lv = 0.0
+        if not math.isfinite(rv):
+            rv = 0.0
         if want_m_vu or want_m_pk:
             l_sq += lv * lv
             r_sq += rv * rv
@@ -883,7 +948,10 @@ class _UiBridge(QObject):
 
     def post(self, fn, *args, **kwargs):
         if self._active:
-            self.invoke.emit(fn, args, kwargs)
+            try:
+                self.invoke.emit(fn, args, kwargs)
+            except RuntimeError:
+                self._active = False
 
     def _execute(self, fn, args, kwargs):
         if self._active:
@@ -911,15 +979,27 @@ class _MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event):
         etype = event.type()
-        if etype == QEvent.Type.MouseButtonPress:
-            name_box = getattr(self._controller, "nameBox", None)
-            if name_box is not None and name_box.hasFocus() and watched is not name_box:
-                name_box.clearFocus()
-        elif etype == QEvent.Type.KeyPress:
-            name_box = getattr(self._controller, "nameBox", None)
-            if watched is name_box and event.key() == Qt.Key.Key_Escape:
+        name_box = getattr(self._controller, "nameBox", None)
+        if name_box is not None and name_box.hasFocus():
+            if etype == QEvent.Type.ShortcutOverride and event.key() == Qt.Key.Key_Escape:
+                # Prevent Transport -> Stop (Escape) menu shortcut from firing while typing in nameBox
+                event.accept()
+                return True
+            if etype == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
                 name_box.clearFocus()
                 return True
+            if etype == QEvent.Type.MouseButtonPress:
+                # Check actual clicked widget (handles QWidgetWindow events & QLineEdit context menu)
+                gp = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else None
+                clicked = QApplication.widgetAt(gp) if gp is not None else None
+                in_name_box = clicked is name_box or (
+                    clicked is not None and name_box.isAncestorOf(clicked)
+                )
+                in_popup_menu = clicked is not None and bool(
+                    clicked.windowFlags() & Qt.WindowType.Popup
+                )
+                if not in_name_box and not in_popup_menu:
+                    name_box.clearFocus()
         return super().eventFilter(watched, event)
 
     def closeEvent(self, event):
@@ -1005,6 +1085,9 @@ class Window:
         self._rec_wave_lock = threading.Lock()
         self._rec_wave_armed = []
         self._rec_wave_peaks = []
+        self._rec_wave_stride = 1
+        self._rec_wave_accum = 0.0
+        self._rec_wave_count = 0
         self._rec_wave_elapsed = 0.0
         self._rec_wave_active = False
 
@@ -1221,7 +1304,7 @@ class Window:
 
         transport_menu = menubar.addMenu("&Transport")
         play_act = QAction("Play / Pause", self.root)
-        play_act.triggered.connect(self._on_space_key)
+        play_act.triggered.connect(lambda: self._on_space_key(ignore_focus=True))
         transport_menu.addAction(play_act)
 
         stop_act = QAction("Stop", self.root)
@@ -1420,7 +1503,17 @@ class Window:
                 "●  Rec", "#f24957", "#3a1c22", "#52252e", "#ff8c96", "#853743",
                 "#cc2431", "#ffffff", "#ffb8bf", parent=body,
             )
-            rec_pad.toggled.connect(lambda en, c=idx: self.channel_states[c].set_rec_armed(en))
+            def _on_rec_pad_toggle(en, c=idx, pad=rec_pad):
+                with self._state_lock:
+                    rec_active = self.recording
+                if rec_active:
+                    pad.blockSignals(True)
+                    pad.setChecked(self.channel_states[c].snapshot().rec_armed)
+                    pad.blockSignals(False)
+                    return
+                self.channel_states[c].set_rec_armed(en)
+
+            rec_pad.toggled.connect(_on_rec_pad_toggle)
 
             ctrl_grid.addWidget(solo_pad, 0, 0)
             ctrl_grid.addWidget(mute_pad, 0, 1)
@@ -1699,7 +1792,6 @@ class Window:
         self.nameBox.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.nameBox.setPlaceholderText("Optional filename (e.g. final_mix)")
         self.nameBox.returnPressed.connect(self.nameBox.clearFocus)
-        self.nameBox.installEventFilter(self.root)
         self._app.installEventFilter(self.root)
         body_layout.addWidget(self.nameBox)
 
@@ -1935,6 +2027,7 @@ class Window:
 
         with self._state_lock:
             is_playing = self.playing
+            is_paused = self.paused
             is_recording = self.recording
 
         with self._meter_lock:
@@ -1970,7 +2063,7 @@ class Window:
                 r_elapsed = self._rec_wave_elapsed
             if r_act:
                 self.timeline.update_live_recording(True, r_armed, r_peaks, r_elapsed)
-        elif is_playing:
+        elif is_playing and not is_paused:
             with self._seek_lock:
                 pos_sec = self._playhead_sec
             self.timeline.set_position(pos_sec)
@@ -1998,9 +2091,9 @@ class Window:
         else:
             self._set_rec_mode("off")
 
-    def _on_space_key(self):
+    def _on_space_key(self, ignore_focus=False):
         """Spacebar shortcut: Play/Pause/Resume, or Stop when recording (ignored while typing or bouncing)."""
-        if self.nameBox.hasFocus():
+        if not ignore_focus and self.nameBox.hasFocus():
             return
         with self._state_lock:
             is_playing = self.playing
@@ -2059,8 +2152,11 @@ class Window:
             label_widget.setText(f"Pan: {pct}% R")
 
     def _on_effect_toggle(self, channel_idx, effect_key, enabled):
-        self.channel_states[channel_idx].set_effect_enabled(effect_key, bool(enabled))
-        if enabled:
+        en = bool(enabled)
+        if en and effect_key in ("delay", "chorus"):
+            self.channel_states[channel_idx].get_processor(effect_key).reset()
+        self.channel_states[channel_idx].set_effect_enabled(effect_key, en)
+        if en:
             self.open_effect_window(channel_idx, effect_key)
         else:
             self._close_effect_window(channel_idx, effect_key)
@@ -2091,7 +2187,6 @@ class Window:
             channel_num=channel_idx + 1,
             on_close=on_popup_close,
         )
-        self._position_effect_window(popup)
         self._effect_windows[key] = popup
 
     def _position_effect_window(self, popup):
@@ -2101,8 +2196,10 @@ class Window:
             avail = screen.availableGeometry() if screen is not None else self.root.frameGeometry()
             root_geo = self.root.frameGeometry()
 
+            # Include titlebar allowance (~28 px on macOS) so rows never overlap frame-to-frame
+            frame_extra_h = max(28, popup.frameGeometry().height() - popup.height())
             pw = max(popup.width(), popup.sizeHint().width(), 340)
-            ph = max(popup.height(), popup.sizeHint().height(), 240)
+            ph = max(popup.height(), popup.sizeHint().height(), 240) + frame_extra_h
             gap = 12
 
             occupied = [
@@ -2112,7 +2209,11 @@ class Window:
             ]
 
             start_x = max(avail.left() + gap, root_geo.left() + 24)
+            if start_x + pw > avail.right() - gap:
+                start_x = avail.left() + gap
             start_y = max(avail.top() + gap, root_geo.top() + 72)
+            if start_y + ph > avail.bottom() - gap:
+                start_y = avail.top() + gap
 
             # Search left-to-right, top-to-bottom for the first non-overlapping slot
             y = start_y
@@ -2170,8 +2271,13 @@ class Window:
             with wave.open(filepath, "rb") as wf:
                 channels = wf.getnchannels()
                 samplefreq = wf.getframerate()
-                bitdepth = wf.getsampwidth() * 8
-                length = int(wf.getnframes() / max(1, samplefreq))
+                sampwidth = wf.getsampwidth()
+                bitdepth = sampwidth * 8
+                if channels <= 0 or samplefreq <= 0:
+                    raise ValueError(f"Invalid WAV header (channels={channels}, rate={samplefreq})")
+                if sampwidth not in (1, 2, 3, 4):
+                    raise ValueError(f"Unsupported WAV bit depth: {bitdepth}-bit")
+                length = int(wf.getnframes() / samplefreq)
         except Exception as exc:
             self._show_error("Error loading WAV", f"Could not open file:\n{exc}")
             return
@@ -2191,6 +2297,7 @@ class Window:
             f"  Bit Depth: {bitdepth}-bit\n"
             f"  Duration: {mins}:{secs:02d}"
         )
+        self.timeline.clear_track(channel_idx)
         self._update_session_duration()
         self._load_channel_waveform_async(channel_idx, filepath)
         self._set_status(f"Loaded Ch {channel_idx + 1}: {os.path.basename(filepath)}")
@@ -2206,13 +2313,18 @@ class Window:
                 return
             if self.channel_states[channel_idx].get_filepath() != filepath:
                 return
-            self._ui_call(
-                self.timeline.set_track_waveform,
-                channel_idx,
-                peaks,
-                dur,
-                os.path.basename(filepath),
-            )
+
+            def _apply():
+                if self.channel_states[channel_idx].get_filepath() != filepath:
+                    return
+                self.timeline.set_track_waveform(
+                    channel_idx,
+                    peaks,
+                    dur,
+                    os.path.basename(filepath),
+                )
+
+            self._ui_call(_apply)
 
         threading.Thread(target=_worker, name=f"WaveformCh{channel_idx + 1}", daemon=True).start()
 
@@ -2249,7 +2361,13 @@ class Window:
                     return
                 if self.channel_states[ch_idx].get_filepath() != path:
                     continue
-                self._ui_call(self.timeline.set_track_detail, ch_idx, bins, vis_s, vis_e)
+
+                def _apply_detail(c=ch_idx, p=path, b=bins, s=vis_s, e=vis_e, g=gen):
+                    if g != self._zoom_detail_gen or self.channel_states[c].get_filepath() != p:
+                        return
+                    self.timeline.set_track_detail(c, b, s, e)
+
+                self._ui_call(_apply_detail)
 
         threading.Thread(target=_worker, name=f"WaveformZoom{gen}", daemon=True).start()
 
@@ -2301,20 +2419,32 @@ class Window:
         if not self._require_pyaudio("playback"):
             return
 
+        resumed = False
+        already_playing = False
+        busy = False
         with self._state_lock:
             if self.playing:
                 if self.paused:
                     self.paused = False
                     self._pause_event.set()
-                    self._ui_call(self._set_pause_lit, False)
-                    self._ui_call(self._set_play_lit, True)
-                return
-            if self.recording or self.bouncing:
-                self._show_info(
-                    "Mixer Busy",
-                    "Please stop recording or wait for bounce to finish before playing.",
-                )
-                return
+                    resumed = True
+                else:
+                    already_playing = True
+            elif self.recording or self.bouncing:
+                busy = True
+
+        if resumed:
+            self._ui_call(self._set_pause_lit, False)
+            self._ui_call(self._set_play_lit, True)
+            return
+        if already_playing:
+            return
+        if busy:
+            self._show_info(
+                "Mixer Busy",
+                "Please stop recording or wait for bounce to finish before playing.",
+            )
+            return
 
         loaded = [ch.get_filepath() for ch in self.channel_states if ch.get_filepath()]
         if not loaded:
@@ -2396,7 +2526,7 @@ class Window:
                     wf = wave.open(path, "rb")
                     wav_handles[idx] = wf
                     fr = wf.getframerate()
-                    if session_rate is None and fr > 0:
+                    if fr > 0 and (session_rate is None or fr > session_rate):
                         session_rate = fr
 
             if session_rate is None:
@@ -2484,6 +2614,12 @@ class Window:
                         self._pause_event.wait(timeout=0.05)
                     if self._stop_event.is_set():
                         break
+                    # Drain any seek queued right before resume so we never play a stale chunk
+                    with self._seek_lock:
+                        req_seek = self._pending_seek_sec
+                        self._pending_seek_sec = None
+                    if req_seek is not None:
+                        _apply_seek(req_seek)
                     try:
                         stream.start_stream()
                     except Exception:
@@ -2514,11 +2650,11 @@ class Window:
                             print("Audio ended")
                             break
                         in_tail = True
-                        max_delay_ms = max(
-                            snapshots[i].delay.get_params()[0] for i in delay_indices
+                        min_tail_frames, tail_frames_remaining = _estimate_delay_tail_frames(
+                            [snapshots[i].delay for i in delay_indices],
+                            session_rate,
+                            self.buffer,
                         )
-                        min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + self.buffer
-                        tail_frames_remaining = max(int(session_rate * 2.5), min_tail_frames * 2)
                     if tail_frames_remaining <= 0:
                         print("Audio ended")
                         break
@@ -2612,17 +2748,24 @@ class Window:
         if not self._require_pyaudio("recording"):
             return
 
+        stopping = False
+        busy = False
         with self._state_lock:
             if self.recording:
                 self._stop_event.set()
-                self._set_status("Stopping recording...")
-                return
-            if self.playing or self.bouncing:
-                self._show_info(
-                    "Mixer Busy",
-                    "Please stop playback or wait for bounce to finish before recording.",
-                )
-                return
+                stopping = True
+            elif self.playing or self.bouncing:
+                busy = True
+
+        if stopping:
+            self._set_status("Stopping recording...")
+            return
+        if busy:
+            self._show_info(
+                "Mixer Busy",
+                "Please stop playback or wait for bounce to finish before recording.",
+            )
+            return
 
         armed_indices = [idx for idx, ch in enumerate(self.channel_states) if ch.snapshot().rec_armed]
         if not armed_indices:
@@ -2632,13 +2775,21 @@ class Window:
             )
             return
 
-        base_name = sanitize_filename(self.nameBox.text())
-        if not base_name:
+        raw_name = self.nameBox.text().strip()
+        if raw_name:
+            base_name = sanitize_filename_stem(raw_name)
+            if not base_name:
+                self._show_error(
+                    "Invalid Recording Name",
+                    "Please enter a valid filename (avoid slashes or special path characters).",
+                )
+                return
+        else:
             base_name = f"recording_{time.strftime('%Y%m%d_%H%M%S')}"
-        elif base_name.lower().endswith(".wav"):
-            base_name = base_name[:-4] or f"recording_{time.strftime('%Y%m%d_%H%M%S')}"
 
         with self._state_lock:
+            if self.playing or self.recording or self.bouncing:
+                return
             self.recording = True
             self._stop_event.clear()
 
@@ -2713,6 +2864,11 @@ class Window:
 
             frames_recorded = 0
             last_ui_update = 0.0
+            overdub_in_tail = False
+            overdub_tail_rem = 0
+            overdub_tail_emitted = 0
+            overdub_min_tail = 0
+            armed_set = set(armed_indices)
             chunk_levels = [0.0, 0.0, 0.0, 0.0]
             master_levels = [0.0, 0.0]
             chunk_true_peaks = [0.0, 0.0, 0.0, 0.0]
@@ -2721,6 +2877,9 @@ class Window:
             with self._rec_wave_lock:
                 self._rec_wave_armed = list(armed_indices)
                 self._rec_wave_peaks = []
+                self._rec_wave_stride = 1
+                self._rec_wave_accum = 0.0
+                self._rec_wave_count = 0
                 self._rec_wave_elapsed = 0.0
                 self._rec_wave_active = True
 
@@ -2764,20 +2923,66 @@ class Window:
                             continue
                         any_data = True
                         chunks[idx] = mono
-                    if any_data:
-                        snapshots = [ch.snapshot() for ch in self.channel_states]
+
+                    raw_snaps = [ch.snapshot() for ch in self.channel_states]
+                    # Mask armed channels so Solo on an armed channel never silences backing tracks
+                    snapshots = [
+                        s._replace(solo=False, mute=True, filepath=None) if idx in armed_set else s
+                        for idx, s in enumerate(raw_snaps)
+                    ]
+                    master_gain = self._get_master_volume()
+
+                    close_overdub = False
+                    if not any_data:
+                        if not overdub_in_tail:
+                            delay_indices = self._audible_delay_indices(snapshots, master_gain)
+                            if not delay_indices:
+                                close_overdub = True
+                            else:
+                                overdub_in_tail = True
+                                overdub_min_tail, overdub_tail_rem = _estimate_delay_tail_frames(
+                                    [snapshots[i].delay for i in delay_indices],
+                                    session_rate,
+                                    self.buffer,
+                                )
+                        if not close_overdub:
+                            if overdub_tail_rem <= 0:
+                                close_overdub = True
+                            else:
+                                delay_indices = self._audible_delay_indices(snapshots, master_gain)
+                                if not delay_indices:
+                                    close_overdub = True
+                                else:
+                                    tail_len = min(self.buffer, overdub_tail_rem)
+                                    overdub_tail_rem -= tail_len
+                                    overdub_tail_emitted += tail_len
+                                    for idx in delay_indices:
+                                        chunks[idx] = [0.0] * tail_len
+
+                    if not close_overdub:
                         pcm_bytes = mix_stereo_chunk(
                             chunks,
                             snapshots,
                             session_rate,
                             out_levels=chunk_levels,
-                            master_gain=self._get_master_volume(),
+                            master_gain=master_gain,
                             out_master_levels=master_levels,
                             out_peaks=chunk_true_peaks,
                             out_master_peaks=master_true_peaks,
                         )
-                        if pcm_bytes:
+                        if overdub_in_tail and overdub_tail_emitted > overdub_min_tail and pcm_bytes:
+                            if _is_pcm_silent(pcm_bytes, 4):
+                                close_overdub = True
+                        if not close_overdub and pcm_bytes:
                             out_stream.write(pcm_bytes)
+
+                    if close_overdub:
+                        try:
+                            out_stream.stop_stream()
+                            out_stream.close()
+                        except Exception:
+                            pass
+                        out_stream = None
 
                 for idx in armed_indices:
                     chunk_levels[idx] = in_vu
@@ -2787,12 +2992,25 @@ class Window:
                 )
 
                 with self._rec_wave_lock:
-                    self._rec_wave_peaks.append(in_pk)
-                    if len(self._rec_wave_peaks) > 1200:
-                        self._rec_wave_peaks = [
-                            max(self._rec_wave_peaks[k], self._rec_wave_peaks[k + 1])
-                            for k in range(0, len(self._rec_wave_peaks) - 1, 2)
-                        ]
+                    # Uniform stride accumulation keeps live waveform linearly aligned with ruler
+                    if in_pk > self._rec_wave_accum:
+                        self._rec_wave_accum = in_pk
+                    self._rec_wave_count += 1
+                    if self._rec_wave_count >= self._rec_wave_stride:
+                        self._rec_wave_peaks.append(self._rec_wave_accum)
+                        self._rec_wave_accum = 0.0
+                        self._rec_wave_count = 0
+                        if len(self._rec_wave_peaks) >= 1200:
+                            n_p = len(self._rec_wave_peaks)
+                            compacted = [
+                                max(self._rec_wave_peaks[k], self._rec_wave_peaks[k + 1])
+                                for k in range(0, n_p - 1, 2)
+                            ]
+                            if n_p % 2 == 1:
+                                self._rec_wave_accum = self._rec_wave_peaks[-1]
+                                self._rec_wave_count = self._rec_wave_stride
+                            self._rec_wave_peaks = compacted
+                            self._rec_wave_stride *= 2
                     self._rec_wave_elapsed = frames_recorded / float(session_rate)
 
                 now = time.monotonic()
@@ -2802,32 +3020,34 @@ class Window:
                     last_ui_update = now
 
             raw_all = b"".join(recorded_frames)
-            saved_files = []
-            for idx in armed_indices:
-                filename = f"{base_name}_ch{idx + 1}.wav"
-                out_path = os.path.join(BASE_DIR, filename)
-                with wave.open(out_path, "wb") as wf_out:
-                    wf_out.setnchannels(1)
-                    wf_out.setsampwidth(2)
-                    wf_out.setframerate(session_rate)
-                    wf_out.writeframes(raw_all)
-                self.channel_states[idx].set_filepath(out_path)
-                well = self._ch_widgets[idx]["file_well"]
-                self._ui_call(well.set_file_text, filename)
-                self._ui_call(well.file_btn.setToolTip, out_path)
-                self._ui_call(well.set_meta_text, format_audio_meta(session_rate, 16, 1))
-                saved_files.append(filename)
-                print(f"Saved recording to {out_path}")
+            if not raw_all:
+                self._set_status("Recording cancelled")
+            else:
+                saved_files = []
+                out_targets = unique_recording_paths(BASE_DIR, base_name, armed_indices)
+                for idx, (filename, out_path) in zip(armed_indices, out_targets):
+                    with wave.open(out_path, "wb") as wf_out:
+                        wf_out.setnchannels(1)
+                        wf_out.setsampwidth(2)
+                        wf_out.setframerate(session_rate)
+                        wf_out.writeframes(raw_all)
+                    self.channel_states[idx].set_filepath(out_path)
+                    well = self._ch_widgets[idx]["file_well"]
+                    self._ui_call(well.set_file_text, filename)
+                    self._ui_call(well.file_btn.setToolTip, out_path)
+                    self._ui_call(well.set_meta_text, format_audio_meta(session_rate, 16, 1))
+                    saved_files.append(filename)
+                    print(f"Saved recording to {out_path}")
 
-            with self._rec_wave_lock:
-                self._rec_wave_active = False
-            self._ui_call(self.timeline.update_live_recording, False)
-            self._update_session_duration()
-            for idx in armed_indices:
-                path = self.channel_states[idx].get_filepath()
-                if path:
-                    self._load_channel_waveform_async(idx, path)
-            self._set_status(f"Saved: {', '.join(saved_files)}")
+                with self._rec_wave_lock:
+                    self._rec_wave_active = False
+                self._ui_call(self.timeline.update_live_recording, False)
+                self._update_session_duration()
+                for idx in armed_indices:
+                    path = self.channel_states[idx].get_filepath()
+                    if path:
+                        self._load_channel_waveform_async(idx, path)
+                self._set_status(f"Saved: {', '.join(saved_files)}")
 
         except Exception as exc:
             print(f"Recording error: {exc}")
@@ -2898,11 +3118,26 @@ class Window:
             self._show_info("Mixer Busy", "Please stop playback/recording before bouncing.")
             return
 
-        entry_name = sanitize_filename(self.nameBox.text())
-        if entry_name:
-            if not entry_name.lower().endswith(".wav"):
-                entry_name += ".wav"
-            out_path = os.path.join(BASE_DIR, entry_name)
+        raw_name = self.nameBox.text().strip()
+        if raw_name:
+            stem = sanitize_filename_stem(raw_name)
+            if not stem:
+                self._show_error(
+                    "Invalid Mix Name",
+                    "Please enter a valid filename (avoid slashes or special path characters).",
+                )
+                return
+            out_path = os.path.join(BASE_DIR, f"{stem}.wav")
+            if os.path.exists(out_path):
+                reply = QMessageBox.question(
+                    self.root,
+                    "Overwrite File?",
+                    f"'{os.path.basename(out_path)}' already exists.\nDo you want to overwrite it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
         else:
             out_path, _ = QFileDialog.getSaveFileName(
                 self.root,
@@ -2914,6 +3149,24 @@ class Window:
                 return
             if not out_path.lower().endswith(".wav"):
                 out_path += ".wav"
+
+        if self._closing:
+            return
+
+        # Prevent overwriting any currently loaded channel WAV (would truncate source before reading)
+        loaded_now = [ch.get_filepath() for ch in self.channel_states if ch.get_filepath()]
+        if not loaded_now:
+            self._show_info("No Audio Loaded", "Load at least one .wav file before bouncing.")
+            return
+        out_real = os.path.realpath(out_path)
+        for lp in loaded_now:
+            if os.path.realpath(lp) == out_real:
+                self._show_error(
+                    "Invalid Bounce Destination",
+                    "Cannot overwrite a WAV file that is currently loaded in a channel.\n"
+                    "Choose a different output filename.",
+                )
+                return
 
         busy_now = False
         with self._state_lock:
@@ -2951,6 +3204,7 @@ class Window:
         use_dither = bool(bounce_dither if bounce_dither is not None else getattr(self, "bounce_dither", bit_depth == 16)) and (bit_depth < 32)
         dither_rng = ctypes.c_uint64((time.time_ns() ^ 0xA0761D6478BD642F) & 0xFFFFFFFFFFFFFFFF or 1)
 
+        wrote_output = False
         try:
             dither_tag = "TPDF Dither" if use_dither else "No Dither"
             print(f"Bouncing {bit_depth}-bit ({dither_tag}) audio to {out_path}...")
@@ -2959,12 +3213,15 @@ class Window:
             offline_procs = [ch.clone_processors_for_offline() for ch in self.channel_states]
             frozen_master_gain = self._get_master_volume()
 
+            out_real = os.path.realpath(out_path)
             for idx, snap in enumerate(snapshots):
                 if snap.filepath:
+                    if os.path.realpath(snap.filepath) == out_real:
+                        raise ValueError("Cannot overwrite a WAV file that is currently loaded in a channel.")
                     wf = wave.open(snap.filepath, "rb")
                     wav_handles[idx] = wf
                     fr = wf.getframerate()
-                    if session_rate is None and fr > 0:
+                    if fr > 0 and (session_rate is None or fr > session_rate):
                         session_rate = fr
 
             if session_rate is None:
@@ -3004,6 +3261,7 @@ class Window:
             fx_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="BounceFX") if use_c else None
             try:
                 with wave.open(out_path, "wb") as bounce_wf:
+                    wrote_output = True
                     bounce_wf.setnchannels(2)
                     bounce_wf.setsampwidth(sampwidth)
                     bounce_wf.setframerate(int(session_rate))
@@ -3029,11 +3287,11 @@ class Window:
                                 if not delay_indices_init:
                                     break
                                 in_tail = True
-                                max_delay_ms = max(
-                                    offline_procs[i][3].get_params()[0] for i in delay_indices_init
+                                min_tail_frames, tail_frames_remaining = _estimate_delay_tail_frames(
+                                    [offline_procs[i][3] for i in delay_indices_init],
+                                    session_rate,
+                                    tail_step,
                                 )
-                                min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + tail_step
-                                tail_frames_remaining = max(int(session_rate * 2.5), min_tail_frames * 2)
                             if tail_frames_remaining <= 0:
                                 break
                             tail_chunk_len = min(tail_step, tail_frames_remaining)
@@ -3101,6 +3359,12 @@ class Window:
 
         except Exception as exc:
             print(f"Bounce error: {exc}")
+            if wrote_output:
+                try:
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
+                except OSError:
+                    pass
             self._ui_call(self._set_bounce_progress, 0.0, "Bounce failed", "#fc8181")
             self._set_status("Bounce error")
             self._ui_call(self._show_error, "Bounce Error", f"Could not export mix:\n{exc}")

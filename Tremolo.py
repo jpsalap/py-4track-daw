@@ -19,6 +19,7 @@ class TremoloProcessor:
 
     def __init__(self, rate=DEFAULT_RATE, depth=DEFAULT_DEPTH):
         self._lock = threading.Lock()
+        self._proc_lock = threading.Lock()
         self._rate = float(rate)
         self._depth = float(depth)
         self._phase = 0.0
@@ -38,7 +39,8 @@ class TremoloProcessor:
         self.set_params(rate=self.DEFAULT_RATE, depth=self.DEFAULT_DEPTH)
 
     def reset(self):
-        self._phase = 0.0
+        with self._proc_lock:
+            self._phase = 0.0
 
     def clone_for_offline(self):
         rate, depth = self.get_params()
@@ -46,6 +48,10 @@ class TremoloProcessor:
 
     def process(self, samples, sample_rate):
         """Apply tremolo to mono float samples in [-1.0, 1.0]."""
+        with self._proc_lock:
+            return self._process_unlocked(samples, sample_rate)
+
+    def _process_unlocked(self, samples, sample_rate):
         rate, depth = self.get_params()
         n = len(samples)
         if n == 0:
@@ -122,8 +128,8 @@ class TremoloWindow(EffectDialogBase):
 
         self.rate_slider, _ = self.add_param_slider(
             "Rate",
-            0.5,
-            15.0,
+            0.1,
+            20.0,
             0.1,
             rate,
             TremoloProcessor.DEFAULT_RATE,

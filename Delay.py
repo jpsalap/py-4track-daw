@@ -20,6 +20,7 @@ class DelayProcessor:
 
     def __init__(self, delay_ms=DEFAULT_DELAY_MS, feedback=DEFAULT_FEEDBACK, mix=DEFAULT_MIX):
         self._lock = threading.Lock()
+        self._proc_lock = threading.Lock()
         self._delay_ms = float(delay_ms)
         self._feedback = float(feedback)
         self._mix = float(mix)
@@ -49,12 +50,13 @@ class DelayProcessor:
         )
 
     def reset(self):
-        if self._buf_len > 0:
-            if _dsp is not None and _dsp.AVAILABLE:
-                self._buffer = _dsp.alloc_f64(self._buf_len)
-            else:
-                self._buffer = [0.0] * self._buf_len
-        self._write_idx = 0
+        with self._proc_lock:
+            if self._buf_len > 0:
+                if _dsp is not None and _dsp.AVAILABLE:
+                    self._buffer = _dsp.alloc_f64(self._buf_len)
+                else:
+                    self._buffer = [0.0] * self._buf_len
+            self._write_idx = 0
 
     def clone_for_offline(self):
         delay_ms, feedback, mix = self.get_params()
@@ -73,6 +75,10 @@ class DelayProcessor:
 
     def process(self, samples, sample_rate):
         """Apply feedback delay to mono float samples in [-1.0, 1.0]."""
+        with self._proc_lock:
+            return self._process_unlocked(samples, sample_rate)
+
+    def _process_unlocked(self, samples, sample_rate):
         n = len(samples)
         if n == 0:
             return samples
