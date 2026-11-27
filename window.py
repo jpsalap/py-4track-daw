@@ -10,7 +10,7 @@ import time
 import wave
 from collections import namedtuple
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -561,7 +561,7 @@ class _UiBridge(QObject):
 
 
 class _MainWindow(QMainWindow):
-    """QMainWindow wrapper handling Spacebar transport shortcut and clean shutdown."""
+    """QMainWindow wrapper handling Spacebar transport shortcut, focus release, and clean shutdown."""
 
     def __init__(self, controller):
         super().__init__()
@@ -578,6 +578,19 @@ class _MainWindow(QMainWindow):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def eventFilter(self, watched, event):
+        etype = event.type()
+        if etype == QEvent.Type.MouseButtonPress:
+            name_box = getattr(self._controller, "nameBox", None)
+            if name_box is not None and name_box.hasFocus() and watched is not name_box:
+                name_box.clearFocus()
+        elif etype == QEvent.Type.KeyPress:
+            name_box = getattr(self._controller, "nameBox", None)
+            if watched is name_box and event.key() == Qt.Key.Key_Escape:
+                name_box.clearFocus()
+                return True
+        return super().eventFilter(watched, event)
 
     def closeEvent(self, event):
         if not self._close_handled:
@@ -679,9 +692,6 @@ class Window:
         self._apply_global_stylesheet()
 
         self._ui_bridge = _UiBridge(self.root)
-        self._mono_badge_font = QFont("Menlo", 9)
-        self._mono_badge_font.setStyleHint(QFont.StyleHint.Monospace)
-        self._mono_badge_font.setBold(True)
 
         # Central layout with resizable vertical splitter (Arrange View / Mixer Console)
         central = QWidget(self.root)
@@ -798,13 +808,6 @@ class Window:
                 max-height: 1px;
                 min-height: 1px;
                 border: none;
-            }}
-            QLabel.faderBadge {{
-                background-color: {T['bg_well']};
-                color: {T['unity_gold']};
-                border: 1px solid #2c465e;
-                border-radius: 4px;
-                padding: 1px 4px;
             }}
             QLineEdit#nameBox {{
                 background-color: {T['bg_well']};
@@ -1341,7 +1344,11 @@ class Window:
 
         self.nameBox = QLineEdit(body)
         self.nameBox.setObjectName("nameBox")
+        self.nameBox.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.nameBox.setPlaceholderText("Optional filename (e.g. final_mix)")
+        self.nameBox.returnPressed.connect(self.nameBox.clearFocus)
+        self.nameBox.installEventFilter(self.root)
+        self._app.installEventFilter(self.root)
         body_layout.addWidget(self.nameBox)
 
         self.export_button = QPushButton("Bounce Mix (.wav)", body)
@@ -1553,12 +1560,18 @@ class Window:
             self._set_rec_mode("off")
 
     def _on_space_key(self):
-        """Spacebar shortcut to Play / Pause / Resume (ignored while typing in Name box)."""
+        """Spacebar shortcut: Play/Pause/Resume, or Stop when recording (ignored while typing or bouncing)."""
         if self.nameBox.hasFocus():
             return
         with self._state_lock:
             is_playing = self.playing
-        if is_playing:
+            is_recording = self.recording
+            is_bouncing = self.bouncing
+        if is_bouncing:
+            return
+        if is_recording:
+            self.stop()
+        elif is_playing:
             self.press_pause()
         else:
             self.press_play()
@@ -1733,6 +1746,8 @@ class Window:
 
         self.channel_states[channel_idx].set_filepath(None)
         self.channel_states[channel_idx].reset_effects()
+        self._channel_meters[channel_idx].reset()
+        self._channel_peak_readouts[channel_idx].clear()
         well = self._ch_widgets[channel_idx]["file_well"]
         well.set_file_text("(click or drop .wav)")
         well.file_btn.setToolTip("Click to browse for a .wav file, or drag & drop one here")
@@ -2010,15 +2025,20 @@ class Window:
                     stream.write(pcm_bytes)
                     frames_played += len(pcm_bytes) // 4
                     with self._seek_lock:
-                        self._playhead_sec = frames_played / float(session_rate)
+                        if self._pending_seek_sec is None and not self._stop_event.is_set():
+                            self._playhead_sec = frames_played / float(session_rate)
 
                 now = time.monotonic()
-                if now - last_ui_update >= 0.25:
+                if now - last_ui_update >= 0.25 and not self._stop_event.is_set():
                     elapsed = int(frames_played / float(session_rate))
                     self._set_status(f"Playing {format_timecode(elapsed)}")
                     last_ui_update = now
 
             if self._stop_event.is_set():
+                with self._seek_lock:
+                    self._playhead_sec = 0.0
+                    self._pending_seek_sec = None
+                self._ui_call(self.timeline.set_position, 0.0)
                 self._set_status("Stopped")
             else:
                 self._set_status("Playback finished")
@@ -2557,6 +2577,7 @@ class Window:
         if self._closing:
             return
         self._closing = True
+        self._app.removeEventFilter(self.root)
         self._meter_timer.stop()
         self._ui_bridge.shutdown()
         self._stop_event.set()

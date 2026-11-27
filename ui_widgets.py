@@ -268,6 +268,9 @@ class PeakReadout(QWidget):
             return
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        self.mousePressEvent(event)
+
     def update_peak(self, linear_peak, now=None):
         """Feed latest true sample peak; holds highest peak for 2.5s then auto-clears."""
         if now is None:
@@ -709,6 +712,9 @@ class InsertSlotWidget(QWidget):
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self.mousePressEvent(event)
 
     def paintEvent(self, _event):
         p = QPainter(self)
@@ -1188,6 +1194,7 @@ class _TimelineCanvas(QWidget):
 
         # Offscreen Retina cache of static ruler + lanes + all 4 waveforms
         self._static_cache = None
+        self._cache_dpr = 0.0
         self._cache_dirty = True
 
     def invalidate_cache(self):
@@ -1599,10 +1606,12 @@ class _TimelineCanvas(QWidget):
         p.restore()
         p.end()
         self._static_cache = pix
+        self._cache_dpr = dpr
         self._cache_dirty = False
 
     def paintEvent(self, event):
-        if self._cache_dirty or self._static_cache is None:
+        cur_dpr = max(1.0, float(self.devicePixelRatioF()))
+        if self._cache_dirty or self._static_cache is None or abs(cur_dpr - self._cache_dpr) > 1e-3:
             self._rebuild_static_cache()
 
         p = QPainter(self)
