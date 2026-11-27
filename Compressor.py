@@ -1,7 +1,13 @@
 # Compressor Effect (DSP Processor + Tkinter Popup Window)
+import ctypes
 import math
 import threading
 import tkinter as tk
+
+try:
+    import dsp_accel as _dsp
+except Exception:
+    _dsp = None
 
 
 class CompressorProcessor:
@@ -78,12 +84,31 @@ class CompressorProcessor:
         )
 
     def process(self, samples, sample_rate):
-        """Apply dynamic compression to a list of mono float samples in [-1.0, 1.0]."""
+        """Apply dynamic compression to mono float samples in [-1.0, 1.0]."""
         n = len(samples)
         if n == 0:
             return samples
 
         threshold_db, ratio, attack_ms, release_ms, makeup_db = self.get_params()
+
+        if _dsp is not None and _dsp.AVAILABLE:
+            in_arr = _dsp.as_f64_array(samples)
+            out_arr = _dsp.alloc_f64(n)
+            env_c = ctypes.c_double(self._env)
+            _dsp.LIB.dsp_compressor_process(
+                _dsp.f64_ptr(in_arr),
+                _dsp.f64_ptr(out_arr),
+                n,
+                float(sample_rate),
+                threshold_db,
+                ratio,
+                attack_ms,
+                release_ms,
+                makeup_db,
+                ctypes.byref(env_c),
+            )
+            self._env = env_c.value
+            return out_arr
 
         sr = float(sample_rate)
         attack_c = math.exp(-1.0 / max(1.0, attack_ms * 0.001 * sr))

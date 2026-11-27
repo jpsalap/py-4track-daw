@@ -1,4 +1,5 @@
 import array
+import ctypes
 import math
 import os
 import queue
@@ -8,9 +9,15 @@ import threading
 import time
 import wave
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import font, messagebox
 from tkinter.filedialog import askopenfilename, asksaveasfilename
+
+try:
+    import dsp_accel as _dsp
+except Exception:
+    _dsp = None
 
 try:
     import pyaudio
@@ -85,10 +92,32 @@ ChannelSnapshot = namedtuple(
 )
 
 
+def _is_pcm_silent(pcm_bytes, threshold=4):
+    """Return True if all 16-bit PCM samples in pcm_bytes have abs(v) < threshold."""
+    if not pcm_bytes:
+        return True
+    if _dsp is not None and _dsp.AVAILABLE:
+        return bool(_dsp.LIB.dsp_is_silent_i16(pcm_bytes, len(pcm_bytes) // 2, int(threshold)))
+    check = array.array("h")
+    check.frombytes(pcm_bytes)
+    return max(abs(v) for v in check) < threshold
+
+
 def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels):
     """Decode PCM WAV bytes (8/16/24/32-bit, mono or multi-channel) to mono floats in [-1.0, 1.0]."""
     if not raw_bytes:
         return []
+
+    if _dsp is not None and _dsp.AVAILABLE and sampwidth in (1, 2, 3, 4) and nchannels > 0:
+        frame_bytes = sampwidth * nchannels
+        n_frames = len(raw_bytes) // frame_bytes
+        if n_frames == 0:
+            return []
+        out = _dsp.alloc_f64(n_frames)
+        _dsp.LIB.dsp_decode_pcm_to_mono_f64(
+            raw_bytes, len(raw_bytes), sampwidth, nchannels, _dsp.f64_ptr(out)
+        )
+        return out
 
     if sampwidth == 2:
         pcm = array.array("h")
@@ -198,7 +227,8 @@ class StreamingWavReader:
         self.src_rate = max(1, wf.getframerate())
         self.dst_rate = max(1, int(dst_rate))
         self.step = self.src_rate / float(self.dst_rate)
-        self._buf = []
+        self._use_c = _dsp is not None and _dsp.AVAILABLE
+        self._buf = array.array("d") if self._use_c else []
         self._pos = 0.0
         self._eof = False
 
@@ -224,27 +254,43 @@ class StreamingWavReader:
         if avail == 0:
             return []
 
-        pos = self._pos
-        step = self.step
-        out = []
-        append = out.append
-        last = avail - 1
+        if self._use_c:
+            out = _dsp.alloc_f64(out_frames)
+            out_pos = ctypes.c_double(self._pos)
+            produced = _dsp.LIB.dsp_resample_linear_f64(
+                _dsp.f64_ptr(buf),
+                avail,
+                self._pos,
+                self.step,
+                out_frames,
+                _dsp.f64_ptr(out),
+                ctypes.byref(out_pos),
+            )
+            pos = out_pos.value
+            if produced < out_frames:
+                out = out[:produced]
+        else:
+            pos = self._pos
+            step = self.step
+            out = []
+            append = out.append
+            last = avail - 1
 
-        for _ in range(out_frames):
-            i0 = int(pos)
-            if i0 >= avail:
-                break
-            if i0 < last:
-                frac = pos - i0
-                append(buf[i0] * (1.0 - frac) + buf[i0 + 1] * frac)
-            else:
-                append(buf[last])
-            pos += step
+            for _ in range(out_frames):
+                i0 = int(pos)
+                if i0 >= avail:
+                    break
+                if i0 < last:
+                    frac = pos - i0
+                    append(buf[i0] * (1.0 - frac) + buf[i0 + 1] * frac)
+                else:
+                    append(buf[last])
+                pos += step
 
         drop = int(pos)
         if drop > 0:
             if drop >= avail:
-                self._buf = []
+                self._buf = array.array("d") if self._use_c else []
                 self._pos = 0.0 if self._eof else (pos - avail)
             else:
                 del self._buf[:drop]
@@ -257,15 +303,16 @@ class StreamingWavReader:
         """Seek to target_sec preserving fractional sample alignment."""
         exact_frame = max(0.0, float(target_sec) * self.src_rate)
         nframes = self.wf.getnframes()
+        empty = array.array("d") if self._use_c else []
         if exact_frame >= nframes:
             self.wf.setpos(nframes)
-            self._buf = []
+            self._buf = empty
             self._pos = 0.0
             self._eof = True
         else:
             base_frame = int(math.floor(exact_frame))
             self.wf.setpos(base_frame)
-            self._buf = []
+            self._buf = empty
             self._pos = exact_frame - base_frame
             self._eof = False
 
@@ -388,6 +435,7 @@ def mix_stereo_chunk(
     out_master_levels=None,
     out_peaks=None,
     out_master_peaks=None,
+    fx_executor=None,
 ):
     """
     Process per-channel mono float chunks through enabled effects, polarity inversion,
@@ -421,26 +469,17 @@ def mix_stereo_chunk(
         return b""
 
     any_solo = any(snap.solo for snap in snapshots)
-    master_left = [0.0] * max_len
-    master_right = [0.0] * max_len
+    use_c = _dsp is not None and _dsp.AVAILABLE
+    master_left = _dsp.alloc_f64(max_len) if use_c else [0.0] * max_len
+    master_right = _dsp.alloc_f64(max_len) if use_c else [0.0] * max_len
+    if use_c:
+        ml_ptr = _dsp.f64_ptr(master_left)
+        mr_ptr = _dsp.f64_ptr(master_right)
     half_pi = math.pi * 0.5
     sqrt2 = 1.4142135623730951
     inv_len = 1.0 / float(max_len)
 
-    for i, snap in enumerate(snapshots):
-        chunk = channel_chunks[i]
-        if not chunk:
-            # If channel had a loaded file that already ended, only keep feeding zeros if Delay/Chorus is active
-            if snap.filepath and (snap.delay_enabled or snap.chorus_enabled):
-                samples = [0.0] * max_len
-            else:
-                continue
-        elif len(chunk) < max_len:
-            samples = chunk + [0.0] * (max_len - len(chunk))
-        else:
-            samples = chunk
-
-        # Choose live or offline-cloned effect processors
+    def _process_channel_fx(i, snap, samples):
         if offline_processors is not None:
             comp_proc, chorus_proc, trem_proc, delay_proc = offline_processors[i]
         else:
@@ -458,7 +497,51 @@ def mix_stereo_chunk(
             samples = trem_proc.process(samples, sample_rate)
         if snap.delay_enabled:
             samples = delay_proc.process(samples, sample_rate)
+        return samples
 
+    prepared = []
+    for i, snap in enumerate(snapshots):
+        chunk = channel_chunks[i]
+        if not chunk:
+            # If channel had a loaded file that already ended, only keep feeding zeros if Delay/Chorus is active
+            if snap.filepath and (snap.delay_enabled or snap.chorus_enabled):
+                samples = _dsp.alloc_f64(max_len) if use_c else [0.0] * max_len
+            else:
+                continue
+        elif len(chunk) < max_len:
+            pad_len = max_len - len(chunk)
+            if use_c:
+                samples = _dsp.as_f64_array(chunk) + _dsp.alloc_f64(pad_len)
+            else:
+                samples = list(chunk) + [0.0] * pad_len
+        else:
+            samples = chunk
+        prepared.append((i, snap, samples))
+
+    # When offline-bouncing with the GIL-releasing C accelerator, run independent channel FX in parallel
+    has_parallel_fx = (
+        fx_executor is not None
+        and use_c
+        and sum(
+            1
+            for _, s, _ in prepared
+            if s.compressor_enabled or s.chorus_enabled or s.tremolo_enabled or s.delay_enabled
+        )
+        >= 2
+    )
+    if has_parallel_fx:
+        futures = [
+            (i, snap, fx_executor.submit(_process_channel_fx, i, snap, samples))
+            for i, snap, samples in prepared
+        ]
+        processed = [(i, snap, fut.result()) for i, snap, fut in futures]
+    else:
+        processed = [
+            (i, snap, _process_channel_fx(i, snap, samples))
+            for i, snap, samples in prepared
+        ]
+
+    for i, snap, samples in processed:
         # Standard mixer Mute / Solo logic
         is_audible = (not snap.mute) and (not any_solo or snap.solo)
         if not is_audible or snap.volume <= 0.0:
@@ -476,7 +559,41 @@ def mix_stereo_chunk(
         want_vu = out_levels is not None and i < len(out_levels)
         want_pk = out_peaks is not None and i < len(out_peaks)
 
-        if want_vu or want_pk:
+        if use_c:
+            s_arr = _dsp.as_f64_array(samples)
+            if want_vu or want_pk:
+                vu_c = ctypes.c_double(0.0)
+                pk_c = ctypes.c_double(0.0)
+                _dsp.LIB.dsp_mix_channel_accum(
+                    _dsp.f64_ptr(s_arr),
+                    max_len,
+                    l_gain,
+                    r_gain,
+                    abs_gain,
+                    ml_ptr,
+                    mr_ptr,
+                    1,
+                    ctypes.byref(vu_c),
+                    ctypes.byref(pk_c),
+                )
+                if want_vu:
+                    out_levels[i] = vu_c.value
+                if want_pk:
+                    out_peaks[i] = pk_c.value
+            else:
+                _dsp.LIB.dsp_mix_channel_accum(
+                    _dsp.f64_ptr(s_arr),
+                    max_len,
+                    l_gain,
+                    r_gain,
+                    abs_gain,
+                    ml_ptr,
+                    mr_ptr,
+                    0,
+                    None,
+                    None,
+                )
+        elif want_vu or want_pk:
             sum_sq = 0.0
             ch_peak = 0.0
             for j in range(max_len):
@@ -498,10 +615,51 @@ def mix_stereo_chunk(
                 master_right[j] += s * r_gain
 
     # Apply master fader, measure stereo master bus VU + pre-clip peaks, clip, and pack 16-bit PCM
-    stereo = array.array("h", [0] * (max_len * 2))
     m_gain = float(master_gain)
     want_m_vu = out_master_levels is not None and len(out_master_levels) >= 2
     want_m_pk = out_master_peaks is not None and len(out_master_peaks) >= 2
+
+    if use_c:
+        stereo = _dsp.alloc_i16(max_len * 2)
+        if want_m_vu or want_m_pk:
+            vl_c = ctypes.c_double(0.0)
+            vr_c = ctypes.c_double(0.0)
+            pl_c = ctypes.c_double(0.0)
+            pr_c = ctypes.c_double(0.0)
+            _dsp.LIB.dsp_master_pack_i16(
+                ml_ptr,
+                mr_ptr,
+                max_len,
+                m_gain,
+                _dsp.i16_ptr(stereo),
+                1,
+                ctypes.byref(vl_c),
+                ctypes.byref(vr_c),
+                ctypes.byref(pl_c),
+                ctypes.byref(pr_c),
+            )
+            if want_m_vu:
+                out_master_levels[0] = vl_c.value
+                out_master_levels[1] = vr_c.value
+            if want_m_pk:
+                out_master_peaks[0] = pl_c.value
+                out_master_peaks[1] = pr_c.value
+        else:
+            _dsp.LIB.dsp_master_pack_i16(
+                ml_ptr,
+                mr_ptr,
+                max_len,
+                m_gain,
+                _dsp.i16_ptr(stereo),
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+        return stereo.tobytes()
+
+    stereo = array.array("h", [0] * (max_len * 2))
 
     if want_m_vu or want_m_pk:
         l_sq = 0.0
@@ -3723,9 +3881,7 @@ class Window:
 
                 if in_tail and tail_frames_emitted > min_tail_frames and pcm_bytes:
                     # Stop tail early once past one full delay cycle and virtually silent
-                    check = array.array("h")
-                    check.frombytes(pcm_bytes)
-                    if max(abs(v) for v in check) < 4:
+                    if _is_pcm_silent(pcm_bytes, 4):
                         print("Audio ended")
                         break
 
@@ -4033,9 +4189,7 @@ class Window:
                             out_master_peaks=master_true_peaks,
                         )
                         if overdub_in_tail and overdub_tail_emitted > overdub_min_tail and pcm_bytes:
-                            check = array.array("h")
-                            check.frombytes(pcm_bytes)
-                            if max(abs(v) for v in check) < 4:
+                            if _is_pcm_silent(pcm_bytes, 4):
                                 close_overdub = True
                         if not close_overdub and pcm_bytes:
                             out_stream.write(pcm_bytes)
@@ -4270,7 +4424,9 @@ class Window:
     def _bounce_worker(self, out_path):
         wav_handles = [None] * 4
         readers = [None] * 4
-        chunk_size = 4096
+        use_c = _dsp is not None and _dsp.AVAILABLE
+        chunk_size = 65536 if use_c else 4096
+        tail_step = 4096
         cancelled = False
 
         try:
@@ -4320,76 +4476,81 @@ class Window:
             min_tail_frames = 0
             in_tail = False
 
-            with wave.open(out_path, "wb") as bounce_wf:
-                bounce_wf.setnchannels(2)
-                bounce_wf.setsampwidth(self.bitdepth // 8)
-                bounce_wf.setframerate(int(session_rate))
+            fx_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="BounceFX") if use_c else None
+            try:
+                with wave.open(out_path, "wb") as bounce_wf:
+                    bounce_wf.setnchannels(2)
+                    bounce_wf.setsampwidth(self.bitdepth // 8)
+                    bounce_wf.setframerate(int(session_rate))
 
-                while True:
-                    if self._stop_event.is_set():
-                        cancelled = True
-                        break
-
-                    chunks = [[] for _ in range(4)]
-                    any_data = False
-
-                    for idx, rdr in enumerate(readers):
-                        if rdr is None:
-                            continue
-                        mono = rdr.read(chunk_size)
-                        if not mono:
-                            continue
-                        any_data = True
-                        chunks[idx] = mono
-
-                    if not any_data:
-                        if not in_tail:
-                            if not delay_indices_init:
-                                break
-                            in_tail = True
-                            max_delay_ms = max(
-                                offline_procs[i][3].get_params()[0] for i in delay_indices_init
-                            )
-                            min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + chunk_size
-                            tail_frames_remaining = max(int(session_rate * 2.5), min_tail_frames * 2)
-                        if tail_frames_remaining <= 0:
+                    while True:
+                        if self._stop_event.is_set():
+                            cancelled = True
                             break
-                        tail_chunk_len = min(chunk_size, tail_frames_remaining)
-                        tail_frames_remaining -= tail_chunk_len
-                        tail_frames_emitted += tail_chunk_len
-                        for idx in delay_indices_init:
-                            chunks[idx] = [0.0] * tail_chunk_len
 
-                    pcm_bytes = mix_stereo_chunk(
-                        chunks,
-                        snapshots,
-                        session_rate,
-                        offline_processors=offline_procs,
-                        master_gain=frozen_master_gain,
-                    )
-                    if in_tail and tail_frames_emitted > min_tail_frames and pcm_bytes:
-                        check = array.array("h")
-                        check.frombytes(pcm_bytes)
-                        if max(abs(v) for v in check) < 4:
-                            break
-                    if pcm_bytes:
-                        bounce_wf.writeframes(pcm_bytes)
-                        frames_written += len(pcm_bytes) // 4
+                        chunks = [[] for _ in range(4)]
+                        any_data = False
 
-                        now = time.monotonic()
-                        frac = min(0.99, frames_written / float(total_frames))
-                        pct = int(frac * 100)
-                        if (pct - last_prog_pct >= 2 or now - last_prog_time >= 0.05) and pct != last_prog_pct:
-                            last_prog_pct = pct
-                            last_prog_time = now
-                            self._set_status(f"Bouncing... {pct}%")
-                            if hasattr(self, "_bounce_canvas"):
-                                self._ui_call(
-                                    self._set_bounce_progress,
-                                    frac,
-                                    f"Bouncing... {pct}%",
-                                    "#48d18a",
+                        for idx, rdr in enumerate(readers):
+                            if rdr is None:
+                                continue
+                            mono = rdr.read(chunk_size)
+                            if not mono:
+                                continue
+                            any_data = True
+                            chunks[idx] = mono
+
+                        if not any_data:
+                            if not in_tail:
+                                if not delay_indices_init:
+                                    break
+                                in_tail = True
+                                max_delay_ms = max(
+                                    offline_procs[i][3].get_params()[0] for i in delay_indices_init
                                 )
+                                min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + tail_step
+                                tail_frames_remaining = max(int(session_rate * 2.5), min_tail_frames * 2)
+                            if tail_frames_remaining <= 0:
+                                break
+                            tail_chunk_len = min(tail_step, tail_frames_remaining)
+                            tail_frames_remaining -= tail_chunk_len
+                            tail_frames_emitted += tail_chunk_len
+                            zero_chunk = _dsp.alloc_f64(tail_chunk_len) if use_c else [0.0] * tail_chunk_len
+                            for idx in delay_indices_init:
+                                chunks[idx] = zero_chunk
+
+                        pcm_bytes = mix_stereo_chunk(
+                            chunks,
+                            snapshots,
+                            session_rate,
+                            offline_processors=offline_procs,
+                            master_gain=frozen_master_gain,
+                            fx_executor=fx_pool,
+                        )
+                        if in_tail and tail_frames_emitted > min_tail_frames and pcm_bytes:
+                            if _is_pcm_silent(pcm_bytes, 4):
+                                break
+                        if pcm_bytes:
+                            bounce_wf.writeframes(pcm_bytes)
+                            frames_written += len(pcm_bytes) // 4
+
+                            now = time.monotonic()
+                            frac = min(0.99, frames_written / float(total_frames))
+                            pct = int(frac * 100)
+                            if (pct - last_prog_pct >= 2 or now - last_prog_time >= 0.05) and pct != last_prog_pct:
+                                last_prog_pct = pct
+                                last_prog_time = now
+                                self._set_status(f"Bouncing... {pct}%")
+                                if hasattr(self, "_bounce_canvas"):
+                                    self._ui_call(
+                                        self._set_bounce_progress,
+                                        frac,
+                                        f"Bouncing... {pct}%",
+                                        "#48d18a",
+                                    )
+            finally:
+                if fx_pool is not None:
+                    fx_pool.shutdown(wait=True)
 
             if cancelled:
                 try:

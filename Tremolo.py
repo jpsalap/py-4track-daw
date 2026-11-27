@@ -1,7 +1,13 @@
 # Tremolo Effect (DSP Processor + Tkinter Popup Window)
+import ctypes
 import math
 import threading
 import tkinter as tk
+
+try:
+    import dsp_accel as _dsp
+except Exception:
+    _dsp = None
 
 
 class TremoloProcessor:
@@ -38,11 +44,27 @@ class TremoloProcessor:
         return TremoloProcessor(rate=rate, depth=depth)
 
     def process(self, samples, sample_rate):
-        """Apply tremolo to a list of mono float samples in [-1.0, 1.0]."""
+        """Apply tremolo to mono float samples in [-1.0, 1.0]."""
         rate, depth = self.get_params()
         n = len(samples)
         if n == 0:
             return samples
+
+        if _dsp is not None and _dsp.AVAILABLE:
+            in_arr = _dsp.as_f64_array(samples)
+            out_arr = _dsp.alloc_f64(n)
+            phase_c = ctypes.c_double(self._phase)
+            _dsp.LIB.dsp_tremolo_process(
+                _dsp.f64_ptr(in_arr),
+                _dsp.f64_ptr(out_arr),
+                n,
+                float(sample_rate),
+                rate,
+                depth,
+                ctypes.byref(phase_c),
+            )
+            self._phase = phase_c.value
+            return out_arr
 
         two_pi = 2.0 * math.pi
         phase_inc = two_pi * rate / float(sample_rate)
