@@ -1,8 +1,9 @@
+"""Mini-DAW: 4-Channel Python Audio Mixer, Multitrack Recorder & Waveform Arrange View (PySide6)."""
+
 import array
 import ctypes
 import math
 import os
-import queue
 import random
 import re
 import sys
@@ -11,29 +12,64 @@ import time
 import wave
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
-import tkinter as tk
-from tkinter import font, messagebox
-from tkinter.filedialog import askopenfilename, asksaveasfilename
 
 try:
     import dsp_accel as _dsp
 except Exception:
     _dsp = None
 
+from PySide6.QtCore import QEvent, QObject, QRect, QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QActionGroup, QFont, QKeySequence
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
+
 try:
     import pyaudio
+
     _PYAUDIO_IMPORT_ERROR = None
 except Exception as _exc:
     pyaudio = None
     _PYAUDIO_IMPORT_ERROR = _exc
 
-from Delay import DelayProcessor, DelayWindow
-from Tremolo import TremoloProcessor, TremoloWindow
 from Chorus import ChorusProcessor, ChorusWindow
 from Compressor import CompressorProcessor, CompressorWindow
+from Delay import DelayProcessor, DelayWindow
 from MasterLimiter import MasterLimiterProcessor
+from themes import THEMES, get_theme
+from Tremolo import TremoloProcessor, TremoloWindow
 from wav_io import open_wav_read, open_wav_write
-
+from ui_widgets import (
+    MAX_FADER_DB,
+    MIN_FADER_DB,
+    ChannelFileWell,
+    ChannelMeter,
+    FaderBadge,
+    FaderWithScale,
+    InsertSlotWidget,
+    MeterScaleTicks,
+    PanSlider,
+    PeakReadout,
+    TogglePadButton,
+    TransportButton,
+    WaveformTimeline,
+    format_peak_db,
+    format_timecode,
+)
 
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.join(os.path.expanduser("~"), "Music", "Mini-DAW")
@@ -43,9 +79,6 @@ if getattr(sys, "frozen", False):
         BASE_DIR = os.path.expanduser("~")
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-MIN_FADER_DB = -60.0
-MAX_FADER_DB = 6.0
 
 
 def db_to_linear(db):
@@ -75,6 +108,66 @@ def format_audio_meta(sample_rate, bit_depth, channels, sample_format="pcm"):
     ch_txt = "Mono" if channels == 1 else ("Stereo" if channels == 2 else f"{channels}ch")
     depth_txt = f"{bit_depth}f" if sample_format == "float" else f"{bit_depth}-bit"
     return f"{sr_txt} · {depth_txt} · {ch_txt}"
+
+
+def sanitize_filename_stem(raw_name):
+    """Sanitize a user-entered filename stem (rejects paths, slashes, and control characters)."""
+    name = str(raw_name).strip()
+    if not name or "/" in name or "\\" in name or os.sep in name:
+        return ""
+    if name.lower().endswith(".wav"):
+        name = name[:-4].strip()
+    cleaned = re.sub(r'[<>:"|?*\x00-\x1f]', "_", name).strip(" .")
+    if cleaned in ("", ".", ".."):
+        return ""
+    return cleaned
+
+
+def unique_recording_paths(base_dir, base_name, armed_indices):
+    """Generate non-colliding WAV paths for all armed channels so earlier takes are never overwritten."""
+    suffix = ""
+    take = 1
+    while True:
+        candidates = []
+        collision = False
+        for idx in armed_indices:
+            fname = f"{base_name}{suffix}_ch{idx + 1}.wav"
+            fpath = os.path.join(base_dir, fname)
+            if os.path.exists(fpath):
+                collision = True
+                break
+            candidates.append((fname, fpath))
+        if not collision:
+            return candidates
+        take += 1
+        suffix = f"_{take}"
+
+
+def _estimate_delay_tail_frames(delay_procs, session_rate, step_frames, max_tail_sec=15.0):
+    """Compute (min_tail_frames, max_tail_frames) accounting for delay time and feedback decay."""
+    max_delay_ms = 0.0
+    max_total_frames = 0
+    cap_frames = int(session_rate * max_tail_sec)
+    for proc in delay_procs:
+        delay_ms, fb, _mix = proc.get_params()
+        if delay_ms > max_delay_ms:
+            max_delay_ms = delay_ms
+        cycle_frames = max(1, int(delay_ms * session_rate / 1000.0))
+        if fb <= 1e-3:
+            cycles = 2
+        else:
+            cycles = max(2, int(math.ceil(math.log(1e-4) / math.log(min(0.99, fb)))) + 1)
+        est = min(cap_frames, cycle_frames * cycles + step_frames)
+        if est > max_total_frames:
+            max_total_frames = est
+    min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + step_frames
+    tail_frames = max(int(session_rate * 2.5), min_tail_frames * 2, max_total_frames)
+    return min_tail_frames, min(cap_frames, tail_frames)
+
+
+# Backward-compatible alias
+sanitize_filename = sanitize_filename_stem
+
 
 ChannelSnapshot = namedtuple(
     "ChannelSnapshot",
@@ -156,7 +249,6 @@ def pack_recorded_mono(raw_bytes, captured_fmt, target_bitdepth=16, target_sampl
                 out_24[off + 2] = (u >> 16) & 0xFF
                 off += 3
             return bytes(out_24)
-        # Widening 16-bit fallback -> 24-bit signed little-endian PCM
         n = len(raw_bytes) // 2
         out_24 = bytearray(n * 3)
         for i in range(n):
@@ -165,7 +257,6 @@ def pack_recorded_mono(raw_bytes, captured_fmt, target_bitdepth=16, target_sampl
             out_24[i * 3 + 2] = raw_bytes[i * 2 + 1]
         return bytes(out_24)
 
-    # 16-bit integer PCM
     if captured_fmt == "int16":
         return raw_bytes
     n = len(raw_bytes) // 4
@@ -188,28 +279,6 @@ def pack_recorded_mono(raw_bytes, captured_fmt, target_bitdepth=16, target_sampl
             q = -32768
         out16[i] = q
     return out16.tobytes()
-
-
-def _estimate_delay_tail_frames(delay_procs, session_rate, step_frames, max_tail_sec=15.0):
-    """Compute (min_tail_frames, max_tail_frames) accounting for delay time and feedback decay."""
-    max_delay_ms = 0.0
-    max_total_frames = 0
-    cap_frames = int(session_rate * max_tail_sec)
-    for proc in delay_procs:
-        delay_ms, fb, _mix = proc.get_params()
-        if delay_ms > max_delay_ms:
-            max_delay_ms = delay_ms
-        cycle_frames = max(1, int(delay_ms * session_rate / 1000.0))
-        if fb <= 1e-3:
-            cycles = 2
-        else:
-            cycles = max(2, int(math.ceil(math.log(1e-4) / math.log(min(0.99, fb)))) + 1)
-        est = min(cap_frames, cycle_frames * cycles + step_frames)
-        if est > max_total_frames:
-            max_total_frames = est
-    min_tail_frames = int(max_delay_ms * session_rate / 1000.0) + step_frames
-    tail_frames = max(int(session_rate * 2.5), min_tail_frames * 2, max_total_frames)
-    return min_tail_frames, min(cap_frames, tail_frames)
 
 
 def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels, sample_format="pcm"):
@@ -480,69 +549,10 @@ class StreamingWavReader:
         self.wf.close()
 
 
-_INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
-
-
-def sanitize_filename_stem(raw_name):
-    """Sanitize user-entered filename stem; returns empty string if nothing valid remains."""
-    name = (raw_name or "").strip()
-    if name.lower().endswith(".wav"):
-        name = name[:-4].strip()
-    name = _INVALID_FILENAME_RE.sub("_", name)
-    name = name.strip(" .")
-    if name in ("", ".", ".."):
-        return ""
-    return name
-
-
-def unique_recording_paths(base_dir, stem, armed_indices):
-    """Return non-colliding (filename, full_path) pairs for all armed channels in a take."""
-    suffix = ""
-    counter = 2
-    while True:
-        candidates = [
-            (f"{stem}{suffix}_ch{idx + 1}.wav", os.path.join(base_dir, f"{stem}{suffix}_ch{idx + 1}.wav"))
-            for idx in armed_indices
-        ]
-        if not any(os.path.exists(p) for _, p in candidates):
-            return candidates
-        suffix = f"_{counter}"
-        counter += 1
-
-
-def format_timecode(seconds):
-    """Format seconds as MM:SS."""
-    sec_int = max(0, int(seconds))
-    mins, secs = divmod(sec_int, 60)
-    return f"{mins:02d}:{secs:02d}"
-
-
-def format_ruler_time(seconds, show_tenths=False):
-    """Format ruler tick label as MM:SS or MM:SS.t when zoomed in."""
-    sec = max(0.0, float(seconds))
-    if not show_tenths:
-        return format_timecode(sec)
-    mins = int(sec // 60)
-    rem = sec - mins * 60
-    return f"{mins:02d}:{rem:04.1f}"
-
-
-def format_peak_db(linear_peak):
-    """Format a linear sample peak as dBFS (e.g. '-11.3 dB', '+0.1 dB', '-∞ dB')."""
-    val = float(linear_peak)
-    if val <= 1e-4:
-        return "-∞ dB"
-    db = 20.0 * math.log10(val)
-    if db <= -60.0:
-        return "-∞ dB"
-    if db >= 0.0:
-        return f"+{db:.1f} dB" if db >= 0.05 else "0.0 dB"
-    return f"{db:.1f} dB"
-
-
-def extract_waveform_peaks(filepath, num_bins=2400):
+def extract_waveform_peaks(filepath, num_bins=2400, start_sec=None, end_sec=None):
     """
     Fast stdlib WAV envelope extractor for pro DAW waveform display.
+    Supports both full-file overview extraction and high-resolution zoomed window extraction.
     Returns (bins_list, duration_sec) where each bin is (min_val, max_val, rms_val) in [-1.0, 1.0].
     """
     with open_wav_read(filepath) as wf:
@@ -555,33 +565,72 @@ def extract_waveform_peaks(filepath, num_bins=2400):
         if nframes <= 0:
             return [], 0.0
 
-        bins = min(int(num_bins), nframes)
-        frames_per_bin = nframes / float(bins)
-        sample_cap = 256
+        if start_sec is None:
+            win_start_f = 0
+        else:
+            win_start_f = max(0, min(nframes - 1, int(math.floor(float(start_sec) * fr))))
+
+        if end_sec is None:
+            win_end_f = nframes
+        else:
+            win_end_f = max(win_start_f + 1, min(nframes, int(math.ceil(float(end_sec) * fr))))
+
+        span_frames = win_end_f - win_start_f
+        if span_frames <= 0:
+            return [], duration_sec
+
+        bins = min(int(num_bins), span_frames)
+        frames_per_bin = span_frames / float(bins)
+        # Read every sample when zoomed in; cap per-bin read for fast full-file overview
+        sample_cap = 256 if start_sec is None else 512
         envelope = [(0.0, 0.0, 0.0)] * bins
 
-        for b in range(bins):
-            start_f = int(b * frames_per_bin)
-            end_f = int((b + 1) * frames_per_bin)
-            count = max(1, min(sample_cap, end_f - start_f))
-            if frames_per_bin > sample_cap:
+        if frames_per_bin <= sample_cap:
+            # Contiguous read: seek once and decode chunks sequentially (very fast when zoomed in!)
+            wf.setpos(win_start_f)
+            prev_f = win_start_f
+            for b in range(bins):
+                end_f = win_start_f + int((b + 1) * frames_per_bin)
+                count = max(1, end_f - prev_f)
+                prev_f += count
+                raw = wf.readframes(count)
+                if not raw:
+                    break
+                mono = decode_pcm_to_mono_float(raw, sw, nch, sfmt)
+                if mono:
+                    lo = 0.0
+                    hi = 0.0
+                    sum_sq = 0.0
+                    for s in mono:
+                        if s < lo:
+                            lo = s
+                        if s > hi:
+                            hi = s
+                        sum_sq += s * s
+                    rms = math.sqrt(sum_sq / float(len(mono)))
+                    envelope[b] = (max(-1.0, lo), min(1.0, hi), min(1.0, rms))
+        else:
+            for b in range(bins):
+                start_f = win_start_f + int(b * frames_per_bin)
+                end_f = win_start_f + int((b + 1) * frames_per_bin)
+                count = max(1, min(sample_cap, end_f - start_f))
                 wf.setpos(start_f)
-            raw = wf.readframes(count)
-            if not raw:
-                break
-            mono = decode_pcm_to_mono_float(raw, sw, nch, sfmt)
-            if mono:
-                lo = 0.0
-                hi = 0.0
-                sum_sq = 0.0
-                for s in mono:
-                    if s < lo:
-                        lo = s
-                    if s > hi:
-                        hi = s
-                    sum_sq += s * s
-                rms = math.sqrt(sum_sq / float(len(mono)))
-                envelope[b] = (max(-1.0, lo), min(1.0, hi), min(1.0, rms))
+                raw = wf.readframes(count)
+                if not raw:
+                    break
+                mono = decode_pcm_to_mono_float(raw, sw, nch, sfmt)
+                if mono:
+                    lo = 0.0
+                    hi = 0.0
+                    sum_sq = 0.0
+                    for s in mono:
+                        if s < lo:
+                            lo = s
+                        if s > hi:
+                            hi = s
+                        sum_sq += s * s
+                    rms = math.sqrt(sum_sq / float(len(mono)))
+                    envelope[b] = (max(-1.0, lo), min(1.0, hi), min(1.0, rms))
 
         return envelope, duration_sec
 
@@ -608,11 +657,6 @@ def mix_stereo_chunk(
     Process per-channel mono float chunks through enabled effects, polarity inversion,
     mute/solo logic, volume faders, constant-power stereo panning, master gain, and sum
     to 16-bit stereo PCM bytes.
-
-    - out_levels (optional list of 4 floats): per-channel post-fader VU-calibrated RMS.
-    - out_peaks (optional list of 4 floats): per-channel post-fader true sample peak.
-    - out_master_levels (optional list of 2 floats): post-master-fader [L, R] VU-calibrated RMS.
-    - out_master_peaks (optional list of 2 floats): pre-clip post-master-fader [L, R] true sample peak.
     """
     if out_levels is not None:
         for i in range(len(out_levels)):
@@ -670,7 +714,6 @@ def mix_stereo_chunk(
     for i, snap in enumerate(snapshots):
         chunk = channel_chunks[i]
         if not chunk:
-            # If channel had a loaded file that already ended, only keep feeding zeros if Delay/Chorus is active
             if snap.filepath and (snap.delay_enabled or snap.chorus_enabled):
                 samples = _dsp.alloc_f64(max_len) if use_c else [0.0] * max_len
             else:
@@ -685,7 +728,6 @@ def mix_stereo_chunk(
             samples = chunk
         prepared.append((i, snap, samples))
 
-    # When offline-bouncing with the GIL-releasing C accelerator, run independent channel FX in parallel
     has_parallel_fx = (
         fx_executor is not None
         and use_c
@@ -709,16 +751,13 @@ def mix_stereo_chunk(
         ]
 
     for i, snap, samples in processed:
-        # Standard mixer Mute / Solo logic
         is_audible = (not snap.mute) and (not any_solo or snap.solo)
         if not is_audible or snap.volume <= 0.0:
             continue
 
-        # Polarity inversion + channel fader gain
         gain = -snap.volume if snap.polarity_invert else snap.volume
         abs_gain = abs(gain)
 
-        # Constant-power panning: 0.0 = Full Left, 0.5 = Center, 1.0 = Full Right
         angle = snap.pan * half_pi
         l_gain = gain * math.cos(angle)
         r_gain = gain * math.sin(angle)
@@ -781,7 +820,6 @@ def mix_stereo_chunk(
                 master_left[j] += s * l_gain
                 master_right[j] += s * r_gain
 
-    # Apply master fader, optional master safety limiter, metering, dither/round, clip, and pack output
     m_gain = float(master_gain)
     if master_limiter is not None:
         master_limiter.process_stereo_inplace(
@@ -1121,1151 +1159,101 @@ class ChannelState:
             )
 
 
-class ChannelMeter:
-    """Segmented vertical LED dBFS level meter with peak-hold indicator."""
+class _UiBridge(QObject):
+    """Thread-safe queued Qt signal dispatcher replacing Tkinter's root.after(0, ...)."""
 
-    def __init__(self, parent, width=16, height=154, segments=22):
-        self.width = width
-        self.height = height
-        self.segments = segments
+    invoke = Signal(object, tuple, dict)
 
-        self.canvas = tk.Canvas(
-            parent,
-            width=width,
-            height=height,
-            bg="#101c28",
-            bd=0,
-            highlightthickness=1,
-            highlightbackground="#36536e",
-        )
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._active = True
+        self.invoke.connect(self._execute, Qt.ConnectionType.QueuedConnection)
 
-        self._seg_ids = []
-        self._lit_colors = []
-        self._dim_colors = []
-        self._seg_lit = [False] * segments
+    def shutdown(self):
+        self._active = False
 
-        pad_x = 2
-        pad_y = 3
-        usable_h = height - 2 * pad_y
-        step = usable_h / float(segments)
-        gap = 1.5
-
-        for idx in range(segments):
-            # idx 0 is bottom (-60 dB), idx segments-1 is top (0 dB / Clip)
-            y_bottom = height - pad_y - idx * step
-            y_top = y_bottom - step + gap
-            frac = (idx + 1) / float(segments)
-            if frac >= 0.88:
-                lit_c, dim_c = "#f24957", "#361920"
-            elif frac >= 0.70:
-                lit_c, dim_c = "#f5c542", "#332d18"
-            else:
-                lit_c, dim_c = "#2ecc71", "#163026"
-
-            rect_id = self.canvas.create_rectangle(
-                pad_x, y_top, width - pad_x, y_bottom, fill=dim_c, outline=""
-            )
-            self._seg_ids.append(rect_id)
-            self._lit_colors.append(lit_c)
-            self._dim_colors.append(dim_c)
-
-        self._peak_seg = -1
-        self._displayed_level = 0.0
-        self._peak_hold = 0.0
-        self._hold_ticks = 0
-
-    @staticmethod
-    def linear_to_norm(linear_peak):
-        """Convert linear amplitude peak to normalized [0.0, 1.0] on a -60..0 dBFS scale."""
-        if not math.isfinite(linear_peak) or linear_peak <= 1e-4:
-            return 0.0
-        db = 20.0 * math.log10(linear_peak)
-        if db <= -60.0:
-            return 0.0
-        if db >= 0.0:
-            return 1.0
-        return (db + 60.0) / 60.0
-
-    def update_level(self, linear_level):
-        """Update LED segments with smooth ~300 ms VU-style ballistics and peak hold."""
-        target = self.linear_to_norm(linear_level)
-
-        # Smooth VU ballistics (~300 ms rise & fall at 30 FPS for easy readability)
-        if target >= self._displayed_level:
-            self._displayed_level += 0.24 * (target - self._displayed_level)
-        else:
-            self._displayed_level += 0.18 * (target - self._displayed_level)
-
-        if self._displayed_level < 0.008 and target == 0.0:
-            self._displayed_level = 0.0
-
-        # Subtle slow peak-hold indicator (~0.8s hold at 30 FPS)
-        if target >= self._peak_hold:
-            self._peak_hold = target
-            self._hold_ticks = 24
-        elif self._hold_ticks > 0:
-            self._hold_ticks -= 1
-        else:
-            self._peak_hold *= 0.92
-            if self._peak_hold < 0.01:
-                self._peak_hold = 0.0
-
-        lit_count = int(round(self._displayed_level * self.segments))
-        if lit_count > self.segments:
-            lit_count = self.segments
-
-        new_peak_seg = (
-            min(self.segments - 1, int(round(self._peak_hold * self.segments)) - 1)
-            if self._peak_hold > 0.02
-            else -1
-        )
-
-        # Redraw only segments whose visual state changed
-        for i in range(self.segments):
-            should_be_lit = i < lit_count
-            is_peak_marker = i == new_peak_seg
-            was_peak_marker = i == self._peak_seg
-
-            if should_be_lit != self._seg_lit[i] or is_peak_marker != was_peak_marker:
-                if is_peak_marker and not should_be_lit:
-                    # Peak-hold floating LED
-                    color = "#ff7a85" if i >= int(self.segments * 0.88) else "#eef7ff"
-                elif should_be_lit:
-                    color = self._lit_colors[i]
-                else:
-                    color = self._dim_colors[i]
-                self.canvas.itemconfig(self._seg_ids[i], fill=color)
-                self._seg_lit[i] = should_be_lit
-
-        self._peak_seg = new_peak_seg
-
-    def reset(self):
-        self._displayed_level = 0.0
-        self._peak_hold = 0.0
-        self._hold_ticks = 0
-        self.update_level(0.0)
-
-
-class PeakReadout:
-    """Numeric dBFS peak indicator with ~2.5s hold/auto-clear and red digital clip alert."""
-
-    HOLD_SECONDS = 2.5
-
-    def __init__(self, parent, width=8):
-        self._held_peak = 0.0
-        self._hold_until = 0.0
-        self._last_text = "-∞ dB"
-        self._last_state = "idle"
-
-        self.var = tk.StringVar(value="-∞ dB")
-        self.label = tk.Label(
-            parent,
-            textvariable=self.var,
-            bg="#12202d",
-            fg="#6886a3",
-            font=("Helvetica", 8, "bold"),
-            width=width,
-            pady=2,
-            cursor="hand2",
-            highlightthickness=1,
-            highlightbackground="#2c465e",
-        )
-        # Clicking clears peak / clip alert immediately
-        self.label.bind("<Button-1>", lambda _e: self.clear())
-
-    def update(self, linear_peak, now=None):
-        """Feed latest true sample peak; holds highest peak for 2.5s then auto-clears."""
-        if now is None:
-            now = time.monotonic()
-
-        pk = float(linear_peak)
-        if pk >= self._held_peak and pk > 1e-4:
-            self._held_peak = pk
-            self._hold_until = now + self.HOLD_SECONDS
-        elif now >= self._hold_until:
-            # Hold window expired -> clear back to current live peak (or -∞ if silent)
-            if pk > 1e-4:
-                self._held_peak = pk
-                self._hold_until = now + self.HOLD_SECONDS
-            else:
-                self._held_peak = 0.0
-
-        self._render()
-
-    def clear(self):
-        self._held_peak = 0.0
-        self._hold_until = 0.0
-        self._render()
-
-    def _render(self):
-        pk = self._held_peak
-        txt = format_peak_db(pk)
-        if pk <= 1e-4 or txt == "-∞ dB":
-            state = "idle"
-            bg, fg, bd = "#12202d", "#6886a3", "#2c465e"
-        elif pk >= 0.999:
-            state = "clip"
-            bg, fg, bd = "#b82530", "#ffffff", "#ff858f"
-        else:
-            db = 20.0 * math.log10(pk)
-            if db >= -3.0:
-                state = "hot"
-                bg, fg, bd = "#12202d", "#ffd166", "#8a6f28"
-            else:
-                state = "normal"
-                bg, fg, bd = "#12202d", "#9be7c4", "#345470"
-
-        if txt != self._last_text:
-            self.var.set(txt)
-            self._last_text = txt
-        if state != self._last_state:
-            self.label.config(bg=bg, fg=fg, highlightbackground=bd)
-            self._last_state = state
-
-
-class WaveformTimeline:
-    """
-    Pro Tools / Logic Pro-style 4-track waveform arrange view with dual-layer filled
-    Peak + RMS polygons, clip title bars, muted region dimming, time ruler, horizontal
-    zoom & pan scrollbar, smooth moving playhead, live recording waveform, and scrubbing.
-    """
-
-    # (accent_stripe, clip_bg, header_bg, peak_fill, rms_fill)
-    TRACK_THEMES = [
-        ("#4da3ff", "#152a3f", "#1d3b59", "#3478bd", "#6eb8ff"),  # Ch 1: Sky Blue
-        ("#48d18a", "#142f26", "#1b4436", "#2c8f5e", "#6ee3a5"),  # Ch 2: Emerald
-        ("#f5c542", "#2f2916", "#453b1c", "#b58d26", "#ffe07d"),  # Ch 3: Amber Gold
-        ("#a375ff", "#251c3a", "#352654", "#7049bf", "#bfa0ff"),  # Ch 4: Violet
-    ]
-    DIM_THEME = ("#586e82", "#17222d", "#1e2c3a", "#364b5e", "#4e677d")
-    HEADER_W = 56
-    RULER_H = 18
-    LANE_H = 40
-    CLIP_HDR_H = 11
-    PAD_RIGHT = 8
-    SCROLL_H = 10
-    MIN_ZOOM = 1.0
-    MAX_ZOOM = 32.0
-    MIN_VZOOM = 1.0
-    MAX_VZOOM = 16.0
-
-    def __init__(self, parent, on_seek, bg="#0e1822"):
-        self.on_seek = on_seek
-        self._bg = bg
-        self._duration = 0.0
-        self._view_duration = 0.0
-        self._position = 0.0
-        self._dragging = False
-
-        # Horizontal zoom & viewport pan state
-        self._zoom = 1.0
-        self._vzoom = 1.0
-        self._view_start = 0.0
-        self._scroll_dragging = False
-        self._scroll_drag_offset = 0.0
-
-        # Per-channel static loaded waveforms: (envelope_list, track_duration_sec, filename)
-        self._tracks = [None, None, None, None]
-        self._audible = [True, True, True, True]
-
-        # Live recording overlay state
-        self._rec_armed = []
-        self._rec_peaks = []
-        self._rec_elapsed = 0.0
-        self._rec_active = False
-
-        total_canvas_h = self.RULER_H + self.LANE_H * 4
-
-        self.frame = tk.Frame(
-            parent,
-            bg="#182836",
-            highlightthickness=1,
-            highlightbackground="#3c5c78",
-        )
-
-        # Compact header bar with zoom controls and timecode display
-        top_bar = tk.Frame(self.frame, bg="#1b2d3e", height=24, padx=10)
-        top_bar.pack(fill=tk.X)
-        top_bar.pack_propagate(False)
-
-        tk.Label(
-            top_bar,
-            text="ARRANGE  ·  WAVEFORMS  (DRAG TO SCRUB · SCROLL / ± TO ZOOM)",
-            bg="#1b2d3e",
-            fg="#8eb0cf",
-            font=("Helvetica", 8, "bold"),
-        ).pack(side=tk.LEFT)
-
-        self.dur_var = tk.StringVar(value="00:00")
-        tk.Label(
-            top_bar,
-            textvariable=self.dur_var,
-            bg="#1b2d3e",
-            fg="#9cb8d1",
-            font=("Helvetica", 9, "bold"),
-        ).pack(side=tk.RIGHT)
-
-        tk.Label(
-            top_bar,
-            text=" / ",
-            bg="#1b2d3e",
-            fg="#5c7b99",
-            font=("Helvetica", 9, "bold"),
-        ).pack(side=tk.RIGHT)
-
-        self.pos_var = tk.StringVar(value="00:00")
-        tk.Label(
-            top_bar,
-            textvariable=self.pos_var,
-            bg="#1b2d3e",
-            fg="#7ef2b8",
-            font=("Helvetica", 9, "bold"),
-        ).pack(side=tk.RIGHT)
-
-        # Compact studio horizontal + vertical waveform zoom controls
-        zoom_bar = tk.Frame(top_bar, bg="#1b2d3e")
-        zoom_bar.pack(side=tk.RIGHT, padx=(0, 12))
-
-        self._make_zoom_btn(zoom_bar, "Fit", self.reset_zoom, padx=5).pack(
-            side=tk.RIGHT, padx=(2, 0)
-        )
-        self._make_zoom_btn(zoom_bar, "+", self.zoom_in, padx=5).pack(
-            side=tk.RIGHT, padx=(2, 0)
-        )
-
-        self.zoom_var = tk.StringVar(value="1.0×")
-        zoom_lbl = tk.Label(
-            zoom_bar,
-            textvariable=self.zoom_var,
-            bg="#12202d",
-            fg="#9bd2ff",
-            font=("Helvetica", 8, "bold"),
-            width=5,
-            cursor="hand2",
-            highlightthickness=1,
-            highlightbackground="#33506b",
-        )
-        zoom_lbl.pack(side=tk.RIGHT, padx=(2, 0))
-        zoom_lbl.bind("<Button-1>", lambda _e: self.reset_zoom())
-
-        self._make_zoom_btn(zoom_bar, "−", self.zoom_out, padx=5).pack(side=tk.RIGHT)
-
-        tk.Label(
-            zoom_bar,
-            text="H-ZOOM",
-            bg="#1b2d3e",
-            fg="#6e8fad",
-            font=("Helvetica", 7, "bold"),
-        ).pack(side=tk.RIGHT, padx=(0, 4))
-
-        tk.Label(
-            zoom_bar,
-            text="│",
-            bg="#1b2d3e",
-            fg="#36536e",
-            font=("Helvetica", 8),
-        ).pack(side=tk.RIGHT, padx=(4, 6))
-
-        self._make_zoom_btn(zoom_bar, "1×", self.reset_vertical_zoom, padx=5).pack(
-            side=tk.RIGHT, padx=(2, 0)
-        )
-        self._make_zoom_btn(zoom_bar, "Fit", self.fit_vertical_zoom, padx=5).pack(
-            side=tk.RIGHT, padx=(2, 0)
-        )
-        self._make_zoom_btn(zoom_bar, "+", self.vzoom_in, padx=5).pack(
-            side=tk.RIGHT, padx=(2, 0)
-        )
-
-        self.vzoom_var = tk.StringVar(value="1.0×")
-        vzoom_lbl = tk.Label(
-            zoom_bar,
-            textvariable=self.vzoom_var,
-            bg="#12202d",
-            fg="#8cf5c0",
-            font=("Helvetica", 8, "bold"),
-            width=5,
-            cursor="hand2",
-            highlightthickness=1,
-            highlightbackground="#33506b",
-        )
-        vzoom_lbl.pack(side=tk.RIGHT, padx=(2, 0))
-        vzoom_lbl.bind("<Button-1>", lambda _e: self.reset_vertical_zoom())
-
-        self._make_zoom_btn(zoom_bar, "−", self.vzoom_out, padx=5).pack(side=tk.RIGHT)
-
-        tk.Label(
-            zoom_bar,
-            text="V-ZOOM",
-            bg="#1b2d3e",
-            fg="#6e8fad",
-            font=("Helvetica", 7, "bold"),
-        ).pack(side=tk.RIGHT, padx=(0, 4))
-
-        # Main 4-track waveform canvas
-        self.canvas = tk.Canvas(
-            self.frame,
-            height=total_canvas_h,
-            bg=bg,
-            bd=0,
-            highlightthickness=0,
-            cursor="hand2",
-        )
-        self.canvas.pack(fill=tk.X, expand=True)
-
-        # Slim horizontal overview / pan scrollbar below lanes
-        self.scroll_canvas = tk.Canvas(
-            self.frame,
-            height=self.SCROLL_H,
-            bg="#12202d",
-            bd=0,
-            highlightthickness=0,
-            cursor="hand2",
-        )
-        self.scroll_canvas.pack(fill=tk.X)
-        self._scroll_thumb = self.scroll_canvas.create_rectangle(
-            self.HEADER_W,
-            2,
-            1080,
-            self.SCROLL_H - 2,
-            fill="#22364a",
-            outline="",
-        )
-
-        # Persistent playhead items (only these 2 move at 30 FPS!)
-        self._playhead_line = self.canvas.create_line(
-            self.HEADER_W,
-            self.RULER_H - 2,
-            self.HEADER_W,
-            total_canvas_h,
-            fill="#eef7ff",
-            width=2,
-            tags=("playhead",),
-        )
-        self._playhead_cap = self.canvas.create_polygon(
-            self.HEADER_W - 5,
-            3,
-            self.HEADER_W + 5,
-            3,
-            self.HEADER_W,
-            self.RULER_H - 1,
-            fill="#48d18a",
-            outline="#eef7ff",
-            tags=("playhead",),
-        )
-
-        self.canvas.bind("<Configure>", lambda _e: self.redraw_waveforms())
-        self.canvas.bind("<ButtonPress-1>", self._on_press)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
-        self.canvas.bind("<Shift-MouseWheel>", self._on_shift_wheel)
-        self.canvas.bind("<Button-4>", self._on_wheel_up)
-        self.canvas.bind("<Button-5>", self._on_wheel_down)
-
-        self.scroll_canvas.bind("<Configure>", lambda _e: self._draw_scrollbar())
-        self.scroll_canvas.bind("<ButtonPress-1>", self._on_scroll_press)
-        self.scroll_canvas.bind("<B1-Motion>", self._on_scroll_drag)
-        self.scroll_canvas.bind("<ButtonRelease-1>", self._on_scroll_release)
-
-        self.redraw_waveforms()
-
-    @staticmethod
-    def _make_zoom_btn(parent, text, command, padx=5):
-        base_bg = "#23384c"
-        hover_bg = "#304f6b"
-        active_bg = "#162636"
-        lbl = tk.Label(
-            parent,
-            text=text,
-            bg=base_bg,
-            fg="#dcecf9",
-            font=("Helvetica", 8, "bold"),
-            padx=padx,
-            pady=0,
-            cursor="hand2",
-            highlightthickness=1,
-            highlightbackground="#3c5c78",
-        )
-        lbl.bind("<Enter>", lambda _e: lbl.config(bg=hover_bg, fg="#ffffff"))
-        lbl.bind("<Leave>", lambda _e: lbl.config(bg=base_bg, fg="#dcecf9"))
-        lbl.bind("<ButtonPress-1>", lambda _e: lbl.config(bg=active_bg))
-
-        def on_release(event):
+    def post(self, fn, *args, **kwargs):
+        if self._active:
             try:
-                x = event.x_root - lbl.winfo_rootx()
-                y = event.y_root - lbl.winfo_rooty()
-                inside = 0 <= x <= lbl.winfo_width() and 0 <= y <= lbl.winfo_height()
-            except Exception:
-                inside = True
-            lbl.config(bg=hover_bg if inside else base_bg, fg="#ffffff" if inside else "#dcecf9")
-            if inside:
-                command()
+                self.invoke.emit(fn, args, kwargs)
+            except RuntimeError:
+                self._active = False
 
-        lbl.bind("<ButtonRelease-1>", on_release)
-        return lbl
+    def _execute(self, fn, args, kwargs):
+        if self._active:
+            fn(*args, **kwargs)
 
-    def _lane_span(self):
-        w = self.canvas.winfo_width()
-        if w <= self.HEADER_W + 40:
-            w = 1090
-        return w, max(1.0, float(w - self.HEADER_W - self.PAD_RIGHT))
 
-    def _effective_duration(self):
-        if self._rec_active:
-            return max(self._duration, self._rec_elapsed, 8.0)
-        return self._duration
+class _MainWindow(QMainWindow):
+    """QMainWindow wrapper handling Spacebar transport shortcut, focus release, and clean shutdown."""
 
-    def _visible_window(self):
-        eff_dur = self._effective_duration()
-        if eff_dur <= 0.0:
-            self._view_start = 0.0
-            return 0.0, 0.0, 0.0, 0.0
-        vis_dur = eff_dur / self._zoom
-        max_start = max(0.0, eff_dur - vis_dur)
-        if self._view_start < 0.0:
-            self._view_start = 0.0
-        elif self._view_start > max_start:
-            self._view_start = max_start
-        return self._view_start, self._view_start + vis_dur, vis_dur, eff_dur
+    def __init__(self, controller):
+        super().__init__()
+        self._controller = controller
+        self._close_handled = False
 
-    def _sec_to_x(self, sec):
-        _, span = self._lane_span()
-        v_start, _, vis_dur, _ = self._visible_window()
-        if vis_dur <= 0.0:
-            return float(self.HEADER_W)
-        return self.HEADER_W + ((float(sec) - v_start) / vis_dur) * span
-
-    def _x_to_sec(self, x):
-        _, span = self._lane_span()
-        v_start, _, vis_dur, eff_dur = self._visible_window()
-        if eff_dur <= 0.0 or vis_dur <= 0.0:
-            return 0.0
-        frac = max(0.0, min(1.0, (x - self.HEADER_W) / span))
-        return max(0.0, min(eff_dur, v_start + frac * vis_dur))
-
-    # ---------- Zoom & Pan API ----------
-
-    def get_zoom(self):
-        return self._zoom
-
-    def set_zoom(self, new_zoom, anchor_sec=None, anchor_frac=None):
-        """Set horizontal zoom factor [1.0..32.0], keeping anchor_sec pinned at anchor_frac."""
-        clamped = max(self.MIN_ZOOM, min(self.MAX_ZOOM, float(new_zoom)))
-        if abs(clamped - 1.0) < 0.02:
-            clamped = 1.0
-
-        v_start, _, vis_dur, eff_dur = self._visible_window()
-        if eff_dur > 0.0:
-            if anchor_sec is None:
-                anchor_sec = self._position if (v_start <= self._position <= v_start + vis_dur) else (v_start + vis_dur * 0.5)
-            if anchor_frac is None:
-                anchor_frac = ((anchor_sec - v_start) / vis_dur) if vis_dur > 0.0 else 0.5
-            anchor_frac = max(0.0, min(1.0, float(anchor_frac)))
-            new_vis = eff_dur / clamped
-            new_start = anchor_sec - anchor_frac * new_vis
-            self._zoom = clamped
-            self._view_start = max(0.0, min(max(0.0, eff_dur - new_vis), new_start))
-        else:
-            self._zoom = clamped
-            self._view_start = 0.0
-
-        self.zoom_var.set(f"{self._zoom:.1f}×" if self._zoom < 10.0 else f"{int(round(self._zoom))}×")
-        self.redraw_waveforms()
-
-    def zoom_in(self, factor=1.5):
-        self.set_zoom(self._zoom * factor)
-
-    def zoom_out(self, factor=1.5):
-        self.set_zoom(self._zoom / factor)
-
-    def reset_zoom(self):
-        self._zoom = 1.0
-        self._view_start = 0.0
-        self.zoom_var.set("1.0×")
-        self.redraw_waveforms()
-
-    def get_vertical_zoom(self):
-        return self._vzoom
-
-    def set_vertical_zoom(self, factor):
-        new_vz = max(self.MIN_VZOOM, min(self.MAX_VZOOM, float(factor)))
-        if abs(new_vz - self._vzoom) < 1e-4:
+    def keyPressEvent(self, event):
+        if (
+            event.key() == Qt.Key.Key_Space
+            and not event.isAutoRepeat()
+            and not self._controller.nameBox.hasFocus()
+        ):
+            self._controller._on_space_key()
+            event.accept()
             return
-        self._vzoom = new_vz
-        self.vzoom_var.set(f"{new_vz:.1f}×" if new_vz < 10.0 else f"{new_vz:.0f}×")
-        self.redraw_waveforms()
+        super().keyPressEvent(event)
 
-    def vzoom_in(self):
-        self.set_vertical_zoom(self._vzoom * 1.4)
-
-    def vzoom_out(self):
-        self.set_vertical_zoom(self._vzoom / 1.4)
-
-    def reset_vertical_zoom(self):
-        self.set_vertical_zoom(1.0)
-
-    def fit_vertical_zoom(self):
-        """Auto-scale waveform display vertically so loudest loaded peak fills ~92% of lane height."""
-        max_pk = 0.0
-        for track in self._tracks:
-            if track is None:
-                continue
-            for it in track[0]:
-                if isinstance(it, tuple):
-                    p = max(abs(it[0]), abs(it[1]))
-                else:
-                    p = abs(float(it))
-                if p > max_pk:
-                    max_pk = p
-        if max_pk <= 1e-4:
-            self.reset_vertical_zoom()
-            return
-        target = max(self.MIN_VZOOM, min(self.MAX_VZOOM, 0.92 / max_pk))
-        if abs(self._vzoom - target) < 0.05 and self._vzoom > 1.05:
-            self.reset_vertical_zoom()
-        else:
-            self.set_vertical_zoom(target)
-
-    def zoom_at_x(self, factor, x):
-        _, span = self._lane_span()
-        frac = max(0.0, min(1.0, (x - self.HEADER_W) / span))
-        anchor_sec = self._x_to_sec(x)
-        self.set_zoom(self._zoom * factor, anchor_sec=anchor_sec, anchor_frac=frac)
-
-    def pan_by_fraction(self, view_frac):
-        """Pan viewport horizontally by a fraction of the current visible duration."""
-        if self._zoom <= 1.0:
-            return
-        v_start, _, vis_dur, eff_dur = self._visible_window()
-        if eff_dur <= 0.0:
-            return
-        max_start = max(0.0, eff_dur - vis_dur)
-        new_start = max(0.0, min(max_start, v_start + float(view_frac) * vis_dur))
-        if abs(new_start - self._view_start) > 1e-6:
-            self._view_start = new_start
-            self.redraw_waveforms()
-
-    def _on_mouse_wheel(self, event):
-        if self._effective_duration() <= 0.0:
-            return
-        delta = getattr(event, "delta", 0)
-        if delta == 0:
-            return
-        step = 1 if delta > 0 else -1
-        if event.state & 0x0001:  # Shift held -> horizontal pan
-            self.pan_by_fraction(-step * 0.14)
-        else:
-            self.zoom_at_x(1.25 if step > 0 else (1.0 / 1.25), event.x)
-
-    def _on_shift_wheel(self, event):
-        if self._effective_duration() <= 0.0:
-            return
-        delta = getattr(event, "delta", 0)
-        if delta != 0:
-            step = 1 if delta > 0 else -1
-            self.pan_by_fraction(-step * 0.14)
-
-    def _on_wheel_up(self, event):
-        if self._effective_duration() <= 0.0:
-            return
-        if event.state & 0x0001:
-            self.pan_by_fraction(-0.14)
-        else:
-            self.zoom_at_x(1.25, event.x)
-
-    def _on_wheel_down(self, event):
-        if self._effective_duration() <= 0.0:
-            return
-        if event.state & 0x0001:
-            self.pan_by_fraction(0.14)
-        else:
-            self.zoom_at_x(1.0 / 1.25, event.x)
-
-    # ---------- Horizontal Overview Scrollbar ----------
-
-    def _thumb_bounds(self):
-        _, span = self._lane_span()
-        v_start, _, vis_dur, eff_dur = self._visible_window()
-        if eff_dur <= 0.0 or self._zoom <= 1.0:
-            return float(self.HEADER_W), float(self.HEADER_W) + span
-        thumb_w = max(24.0, (vis_dur / eff_dur) * span)
-        max_start = max(1e-9, eff_dur - vis_dur)
-        avail_travel = max(0.0, span - thumb_w)
-        x0 = self.HEADER_W + (v_start / max_start) * avail_travel
-        return x0, x0 + thumb_w
-
-    def _draw_scrollbar(self):
-        try:
-            x0, x1 = self._thumb_bounds()
-            fill = "#5489bd" if self._scroll_dragging else ("#3d6891" if self._zoom > 1.0 else "#22364a")
-            self.scroll_canvas.coords(self._scroll_thumb, x0, 2, x1, self.SCROLL_H - 2)
-            self.scroll_canvas.itemconfig(self._scroll_thumb, fill=fill)
-        except Exception:
-            pass
-
-    def _on_scroll_press(self, event):
-        if self._zoom <= 1.0 or self._effective_duration() <= 0.0:
-            return
-        x0, x1 = self._thumb_bounds()
-        self._scroll_dragging = True
-        if x0 <= event.x <= x1:
-            self._scroll_drag_offset = event.x - x0
-        else:
-            self._scroll_drag_offset = (x1 - x0) * 0.5
-            self._apply_scroll_x(event.x)
-        self._draw_scrollbar()
-
-    def _on_scroll_drag(self, event):
-        if not self._scroll_dragging:
-            return
-        self._apply_scroll_x(event.x)
-
-    def _on_scroll_release(self, _event):
-        if self._scroll_dragging:
-            self._scroll_dragging = False
-            self._draw_scrollbar()
-
-    def _apply_scroll_x(self, x):
-        _, span = self._lane_span()
-        _, _, vis_dur, eff_dur = self._visible_window()
-        if eff_dur <= 0.0 or self._zoom <= 1.0:
-            return
-        x0, x1 = self._thumb_bounds()
-        thumb_w = x1 - x0
-        avail_travel = max(1.0, span - thumb_w)
-        desired_x0 = max(float(self.HEADER_W), min(self.HEADER_W + avail_travel, x - self._scroll_drag_offset))
-        frac = (desired_x0 - self.HEADER_W) / avail_travel
-        self._view_start = frac * max(0.0, eff_dur - vis_dur)
-        self.redraw_waveforms()
-
-    def _on_press(self, event):
-        if self._rec_active or self._duration <= 0.0 or event.x < self.HEADER_W:
-            return
-        self._dragging = True
-        self._position = self._x_to_sec(event.x)
-        self._move_playhead_only()
-
-    def _on_drag(self, event):
-        if not self._dragging or self._duration <= 0.0:
-            return
-        self._position = self._x_to_sec(event.x)
-        self._move_playhead_only()
-
-    def _on_release(self, event):
-        if not self._dragging:
-            return
-        self._dragging = False
-        if self._duration > 0.0:
-            self._position = self._x_to_sec(event.x)
-            self._move_playhead_only()
-            self.on_seek(self._position)
-
-    def set_track_waveform(self, channel_idx, peaks, duration_sec, label=""):
-        if 0 <= channel_idx < 4:
-            self._tracks[channel_idx] = (list(peaks), float(duration_sec), label)
-            self.redraw_waveforms()
-
-    def clear_track(self, channel_idx):
-        if 0 <= channel_idx < 4:
-            self._tracks[channel_idx] = None
-            self.redraw_waveforms()
-
-    def set_audible_flags(self, audible_flags):
-        """Dim muted or non-soloed tracks in the Arrange view."""
-        new_flags = [bool(f) for f in audible_flags[:4]]
-        if new_flags != self._audible:
-            self._audible = new_flags
-            self.redraw_waveforms()
-
-    def set_duration(self, duration_sec):
-        self._duration = max(0.0, float(duration_sec))
-        if self._duration <= 0.0:
-            self._zoom = 1.0
-            self._view_start = 0.0
-            self.zoom_var.set("1.0×")
-        if self._position > self._duration and not self._rec_active:
-            self._position = self._duration
-        self.dur_var.set(format_timecode(self._duration))
-        self.redraw_waveforms()
-
-    def set_position(self, pos_sec, follow=False):
-        if self._dragging:
-            return
-        eff = self._effective_duration()
-        self._position = max(0.0, min(eff, float(pos_sec))) if eff > 0.0 else 0.0
-        if follow and self._zoom > 1.0 and eff > 0.0:
-            v_start, v_end, vis_dur, _ = self._visible_window()
-            if self._position < v_start or self._position > v_end - 0.05 * vis_dur:
-                max_start = max(0.0, eff - vis_dur)
-                self._view_start = max(0.0, min(max_start, self._position - 0.15 * vis_dur))
-                self.redraw_waveforms()
-                return
-        self._move_playhead_only()
-
-    def update_live_recording(self, active, armed_indices=(), peaks=(), elapsed_sec=0.0):
-        """Draw live growing crimson waveform on armed channel lane(s) during recording."""
-        self._rec_active = bool(active)
-        self._rec_armed = list(armed_indices) if active else []
-        self._rec_peaks = list(peaks) if active else []
-        self._rec_elapsed = float(elapsed_sec) if active else 0.0
-
-        if active:
-            self._position = self._rec_elapsed
-            v_start, v_end, vis_dur, eff_dur = self._visible_window()
-            self.dur_var.set(format_timecode(eff_dur))
-            need_redraw = abs(eff_dur - self._view_duration) > 0.5
-            if self._zoom > 1.0 and (self._position < v_start or self._position > v_end - 0.05 * vis_dur):
-                max_start = max(0.0, eff_dur - vis_dur)
-                self._view_start = max(0.0, min(max_start, self._position - 0.80 * vis_dur))
-                need_redraw = True
-            if need_redraw:
-                self.redraw_waveforms()
-            else:
-                self._draw_live_rec_overlay()
-                self._move_playhead_only()
-        else:
-            self.dur_var.set(format_timecode(self._duration))
-            self.redraw_waveforms()
-
-    def redraw_waveforms(self):
-        """Redraw ruler, 4 track lanes, and loaded waveforms for current zoom/pan viewport."""
-        try:
-            self.canvas.delete("static")
-            self.canvas.delete("rec_live")
-
-            w, span = self._lane_span()
-            total_h = self.RULER_H + self.LANE_H * 4
-            v_start, v_end, vis_dur, eff_dur = self._visible_window()
-            self._view_duration = eff_dur
-
-            # Time ruler background
-            self.canvas.create_rectangle(
-                0, 0, w, self.RULER_H, fill="#162534", outline="", tags=("static",)
-            )
-            self.canvas.create_line(
-                0, self.RULER_H - 1, w, self.RULER_H - 1, fill="#2e4963", tags=("static",)
-            )
-
-            # Vertical time grid ticks in ruler + subtle guides across lanes
-            num_ticks = 8
-            if eff_dur > 0.0 and vis_dur > 0.0:
-                show_tenths = vis_dur < 16.0
-                for t_idx in range(num_ticks + 1):
-                    frac = t_idx / float(num_ticks)
-                    gx = self.HEADER_W + frac * span
-                    tick_sec = v_start + frac * vis_dur
-                    self.canvas.create_line(
-                        gx, self.RULER_H, gx, total_h, fill="#162635", tags=("static",)
-                    )
-                    if t_idx < num_ticks:
-                        self.canvas.create_text(
-                            gx + 3,
-                            self.RULER_H // 2,
-                            text=format_ruler_time(tick_sec, show_tenths=show_tenths),
-                            fill="#6e8fad",
-                            font=("Helvetica", 7),
-                            anchor="w",
-                            tags=("static",),
-                        )
-
-            # Draw 4 horizontal track lanes
-            for ch in range(4):
-                y0 = self.RULER_H + ch * self.LANE_H
-                y1 = y0 + self.LANE_H
-                mid_y = (y0 + y1) * 0.5
-                is_aud = self._audible[ch]
-                stripe_col, clip_bg, hdr_bg, peak_col, rms_col = (
-                    self.TRACK_THEMES[ch] if is_aud else self.DIM_THEME
+    def eventFilter(self, watched, event):
+        etype = event.type()
+        name_box = getattr(self._controller, "nameBox", None)
+        if name_box is not None and name_box.hasFocus():
+            if etype == QEvent.Type.ShortcutOverride and event.key() == Qt.Key.Key_Escape:
+                # Prevent Transport -> Stop (Escape) menu shortcut from firing while typing in nameBox
+                event.accept()
+                return True
+            if etype == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
+                name_box.clearFocus()
+                return True
+            if etype == QEvent.Type.MouseButtonPress:
+                # Check actual clicked widget (handles QWidgetWindow events & QLineEdit context menu)
+                gp = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else None
+                clicked = QApplication.widgetAt(gp) if gp is not None else None
+                in_name_box = clicked is name_box or (
+                    clicked is not None and name_box.isAncestorOf(clicked)
                 )
-                base_stripe = self.TRACK_THEMES[ch][0]
-
-                # Lane alternating dark background
-                lane_bg = "#0f1a25" if ch % 2 == 0 else "#121f2d"
-                self.canvas.create_rectangle(
-                    self.HEADER_W, y0, w, y1, fill=lane_bg, outline="", tags=("static",)
+                in_popup_menu = clicked is not None and bool(
+                    clicked.windowFlags() & Qt.WindowType.Popup
                 )
-                # Track header box on the left
-                self.canvas.create_rectangle(
-                    0, y0, self.HEADER_W, y1, fill="#192a3b", outline="#263d54", tags=("static",)
-                )
-                self.canvas.create_rectangle(
-                    0, y0 + 1, 4, y1 - 1, fill=base_stripe if is_aud else "#4a5e70", outline="", tags=("static",)
-                )
-                self.canvas.create_text(
-                    30,
-                    mid_y,
-                    text=f"CH {ch + 1}",
-                    fill="#d4e5f5" if is_aud else "#6f869c",
-                    font=("Helvetica", 8, "bold"),
-                    tags=("static",),
-                )
-                # Subtle empty-lane center line & bottom divider
-                self.canvas.create_line(
-                    self.HEADER_W, mid_y, w - self.PAD_RIGHT, mid_y, fill="#172737", tags=("static",)
-                )
-                self.canvas.create_line(
-                    0, y1 - 1, w, y1 - 1, fill="#22364a", tags=("static",)
-                )
+                if not in_name_box and not in_popup_menu:
+                    name_box.clearFocus()
+        return super().eventFilter(watched, event)
 
-                # Draw Pro DAW audio clip region clipped to visible viewport [v_start, v_end]
-                track = self._tracks[ch]
-                if track is not None and eff_dur > 0.0 and vis_dur > 0.0:
-                    envelope, track_dur, clip_label = track
-                    if envelope and track_dur > 0.0:
-                        clip_t0 = max(0.0, v_start)
-                        clip_t1 = min(track_dur, v_end)
-                        if clip_t1 <= clip_t0:
-                            continue
-
-                        x_start = self.HEADER_W + ((clip_t0 - v_start) / vis_dur) * span
-                        x_end = self.HEADER_W + ((clip_t1 - v_start) / vis_dur) * span
-                        clip_w = max(2.0, x_end - x_start)
-                        x_end = x_start + clip_w
-
-                        cy0 = y0 + 2
-                        cy1 = y1 - 2
-                        wf_y0 = cy0 + self.CLIP_HDR_H
-                        wf_mid = (wf_y0 + cy1) * 0.5
-                        max_amp = max(2.0, (cy1 - wf_y0) * 0.5 - 1.5)
-
-                        # Clip body background
-                        self.canvas.create_rectangle(
-                            x_start, cy0, x_end, cy1,
-                            fill=clip_bg, outline=stripe_col, width=1, tags=("static",),
-                        )
-                        # Top clip title bar (Logic / Pro Tools region header)
-                        self.canvas.create_rectangle(
-                            x_start + 1, cy0 + 1, x_end - 1, wf_y0,
-                            fill=hdr_bg, outline="", tags=("static",),
-                        )
-                        if clip_label and clip_w > 34:
-                            max_chars = max(4, int((clip_w - 10) // 6))
-                            disp = clip_label if len(clip_label) <= max_chars else clip_label[: max_chars - 2] + ".."
-                            self.canvas.create_text(
-                                x_start + 5,
-                                (cy0 + wf_y0) * 0.5,
-                                text=disp,
-                                fill="#e6f2fc" if is_aud else "#8aa0b5",
-                                font=("Helvetica", 7, "bold"),
-                                anchor="w",
-                                tags=("static",),
-                            )
-
-                        # Center zero-crossing reference line inside waveform body
-                        self.canvas.create_line(
-                            x_start + 1, wf_mid, x_end - 1, wf_mid, fill="#243c54", tags=("static",)
-                        )
-
-                        # Build continuous filled Peak & RMS polygons (~1.5px per vertex)
-                        n_bins = len(envelope)
-                        b_start_f = (clip_t0 / track_dur) * (n_bins - 1)
-                        b_end_f = (clip_t1 / track_dur) * (n_bins - 1)
-                        vis_bins = max(1.0, b_end_f - b_start_f)
-                        n_pts = max(2, min(int(clip_w / 1.5), max(2, int(math.ceil(vis_bins)) + 1)))
-                        inner_w = max(1.0, clip_w - 2.0)
-
-                        pk_top = []
-                        pk_bot = []
-                        rms_top = []
-                        rms_bot = []
-
-                        for p in range(n_pts):
-                            frac_p = p / float(max(1, n_pts - 1))
-                            b_pos = b_start_f + frac_p * (b_end_f - b_start_f)
-                            if vis_bins > n_pts:
-                                # Aggregate min/max across covered bins so transients never vanish
-                                next_frac = (p + 1) / float(max(1, n_pts - 1))
-                                bi0 = max(0, min(n_bins - 1, int(b_pos)))
-                                bi1 = max(bi0 + 1, min(n_bins, int(b_start_f + next_frac * (b_end_f - b_start_f)) + 1))
-                                lo_v = 0.0
-                                hi_v = 0.0
-                                rms_v = 0.0
-                                for bi in range(bi0, bi1):
-                                    it = envelope[bi]
-                                    if isinstance(it, tuple):
-                                        if it[0] < lo_v:
-                                            lo_v = it[0]
-                                        if it[1] > hi_v:
-                                            hi_v = it[1]
-                                        if it[2] > rms_v:
-                                            rms_v = it[2]
-                                    else:
-                                        v = float(it)
-                                        if -v < lo_v:
-                                            lo_v = -v
-                                        if v > hi_v:
-                                            hi_v = v
-                                        if v * 0.65 > rms_v:
-                                            rms_v = v * 0.65
-                            else:
-                                bi = max(0, min(n_bins - 1, int(round(b_pos))))
-                                item = envelope[bi]
-                                if isinstance(item, tuple):
-                                    lo_v, hi_v, rms_v = item
-                                else:
-                                    v = float(item)
-                                    lo_v, hi_v, rms_v = -v, v, v * 0.65
-
-                            vz = self._vzoom
-                            px = x_start + 1.0 + frac_p * inner_w
-                            y_hi = wf_mid - min(1.0, max(0.0, hi_v * vz)) * max_amp
-                            y_lo = wf_mid - max(-1.0, min(0.0, lo_v * vz)) * max_amp
-                            if y_lo - y_hi < 1.2:
-                                y_hi = wf_mid - 0.6
-                                y_lo = wf_mid + 0.6
-                            pk_top.extend((px, y_hi))
-                            pk_bot.append((px, y_lo))
-
-                            r_amp = max(0.5, min(1.0, rms_v * vz) * max_amp)
-                            rms_top.extend((px, wf_mid - r_amp))
-                            rms_bot.append((px, wf_mid + r_amp))
-
-                        for px, py in reversed(pk_bot):
-                            pk_top.extend((px, py))
-                        for px, py in reversed(rms_bot):
-                            rms_top.extend((px, py))
-
-                        # Layer 1: Outer true min/max peak silhouette
-                        self.canvas.create_polygon(
-                            *pk_top, fill=peak_col, outline=peak_col, tags=("static",)
-                        )
-                        # Layer 2: Brighter inner RMS energy core
-                        self.canvas.create_polygon(
-                            *rms_top, fill=rms_col, outline="", tags=("static",)
-                        )
-                        # Crisp zero-line overlay
-                        self.canvas.create_line(
-                            x_start + 1, wf_mid, x_end - 1, wf_mid, fill=clip_bg, tags=("static",)
-                        )
-
-            if self._rec_active:
-                self._draw_live_rec_overlay()
-
-            self._draw_scrollbar()
-            self._move_playhead_only()
-            self.canvas.tag_raise("playhead")
-        except Exception:
-            pass
-
-    def _draw_live_rec_overlay(self):
-        try:
-            self.canvas.delete("rec_live")
-            if not self._rec_active or not self._rec_armed:
-                return
-            _, span = self._lane_span()
-            v_start, v_end, vis_dur, eff_dur = self._visible_window()
-            if eff_dur <= 0.0 or vis_dur <= 0.0:
-                return
-
-            rec_dur = max(0.0, self._rec_elapsed)
-            clip_t0 = max(0.0, v_start)
-            clip_t1 = min(rec_dur, v_end)
-            if clip_t1 <= clip_t0 and rec_dur > 0.0:
-                return
-
-            x_start = self.HEADER_W + ((clip_t0 - v_start) / vis_dur) * span
-            x_end = self.HEADER_W + ((clip_t1 - v_start) / vis_dur) * span
-            clip_w = max(6.0, x_end - x_start)
-            x_end = min(self.HEADER_W + span, x_start + clip_w)
-            peaks = self._rec_peaks
-            n_peaks = len(peaks)
-
-            for ch in self._rec_armed:
-                if not (0 <= ch < 4):
-                    continue
-                y0 = self.RULER_H + ch * self.LANE_H
-                y1 = y0 + self.LANE_H
-                cy0 = y0 + 2
-                cy1 = y1 - 2
-                wf_y0 = cy0 + self.CLIP_HDR_H
-                wf_mid = (wf_y0 + cy1) * 0.5
-                max_amp = max(2.0, (cy1 - wf_y0) * 0.5 - 1.5)
-
-                self.canvas.create_rectangle(
-                    x_start, cy0, x_end, cy1,
-                    fill="#3a161e", outline="#f24957", width=1, tags=("rec_live",),
-                )
-                self.canvas.create_rectangle(
-                    x_start + 1, cy0 + 1, x_end - 1, wf_y0,
-                    fill="#6e1e2a", outline="", tags=("rec_live",),
-                )
-                if clip_w > 34:
-                    self.canvas.create_text(
-                        x_start + 5,
-                        (cy0 + wf_y0) * 0.5,
-                        text="● REC",
-                        fill="#ffd6da",
-                        font=("Helvetica", 7, "bold"),
-                        anchor="w",
-                        tags=("rec_live",),
-                    )
-                if n_peaks >= 2 and rec_dur > 0.0:
-                    p_start_f = (clip_t0 / rec_dur) * (n_peaks - 1)
-                    p_end_f = (clip_t1 / rec_dur) * (n_peaks - 1)
-                    n_pts = max(2, min(n_peaks, int(clip_w / 1.5)))
-                    inner_w = max(1.0, (x_end - x_start) - 2.0)
-                    poly_top = []
-                    poly_bot = []
-                    for p in range(n_pts):
-                        frac_p = p / float(max(1, n_pts - 1))
-                        p_idx = max(0, min(n_peaks - 1, int(round(p_start_f + frac_p * (p_end_f - p_start_f)))))
-                        amp = max(1.0, min(1.0, peaks[p_idx]) * max_amp)
-                        px = x_start + 1.0 + frac_p * inner_w
-                        poly_top.extend((px, wf_mid - amp))
-                        poly_bot.append((px, wf_mid + amp))
-                    for px, py in reversed(poly_bot):
-                        poly_top.extend((px, py))
-                    self.canvas.create_polygon(
-                        *poly_top, fill="#ff6b78", outline="#ff8a94", tags=("rec_live",)
-                    )
-
-            self.canvas.tag_raise("playhead")
-        except Exception:
-            pass
-
-    def _move_playhead_only(self):
-        """Lightweight O(1) playhead movement called at 30 FPS without redrawing waveforms."""
-        self.pos_var.set(format_timecode(self._position))
-        try:
-            _, span = self._lane_span()
-            total_h = self.RULER_H + self.LANE_H * 4
-            v_start, v_end, vis_dur, eff_dur = self._visible_window()
-            if eff_dur > 0.0 and vis_dur > 0.0:
-                if self._position < v_start - 1e-6 or self._position > v_end + 1e-6:
-                    self.canvas.itemconfig(self._playhead_line, state="hidden")
-                    self.canvas.itemconfig(self._playhead_cap, state="hidden")
-                    return
-                frac = max(0.0, min(1.0, (self._position - v_start) / vis_dur))
-            else:
-                frac = 0.0
-            cx = self.HEADER_W + frac * span
-            cap_col = "#f24957" if self._rec_active else "#48d18a"
-            self.canvas.itemconfig(self._playhead_line, state="normal")
-            self.canvas.itemconfig(self._playhead_cap, state="normal", fill=cap_col)
-            self.canvas.coords(self._playhead_line, cx, self.RULER_H - 2, cx, total_h)
-            self.canvas.coords(
-                self._playhead_cap, cx - 5, 3, cx + 5, 3, cx, self.RULER_H - 1
-            )
-        except Exception:
-            pass
+    def closeEvent(self, event):
+        if not self._close_handled:
+            self._close_handled = True
+            self._controller._shutdown_resources()
+        super().closeEvent(event)
 
 
 class Window:
-    """4-Channel Audio Mixer GUI & Multithreaded Audio Engine."""
+    """4-Channel Audio Mixer PySide6 GUI & Multithreaded Audio Engine."""
 
     THEME = {
-        "bg_root": "#1d2d3d",
-        "bg_strip": "#2b455c",
-        "bg_header": "#203548",
-        "bg_well": "#182836",
-        "border": "#426382",
-        "divider": "#3b5975",
+        "bg_root": "#1a2836",
+        "bg_strip": "#263e54",
+        "bg_master": "#22384c",
+        "bg_header": "#1b2f40",
+        "bg_well": "#14222f",
+        "border": "#3f5f7d",
+        "divider": "#38546e",
         "text_primary": "#f0f6fc",
         "text_muted": "#9cb8d1",
         "unity_gold": "#ffd166",
         "boost_coral": "#fc8181",
         "status_fg": "#7ef2b8",
     }
+
+    TRACK_ACCENTS = ["#4da3ff", "#48d18a", "#f5c542", "#a375ff"]
 
     # (key, label, active_bg, led_color, inactive_bg, hover_bg, popup_cls)
     # Ordered top-to-bottom to match the DSP signal flow: Compressor -> Chorus -> Tremolo -> Delay
@@ -2287,14 +1275,20 @@ class Window:
         self.channels = 2
         self.rate = 44100
 
+        # Ensure a QApplication exists (use Fusion style for fast, uniform dark controls on macOS)
+        self._app = QApplication.instance()
+        self._owns_app = False
+        if self._app is None:
+            self._app = QApplication(sys.argv)
+            self._app.setStyle("Fusion")
+            self._owns_app = True
+
         # Thread synchronization
         self._state_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
-        self._pause_event.set()  # Set = running, Cleared = paused
+        self._pause_event.set()
         self._active_thread = None
-        self._main_thread_id = threading.get_ident()
-        self._ui_queue = queue.Queue()
         self.playing = False
         self.paused = False
         self.recording = False
@@ -2328,7 +1322,7 @@ class Window:
         self._rec_wave_elapsed = 0.0
         self._rec_wave_active = False
 
-        # Blink timer tick counter for armed Rec buttons (~2 Hz flash)
+        # Blink timer tick counter for armed Rec buttons (~2 Hz flash at 60 FPS)
         self._blink_tick = 0
 
         # 4 independent channel states
@@ -2337,1099 +1331,348 @@ class Window:
         # Open effect popup windows keyed by (channel_index_0_based, effect_name)
         self._effect_windows = {}
 
-        # Build main Tkinter window
-        self.root = tk.Tk()
-        self.root.geometry("1120x788")
-        self.root.title("Mini-DAW")
-        self.root.resizable(False, False)
-        self.root.configure(bg=self.THEME["bg_root"])
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.bind("<space>", self._on_space_key)
-        self.root.bind("<Button-1>", self._on_root_click, add="+")
-        for key in ("<plus>", "<equal>", "<KP_Add>"):
-            self.root.bind(key, lambda _e: self._on_zoom_key("in"))
-        for key in ("<minus>", "<KP_Subtract>"):
-            self.root.bind(key, lambda _e: self._on_zoom_key("out"))
-        for key in ("<Key-0>", "<KP_0>"):
-            self.root.bind(key, lambda _e: self._on_zoom_key("reset"))
+        # Load persisted UI theme ('studio' or 'classic')
+        self._settings = QSettings("Mini-DAW", "Mini-DAW")
+        saved_theme = str(self._settings.value("ui/theme", "studio") or "studio")
+        self._theme_key = saved_theme if saved_theme in THEMES else "studio"
+        self.THEME = get_theme(self._theme_key)
+        self._themed_headers = []
+        self._themed_wells = []
+        self._theme_actions = {}
 
-        self.font_header = font.Font(family="Helvetica", weight="bold", size=11)
-        self.font_section = font.Font(family="Helvetica", weight="bold", size=8)
-        self.font_small = font.Font(family="Helvetica", size=9)
-        self.font_readout = font.Font(family="Helvetica", weight="bold", size=9)
+        # Build Qt6 main window
+        self.root = _MainWindow(self)
+        self.root.setWindowTitle("Mini-DAW")
+        self.root.setMinimumSize(1080, 740)
+        self.root.resize(1180, 820)
+        self._apply_global_stylesheet()
 
-        # Menu bar
-        self.menu = tk.Menu(self.root)
-        self.root.config(menu=self.menu)
-        self.file_menu = tk.Menu(self.menu, tearoff=0)
-        self.menu.add_cascade(label="File", menu=self.file_menu)
-        self.file_menu.add_command(label="Exit", command=self.on_close)
+        self._ui_bridge = _UiBridge(self.root)
 
-        # Transport button live-LED callbacks (populated in _build_master_panel)
-        self._set_play_lit = lambda _lit: None
-        self._set_pause_lit = lambda _lit: None
-        self._set_rec_lit = lambda _lit: None
-        self._set_rec_mode = lambda _mode: None
+        # Central layout with resizable vertical splitter (Arrange View / Mixer Console)
+        central = QWidget(self.root)
+        central.setObjectName("centralWidget")
+        self.root.setCentralWidget(central)
+        outer_layout = QVBoxLayout(central)
+        outer_layout.setContentsMargins(12, 10, 12, 12)
+        outer_layout.setSpacing(0)
 
-        # Harmonious grid container:
-        #   Row 0: Full-width 4-Track Waveform Arrange View + Time Ruler & Playhead
-        #   Row 1: 4 Channel strips (cols 0..3) + Master Bus strip (col 4) + Control/Export (col 5)
-        self.board = tk.Frame(self.root, bg=self.THEME["bg_root"], padx=14, pady=10)
-        self.board.pack(fill=tk.BOTH, expand=True)
-        self.board.rowconfigure(0, weight=0)
-        self.board.rowconfigure(1, weight=1)
-        for col in range(4):
-            self.board.columnconfigure(col, weight=1, uniform="channels")
-        self.board.columnconfigure(4, minsize=142)
-        self.board.columnconfigure(5, minsize=248)
+        self.splitter = QSplitter(Qt.Orientation.Vertical, central)
+        self.splitter.setHandleWidth(8)
+        outer_layout.addWidget(self.splitter, 1)
 
-        # Top 4-track waveform timeline & playhead scrubber
-        self.timeline = WaveformTimeline(self.board, on_seek=self.seek_to_seconds)
-        self.timeline.frame.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(0, 8))
+        # Top: 4-Track Waveform Arrange View
+        self._zoom_detail_gen = 0
+        self.timeline = WaveformTimeline(self.splitter, on_seek=self.seek_to_seconds)
+        self.timeline.fileDroppedOnChannel.connect(self.load_channel_file_path)
+        self.timeline.detailRequested.connect(self._load_zoomed_waveforms_async)
+        self.splitter.addWidget(self.timeline)
 
-        # Per-channel Tkinter widget/variable references
+        # Native menu bar (built after timeline exists)
+        self._build_menu_bar()
+
+        # Bottom: Mixer Console Board (Ch 1-4 + Master Bus + Control & Export)
+        mixer_board = QWidget(self.splitter)
+        mixer_board.setObjectName("mixerBoard")
+        self._mixer_layout = QHBoxLayout(mixer_board)
+        self._mixer_layout.setContentsMargins(0, 4, 0, 0)
+        self._mixer_layout.setSpacing(8)
+        self.splitter.addWidget(mixer_board)
+
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 3)
+        self.splitter.setSizes([230, 560])
+
+        # Per-channel & master widget references
         self._ch_widgets = []
         self._channel_meters = []
         self._channel_peak_readouts = []
         self._rec_pad_modes = []
         self._master_meters = []
         self._master_peak_readout = None
-        self._build_channel_strips()
-        self._build_master_bus_strip()
-        self._build_master_panel()
+
+        self._set_play_lit = lambda _lit: None
+        self._set_pause_lit = lambda _lit: None
+        self._set_rec_lit = lambda _lit: None
+        self._set_rec_mode = lambda _mode: None
+
+        self._build_channel_strips(mixer_board)
+        self._build_master_bus_strip(mixer_board)
+        self._build_master_panel(mixer_board)
+        self.apply_theme(self._theme_key, persist=False)
+
+        self._last_bounce_color = "#48d18a"
+
+        # 30 FPS UI timer (33 ms) — smooth VU ballistics with minimal Python GIL overhead
+        self._meter_timer = QTimer(self.root)
+        self._meter_timer.setInterval(33)
+        self._meter_timer.timeout.connect(self._poll_meters)
+        self._meter_timer.start()
 
         if start_mainloop:
-            self.root.after(33, self._poll_meters)
-            self.root.mainloop()
+            self.root.show()
+            if self._owns_app:
+                self._app.exec()
 
-    @staticmethod
-    def _pointer_in_widget(widget, event):
-        """Return True if the mouse event coordinates fall inside widget's screen bounds."""
-        try:
-            x = event.x_root - widget.winfo_rootx()
-            y = event.y_root - widget.winfo_rooty()
-            return 0 <= x <= widget.winfo_width() and 0 <= y <= widget.winfo_height()
-        except Exception:
-            return True
+    # ---------- Styling & Menu ----------
 
-    @staticmethod
-    def _reset_scale(scale, value):
-        """Reset a tk.Scale on double-click and suppress default class click handling."""
-        scale.set(value)
-        return "break"
-
-    def _make_flat_button(
-        self,
-        parent,
-        text,
-        command,
-        bg="#3d7a47",
-        hover_bg="#4c9458",
-        active_bg="#2f6138",
-        fg="#ffffff",
-        font_spec=("Helvetica", 10, "bold"),
-        pady=7,
-    ):
-        """Flat studio button that renders consistently on macOS without Aqua chrome."""
-        btn = tk.Label(
-            parent,
-            text=text,
-            bg=bg,
-            fg=fg,
-            font=font_spec,
-            pady=pady,
-            cursor="hand2",
-            bd=0,
-            highlightthickness=1,
-            highlightbackground="#203548",
-        )
-
-        def on_enter(_e):
-            btn.config(bg=hover_bg)
-
-        def on_leave(_e):
-            btn.config(bg=bg)
-
-        def on_press(_e):
-            btn.config(bg=active_bg)
-
-        def on_release(event):
-            if self._pointer_in_widget(btn, event):
-                btn.config(bg=hover_bg)
-                command()
-            else:
-                btn.config(bg=bg)
-
-        btn.bind("<Enter>", on_enter)
-        btn.bind("<Leave>", on_leave)
-        btn.bind("<ButtonPress-1>", on_press)
-        btn.bind("<ButtonRelease-1>", on_release)
-        return btn
-
-    def _make_transport_button(
-        self,
-        parent,
-        kind,
-        caption,
-        command,
-        icon_color,
-        hover_icon_color,
-        lit_bg=None,
-        lit_border=None,
-        lit_icon_color="#ffffff",
-        width=48,
-    ):
-        """Crisp vector-drawn studio transport pad (Stop / Play / Pause / Rec) with active glow."""
-        base_bg = "#23384c"
-        hover_bg = "#2e4b66"
-        active_bg = "#162636"
-        base_border = "#426382"
-        hover_border = "#638db3"
-
-        pad = tk.Frame(
-            parent,
-            width=width,
-            height=46,
-            bg=base_bg,
-            bd=0,
-            highlightthickness=1,
-            highlightbackground=base_border,
-            cursor="hand2",
-        )
-        pad.pack_propagate(False)
-
-        canvas = tk.Canvas(
-            pad,
-            width=24,
-            height=18,
-            bg=base_bg,
-            bd=0,
-            highlightthickness=0,
-            cursor="hand2",
-        )
-        canvas.pack(pady=(5, 1))
-
-        if kind == "stop":
-            shape_ids = (canvas.create_rectangle(6, 3, 18, 15, fill=icon_color, outline=""),)
-        elif kind == "play":
-            shape_ids = (canvas.create_polygon(7, 2, 7, 16, 19, 9, fill=icon_color, outline=""),)
-        elif kind == "pause":
-            shape_ids = (
-                canvas.create_rectangle(6, 3, 10, 15, fill=icon_color, outline=""),
-                canvas.create_rectangle(14, 3, 18, 15, fill=icon_color, outline=""),
-            )
-        else:  # "rec"
-            shape_ids = (canvas.create_oval(6, 3, 18, 15, fill=icon_color, outline=""),)
-
-        cap_lbl = tk.Label(
-            pad,
-            text=caption,
-            bg=base_bg,
-            fg="#b9d2e8",
-            font=("Helvetica", 7, "bold"),
-            cursor="hand2",
-        )
-        cap_lbl.pack()
-
-        state = {"hover": False, "pressed": False, "mode": "off"}
-
-        def refresh():
-            mode = state["mode"]
-            if state["pressed"]:
-                bg_c = active_bg
-                bd_c = hover_border
-                ic_c = lit_icon_color if mode in ("solid", "blink_hi") else hover_icon_color
-                tx_c = "#ffffff"
-            elif mode == "solid" and lit_bg:
-                bg_c = lit_bg
-                bd_c = lit_border or hover_border
-                ic_c = lit_icon_color
-                tx_c = "#ffffff"
-            elif mode == "blink_hi" and lit_bg:
-                bg_c = lit_bg
-                bd_c = lit_border or hover_border
-                ic_c = lit_icon_color
-                tx_c = "#ffffff"
-            elif mode == "blink_lo":
-                bg_c = "#3d1c22"
-                bd_c = "#9e3843"
-                ic_c = icon_color
-                tx_c = "#ff9ea6"
-            elif state["hover"]:
-                bg_c = hover_bg
-                bd_c = hover_border
-                ic_c = hover_icon_color
-                tx_c = "#f0f6fc"
-            else:
-                bg_c = base_bg
-                bd_c = base_border
-                ic_c = icon_color
-                tx_c = "#b9d2e8"
-
-            pad.config(bg=bg_c, highlightbackground=bd_c)
-            canvas.config(bg=bg_c)
-            for sid in shape_ids:
-                canvas.itemconfig(sid, fill=ic_c)
-            cap_lbl.config(bg=bg_c, fg=tx_c)
-
-        def set_mode(mode):
-            if state["mode"] != mode:
-                state["mode"] = mode
-                refresh()
-
-        def set_lit(is_lit):
-            set_mode("solid" if is_lit else "off")
-
-        set_lit.set_mode = set_mode
-
-        def on_enter(_event):
-            state["hover"] = True
-            refresh()
-
-        def on_leave(event):
-            if not self._pointer_in_widget(pad, event):
-                state["hover"] = False
-                state["pressed"] = False
-                refresh()
-
-        def on_press(_event):
-            state["pressed"] = True
-            refresh()
-
-        def on_release(event):
-            was_inside = self._pointer_in_widget(pad, event)
-            state["pressed"] = False
-            state["hover"] = was_inside
-            refresh()
-            if was_inside:
-                command()
-
-        for widget in (pad, canvas, cap_lbl):
-            widget.bind("<Enter>", on_enter)
-            widget.bind("<Leave>", on_leave)
-            widget.bind("<ButtonPress-1>", on_press)
-            widget.bind("<ButtonRelease-1>", on_release)
-
-        return pad, set_lit
-
-    def _make_compact_clear_button(self, parent, command):
-        """Compact icon-only ✕ clear button designed to sit inside the top file bar."""
-        base_bg = "#261d24"
-        hover_bg = "#7a2a36"
-        active_bg = "#1c1218"
-        base_border = "#4a333b"
-        hover_border = "#ff858f"
-
-        lbl = tk.Label(
-            parent,
-            text="✕",
-            width=2,
-            bg=base_bg,
-            fg="#b87c85",
-            font=("Helvetica", 8, "bold"),
-            cursor="hand2",
-            highlightthickness=1,
-            highlightbackground=base_border,
-        )
-
-        def on_enter(_e):
-            lbl.config(bg=hover_bg, fg="#ffffff", highlightbackground=hover_border)
-
-        def on_leave(_e):
-            lbl.config(bg=base_bg, fg="#b87c85", highlightbackground=base_border)
-
-        def on_press(_e):
-            lbl.config(bg=active_bg, fg="#ffffff")
-
-        def on_release(e):
-            if self._pointer_in_widget(lbl, e):
-                lbl.config(bg=hover_bg, fg="#ffffff", highlightbackground=hover_border)
-                command()
-            else:
-                lbl.config(bg=base_bg, fg="#b87c85", highlightbackground=base_border)
-
-        lbl.bind("<Enter>", on_enter)
-        lbl.bind("<Leave>", on_leave)
-        lbl.bind("<ButtonPress-1>", on_press)
-        lbl.bind("<ButtonRelease-1>", on_release)
-        return lbl
-
-    def _make_effect_slot(
-        self,
-        parent,
-        channel_idx,
-        fx_key,
-        fx_label,
-        active_bg,
-        led_color,
-        inactive_bg,
-        hover_bg,
-        var,
-    ):
-        """Sleek DAW insert slot: clickable LED+name bypass toggle + integrated ⚙ edit button."""
-        slot = tk.Frame(
-            parent,
-            bg=inactive_bg,
-            height=26,
-            highlightthickness=1,
-            highlightbackground="#38546e",
-        )
-        slot.pack(fill=tk.X, padx=8, pady=2)
-        slot.pack_propagate(False)
-
-        toggle_area = tk.Frame(slot, bg=inactive_bg, cursor="hand2")
-        toggle_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        led = tk.Label(
-            toggle_area,
-            text="●",
-            bg=inactive_bg,
-            fg="#4c6780",
-            font=("Helvetica", 9),
-            padx=5,
-            cursor="hand2",
-        )
-        led.pack(side=tk.LEFT)
-
-        name_lbl = tk.Label(
-            toggle_area,
-            text=fx_label,
-            bg=inactive_bg,
-            fg="#c9dced",
-            font=("Helvetica", 9, "bold"),
-            anchor="w",
-            cursor="hand2",
-        )
-        name_lbl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        sep = tk.Frame(slot, bg="#38546e", width=1)
-        sep.pack(side=tk.LEFT, fill=tk.Y, pady=3)
-
-        edit_lbl = tk.Label(
-            slot,
-            text="⚙",
-            bg=inactive_bg,
-            fg="#b8d0e6",
-            font=("Helvetica", 11),
-            width=3,
-            anchor="center",
-            cursor="hand2",
-        )
-        edit_lbl.pack(side=tk.RIGHT, fill=tk.Y)
-
-        hover_state = {"toggle": False, "edit": False}
-
-        def refresh_visuals():
-            is_on = bool(var.get())
-            base_bg = active_bg if is_on else inactive_bg
-            t_bg = active_bg if (is_on and not hover_state["toggle"]) else (hover_bg if not is_on and hover_state["toggle"] else base_bg)
-            e_bg = hover_bg if hover_state["edit"] else base_bg
-
-            slot.config(
-                bg=base_bg,
-                highlightbackground=led_color if is_on else "#38546e",
-            )
-            toggle_area.config(bg=t_bg)
-            led.config(bg=t_bg, fg=led_color if is_on else "#4c6780")
-            name_lbl.config(bg=t_bg, fg="#ffffff" if is_on else "#bfd4e8")
-            sep.config(bg=led_color if is_on else "#38546e")
-            edit_lbl.config(
-                bg=e_bg,
-                fg="#ffffff" if (is_on or hover_state["edit"]) else "#9cb8d1",
-            )
-
-        def on_toggle_click(_e):
-            var.set(not bool(var.get()))
-            refresh_visuals()
-            self._on_effect_toggle(channel_idx, fx_key, var)
-
-        def on_toggle_enter(_e):
-            hover_state["toggle"] = True
-            refresh_visuals()
-
-        def on_toggle_leave(e):
-            if not self._pointer_in_widget(toggle_area, e):
-                hover_state["toggle"] = False
-                refresh_visuals()
-
-        def on_edit_click(_e):
-            self.open_effect_window(channel_idx, fx_key)
-
-        def on_edit_enter(_e):
-            hover_state["edit"] = True
-            refresh_visuals()
-
-        def on_edit_leave(_e):
-            hover_state["edit"] = False
-            refresh_visuals()
-
-        for w in (toggle_area, led, name_lbl):
-            w.bind("<Button-1>", on_toggle_click)
-            w.bind("<Enter>", on_toggle_enter)
-            w.bind("<Leave>", on_toggle_leave)
-
-        edit_lbl.bind("<Button-1>", on_edit_click)
-        edit_lbl.bind("<Enter>", on_edit_enter)
-        edit_lbl.bind("<Leave>", on_edit_leave)
-
-        refresh_visuals()
-        return refresh_visuals
-
-    def _make_toggle_pad(
-        self,
-        parent,
-        text,
-        var,
-        accent_color,
-        off_bg,
-        off_hover_bg,
-        off_fg,
-        off_border,
-        on_bg,
-        on_fg,
-        on_border,
-        on_change,
-    ):
-        """Distinct color-coded DAW toggle pad with accent stripe (Solo / Mute / Ø Phase / Rec)."""
-        pad = tk.Frame(
-            parent,
-            bg=off_bg,
-            height=26,
-            cursor="hand2",
-            highlightthickness=1,
-            highlightbackground=off_border,
-        )
-        pad.pack_propagate(False)
-
-        stripe = tk.Frame(pad, bg=accent_color, width=4, cursor="hand2")
-        stripe.pack(side=tk.LEFT, fill=tk.Y)
-
-        lbl = tk.Label(
-            pad,
-            text=text,
-            bg=off_bg,
-            fg=off_fg,
-            font=("Helvetica", 9, "bold"),
-            anchor="center",
-            cursor="hand2",
-        )
-        lbl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        hover = {"in": False, "flash_mode": None}
-
-        def refresh():
-            is_on = bool(var.get())
-            fmode = hover["flash_mode"]
-            if is_on and fmode == "blink_lo":
-                # Dim armed flash phase (clearly armed, alternating with bright solid)
-                pad.config(bg="#59222a", highlightbackground=accent_color)
-                stripe.config(bg=accent_color)
-                lbl.config(bg="#59222a", fg="#ffb3ba")
-            elif is_on:
-                pad.config(bg=on_bg, highlightbackground=on_border)
-                stripe.config(bg=on_border)
-                lbl.config(bg=on_bg, fg=on_fg)
-            else:
-                bg_now = off_hover_bg if hover["in"] else off_bg
-                pad.config(
-                    bg=bg_now,
-                    highlightbackground=accent_color if hover["in"] else off_border,
-                )
-                stripe.config(bg=accent_color)
-                lbl.config(bg=bg_now, fg="#ffffff" if hover["in"] else off_fg)
-
-        def set_flash_mode(mode):
-            if hover["flash_mode"] != mode:
-                hover["flash_mode"] = mode
-                refresh()
-
-        def on_click(_e):
-            var.set(not bool(var.get()))
-            if not var.get():
-                hover["flash_mode"] = None
-            refresh()
-            on_change(bool(var.get()))
-
-        def on_enter(_e):
-            hover["in"] = True
-            refresh()
-
-        def on_leave(e):
-            if not self._pointer_in_widget(pad, e):
-                hover["in"] = False
-                refresh()
-
-        for w in (pad, stripe, lbl):
-            w.bind("<Button-1>", on_click)
-            w.bind("<Enter>", on_enter)
-            w.bind("<Leave>", on_leave)
-
-        refresh()
-        pad.set_flash_mode = set_flash_mode
-        return pad
-
-    def _make_fader_ticks_canvas(
-        self,
-        parent,
-        bg,
-        fader_len,
-        pad_frac,
-        major_ticks,
-        minor_step_db=3.0,
-        width=32,
-    ):
-        """Crisp studio fader dB ruler canvas with major labels and minor hash marks."""
+    def _apply_global_stylesheet(self):
         T = self.THEME
-        cv = tk.Canvas(
-            parent,
-            width=width,
-            height=fader_len,
-            bg=bg,
-            bd=0,
-            highlightthickness=0,
+        card_r = int(T.get("card_radius", 6))
+        hdr_r = max(1, card_r - 1)
+        ctrl_r = int(T.get("ctrl_radius", 5))
+        btn_r = int(T.get("btn_radius", 4))
+        self.root.setStyleSheet(
+            f"""
+            QMainWindow, QWidget#centralWidget, QWidget#mixerBoard, QSplitter {{
+                background-color: {T['bg_root']};
+                color: {T['text_primary']};
+                font-family: ".AppleSystemUIFont", "Helvetica Neue", Helvetica, Arial;
+            }}
+            QSplitter::handle {{
+                background-color: transparent;
+            }}
+            QSplitter::handle:hover {{
+                background-color: #2f4b66;
+                border-radius: 3px;
+            }}
+            QFrame.channelStrip {{
+                background-color: {T['bg_strip']};
+                border: 1px solid {T['border']};
+                border-radius: {card_r}px;
+            }}
+            QFrame.masterStrip {{
+                background-color: {T['bg_master']};
+                border: 1px solid {T.get('border_master', '#4f7496')};
+                border-radius: {card_r}px;
+            }}
+            QFrame.stripHeader {{
+                background-color: {T['bg_header']};
+                border-bottom: 1px solid {T.get('border_header', '#2e4963')};
+                border-top-left-radius: {hdr_r}px;
+                border-top-right-radius: {hdr_r}px;
+            }}
+            QLabel.stripTitle {{
+                background: transparent;
+                color: {T['text_primary']};
+                font-size: 12px;
+                font-weight: 700;
+                letter-spacing: 0.6px;
+            }}
+            QLabel.sectionLbl {{
+                background: transparent;
+                color: {T['text_muted']};
+                font-size: 9px;
+                font-weight: 700;
+                letter-spacing: 0.7px;
+            }}
+            QFrame.hDivider {{
+                background-color: {T['divider']};
+                max-height: 1px;
+                min-height: 1px;
+                border: none;
+            }}
+            QLineEdit#nameBox {{
+                background-color: {T['bg_well']};
+                color: {T['text_primary']};
+                border: 1px solid #45698a;
+                border-radius: {ctrl_r}px;
+                padding: 6px 8px;
+                font-size: 12px;
+            }}
+            QLineEdit#nameBox:focus {{
+                border-color: #63b3ed;
+            }}
+            QPushButton#exportBtn {{
+                background-color: #3b7a47;
+                color: #ffffff;
+                border: 1px solid #529c60;
+                border-radius: {ctrl_r}px;
+                padding: 7px 10px;
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            QPushButton#exportBtn:hover {{
+                background-color: #4a9458;
+            }}
+            QPushButton#exportBtn:pressed {{
+                background-color: #2d6037;
+            }}
+            QPushButton#unityBtn {{
+                background-color: {T.get('unity_btn_bg', '#1c3144')};
+                color: {T['unity_gold']};
+                border: 1px solid {T['border']};
+                border-radius: {btn_r}px;
+                padding: 5px 8px;
+                font-size: 10px;
+                font-weight: 700;
+            }}
+            QPushButton#unityBtn:hover {{
+                background-color: {T.get('unity_btn_hover', '#2a4763')};
+            }}
+            QProgressBar#bounceBar {{
+                background-color: {T['bg_well']};
+                border: 1px solid {T.get('border_subtle', '#38546e')};
+                border-radius: {btn_r}px;
+                max-height: 12px;
+                min-height: 12px;
+                text-align: center;
+            }}
+            QProgressBar#bounceBar::chunk {{
+                background-color: #48d18a;
+                border-radius: {max(1, btn_r - 1)}px;
+            }}
+            """
         )
-        db_span = MAX_FADER_DB - MIN_FADER_DB
-        top_y = fader_len * pad_frac
-        span_y = fader_len * (1.0 - 2.0 * pad_frac)
-        major_dbs = {db for db, _ in major_ticks}
 
-        # Minor graduation dashes
-        db = float(MAX_FADER_DB)
-        while db >= float(MIN_FADER_DB) - 1e-6:
-            if not any(abs(db - m) < 0.05 for m in major_dbs):
-                y = top_y + ((MAX_FADER_DB - db) / db_span) * span_y
-                cv.create_line(0, y, 3, y, fill="#527494", width=1)
-            db -= float(minor_step_db)
+    def apply_theme(self, theme_key, persist=True):
+        """Switch live between 'studio' (Qt 6 dark studio) and 'classic' (v1.3 Tkinter-inspired)."""
+        T = get_theme(theme_key)
+        self._theme_key = T["key"]
+        self.THEME = T
+        self._apply_global_stylesheet()
 
-        # Major ticks + labels (non-overlapping guard prioritizing unity and endpoints)
-        min_gap = 10.5
-        drawn_ys = []
-        priority = [t for t in major_ticks if t[0] in (0.0, MAX_FADER_DB, MIN_FADER_DB)]
-        others = [t for t in major_ticks if t[0] not in (0.0, MAX_FADER_DB, MIN_FADER_DB)]
-        show_lbl = set()
-        for tick_db, _ in priority + others:
-            y = top_y + ((MAX_FADER_DB - tick_db) / db_span) * span_y
-            if all(abs(y - py) >= min_gap for py in drawn_ys):
-                drawn_ys.append(y)
-                show_lbl.add(tick_db)
+        hdr_r = max(1, int(T.get("card_radius", 6)) - 1)
+        hdr_bd = T.get("border_header", "#2e4963")
+        for hdr_widget, obj_name, top_accent in self._themed_headers:
+            hdr_widget.setStyleSheet(
+                f"QFrame#{obj_name} {{ background-color: {T['bg_header']}; "
+                f"border-top: 3px solid {top_accent}; "
+                f"border-bottom: 1px solid {hdr_bd}; "
+                f"border-top-left-radius: {hdr_r}px; border-top-right-radius: {hdr_r}px; }}"
+            )
 
-        for tick_db, tick_txt in major_ticks:
-            y = top_y + ((MAX_FADER_DB - tick_db) / db_span) * span_y
-            is_unity = tick_db == 0.0
-            has_lbl = tick_db in show_lbl
-            col = T["unity_gold"] if is_unity else (T["text_muted"] if has_lbl else "#5c7e9e")
-            cv.create_line(0, y, 5 if has_lbl else 3, y, fill=col, width=1.5 if is_unity else 1)
-            if has_lbl:
-                cv.create_text(
-                    7,
-                    y,
-                    text=tick_txt,
-                    fill=col,
-                    font=("Helvetica", 7, "bold" if is_unity else "normal"),
-                    anchor="w",
-                )
-        return cv
+        ctrl_r = int(T.get("ctrl_radius", 5))
+        well_bd = T.get("border_subtle", "#38546e")
+        for well_widget, extra_css in self._themed_wells:
+            well_widget.setStyleSheet(
+                f"background-color: {T['bg_well']}; border: 1px solid {well_bd}; "
+                f"border-radius: {ctrl_r}px; {extra_css}"
+            )
 
-    def _make_meter_ticks_canvas(
-        self,
-        parent,
-        bg,
-        meter_len,
-        major_ticks,
-        minor_step_db=3.0,
-        width=24,
-        pad_y=3.0,
-    ):
-        """Independent dBFS meter scale ruler (0 to -60 dBFS) aligned to ChannelMeter."""
-        cv = tk.Canvas(
-            parent,
-            width=width,
-            height=meter_len + 2,  # +2 accounts for 1px top/bottom meter highlight border
-            bg=bg,
-            bd=0,
-            highlightthickness=0,
-        )
-        top_y = float(pad_y) + 1.0
-        span_y = max(10.0, float(meter_len) - 2.0 * float(pad_y))
+        if hasattr(self, "timeline"):
+            self.timeline.set_theme(T)
+        for m in self._channel_meters:
+            m.set_theme(T)
+        for p in self._channel_peak_readouts:
+            p.set_theme(T)
+        for m in self._master_meters:
+            m.set_theme(T)
+        if self._master_peak_readout is not None:
+            self._master_peak_readout.set_theme(T)
+        if hasattr(self, "master_vol_badge"):
+            self.master_vol_badge.set_theme(T)
+        if hasattr(self, "_master_fader_widget"):
+            self._master_fader_widget.set_theme(T)
 
-        def _db_to_y(db_val):
-            return top_y + ((0.0 - float(db_val)) / 60.0) * span_y
+        for cw in self._ch_widgets:
+            cw["file_well"].set_theme(T)
+            cw["pan_slider"].set_theme(T)
+            if "fader_with_scale" in cw:
+                cw["fader_with_scale"].set_theme(T)
+            if "vol_badge" in cw:
+                cw["vol_badge"].set_theme(T)
 
-        major_dbs = {db for db, _ in major_ticks}
+        for btn_attr in ("stop_button", "play_button", "pause_button", "rec_button"):
+            btn = getattr(self, btn_attr, None)
+            if btn is not None:
+                btn.set_theme(T)
 
-        # Minor graduation marks pointing right toward the meter bar
-        db = 0.0
-        last_minor_y = -1e9
-        while db >= -60.0 - 1e-6:
-            if not any(abs(db - m) < 0.05 for m in major_dbs):
-                y = _db_to_y(db)
-                if y - last_minor_y >= 4.8:
-                    cv.create_line(width - 3, y, width, y, fill="#4f6e8c", width=1)
-                    last_minor_y = y
-            db -= float(minor_step_db)
+        if hasattr(self, "_refresh_export_fmt_cb"):
+            self._refresh_export_fmt_cb()
+        if hasattr(self, "_refresh_rec_fmt_cb"):
+            self._refresh_rec_fmt_cb()
 
-        # Major ticks + right-aligned dBFS labels with overlap guard
-        min_gap = 10.5
-        drawn_ys = []
-        priority = [t for t in major_ticks if t[0] in (0.0, -6.0, -12.0, -24.0, -60.0)]
-        others = [t for t in major_ticks if t[0] not in (0.0, -6.0, -12.0, -24.0, -60.0)]
-        label_allowed = set()
-        for tick_db, _ in priority + others:
-            y = _db_to_y(tick_db)
-            if all(abs(y - py) >= min_gap for py in drawn_ys):
-                drawn_ys.append(y)
-                label_allowed.add(tick_db)
+        for key, act in self._theme_actions.items():
+            act.setChecked(key == self._theme_key)
 
-        for tick_db, tick_txt in major_ticks:
-            y = _db_to_y(tick_db)
-            show_lbl = tick_db in label_allowed
-            is_clip = tick_db >= -0.05
-            is_hot = -6.05 <= tick_db <= -5.95
-            if is_clip:
-                col = "#ff7a85"
-            elif is_hot:
-                col = "#f5c542"
-            elif show_lbl:
-                col = "#9cb8d1"
-            else:
-                col = "#5d7d9c"
+        if persist and hasattr(self, "_settings"):
+            self._settings.setValue("ui/theme", self._theme_key)
 
-            tick_w = 5 if show_lbl else 3
-            cv.create_line(width - tick_w, y, width, y, fill=col, width=1)
-            if show_lbl:
-                text_y = max(5.5, min(float(meter_len) - 3.5, y))
-                cv.create_text(
-                    width - 6,
-                    text_y,
-                    text=tick_txt,
-                    fill=col,
-                    font=("Helvetica", 7, "bold" if (is_clip or is_hot) else "normal"),
-                    anchor="e",
-                )
-        return cv
+    def _build_menu_bar(self):
+        menubar = self.root.menuBar()
 
-    def _build_channel_strips(self):
-        T = self.THEME
-
+        file_menu = menubar.addMenu("&File")
         for idx in range(4):
-            ch_num = idx + 1
+            act = QAction(f"Load WAV on Channel {idx + 1}...", self.root)
+            act.setShortcut(QKeySequence(f"Ctrl+{idx + 1}"))
+            act.triggered.connect(lambda _checked=False, c=idx: self.open_channel_file(c))
+            file_menu.addAction(act)
 
-            frame = tk.Frame(
-                self.board,
-                bg=T["bg_strip"],
-                highlightthickness=1,
-                highlightbackground=T["border"],
-            )
-            frame.grid(row=1, column=idx, sticky="nsew", padx=(0, 8))
+        file_menu.addSeparator()
+        bounce_act = QAction("Bounce Mix (.wav)...", self.root)
+        bounce_act.setShortcut(QKeySequence("Ctrl+E"))
+        bounce_act.triggered.connect(self.bounce)
+        file_menu.addAction(bounce_act)
 
-            # Channel top header bar
-            header = tk.Frame(frame, bg=T["bg_header"], height=30)
-            header.pack(fill=tk.X)
-            header.pack_propagate(False)
-            tk.Label(
-                header,
-                text=f"CHANNEL {ch_num}",
-                bg=T["bg_header"],
-                fg=T["text_primary"],
-                font=self.font_header,
-            ).pack(expand=True)
+        file_menu.addSeparator()
+        exit_act = QAction("Exit", self.root)
+        exit_act.setShortcut(QKeySequence.StandardKey.Quit)
+        exit_act.triggered.connect(self.on_close)
+        file_menu.addAction(exit_act)
 
-            # Top file well: clickable filename bar + compact ✕ clear button + format metadata
-            file_well = tk.Frame(
-                frame,
-                bg=T["bg_well"],
-                padx=5,
-                pady=4,
-                highlightthickness=1,
-                highlightbackground="#38546e",
-            )
-            file_well.pack(pady=(6, 4), padx=8, fill=tk.X)
+        transport_menu = menubar.addMenu("&Transport")
+        play_act = QAction("Play / Pause", self.root)
+        play_act.triggered.connect(lambda: self._on_space_key(ignore_focus=True))
+        transport_menu.addAction(play_act)
 
-            file_top = tk.Frame(file_well, bg=T["bg_well"])
-            file_top.pack(fill=tk.X)
+        stop_act = QAction("Stop", self.root)
+        stop_act.setShortcut(QKeySequence(Qt.Key.Key_Escape))
+        stop_act.triggered.connect(self.stop)
+        transport_menu.addAction(stop_act)
 
-            clear_icon = self._make_compact_clear_button(
-                file_top,
-                command=lambda c=idx: self.clear_channel_file(c),
-            )
-            clear_icon.pack(side=tk.RIGHT, padx=(3, 0))
+        rec_act = QAction("Record / Stop Recording", self.root)
+        rec_act.setShortcut(QKeySequence("Ctrl+R"))
+        rec_act.triggered.connect(self.press_rec)
+        transport_menu.addAction(rec_act)
 
-            file_var = tk.StringVar(value="(click to load)")
-            file_lbl = tk.Label(
-                file_top,
-                textvariable=file_var,
-                bg=T["bg_well"],
-                fg="#dcecf9",
-                font=("Helvetica", 8, "bold"),
-                anchor="center",
-                padx=4,
-                pady=2,
-                cursor="hand2",
-            )
-            file_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            file_lbl.bind("<Button-1>", lambda _e, c=idx: self.open_channel_file(c))
-            file_lbl.bind("<Enter>", lambda _e, l=file_lbl: l.config(bg="#243a4f", fg="#ffffff"))
-            file_lbl.bind("<Leave>", lambda _e, l=file_lbl: l.config(bg=T["bg_well"], fg="#dcecf9"))
+        view_menu = menubar.addMenu("&View")
+        zoom_in_act = QAction("Zoom In Timeline", self.root)
+        zoom_in_act.setShortcuts([QKeySequence.StandardKey.ZoomIn, QKeySequence("Ctrl+=")])
+        zoom_in_act.triggered.connect(lambda: self.timeline.canvas.set_zoom(self.timeline.canvas.zoom() * 1.4))
+        view_menu.addAction(zoom_in_act)
 
-            meta_var = tk.StringVar(value="—")
-            meta_lbl = tk.Label(
-                file_well,
-                textvariable=meta_var,
-                bg=T["bg_well"],
-                fg="#7cc0f7",
-                font=("Helvetica", 8),
-                anchor="center",
-                cursor="hand2",
-            )
-            meta_lbl.pack(fill=tk.X, pady=(2, 0))
-            meta_lbl.bind("<Button-1>", lambda _e, c=idx: self.open_channel_file(c))
+        zoom_out_act = QAction("Zoom Out Timeline", self.root)
+        zoom_out_act.setShortcuts([QKeySequence.StandardKey.ZoomOut, QKeySequence("Ctrl+-")])
+        zoom_out_act.triggered.connect(lambda: self.timeline.canvas.set_zoom(self.timeline.canvas.zoom() / 1.4))
+        view_menu.addAction(zoom_out_act)
 
-            # Insert Rack section
-            tk.Label(
-                frame,
-                text="INSERTS",
-                bg=T["bg_strip"],
-                fg=T["text_muted"],
-                font=self.font_section,
-                anchor="w",
-            ).pack(fill=tk.X, padx=10, pady=(2, 2))
+        zoom_reset_act = QAction("Reset Timeline Zoom", self.root)
+        zoom_reset_act.setShortcut(QKeySequence("Ctrl+0"))
+        zoom_reset_act.triggered.connect(self.timeline.reset_zoom)
+        view_menu.addAction(zoom_reset_act)
 
-            fx_vars = {}
-            for fx_key, fx_label, active_bg, led_color, inactive_bg, hover_bg, _ in self.EFFECT_SPECS:
-                var = tk.BooleanVar(value=False)
-                fx_vars[fx_key] = var
-                self._make_effect_slot(
-                    frame,
-                    idx,
-                    fx_key,
-                    fx_label,
-                    active_bg,
-                    led_color,
-                    inactive_bg,
-                    hover_bg,
-                    var,
-                )
+        view_menu.addSeparator()
+        vfit_act = QAction("Fit Waveform Height", self.root)
+        vfit_act.triggered.connect(self.timeline.fit_vertical_zoom)
+        view_menu.addAction(vfit_act)
 
-            # Subtle divider
-            tk.Frame(frame, bg=T["divider"], height=1).pack(fill=tk.X, padx=10, pady=(8, 6))
+        vreset_act = QAction("Restore Waveform Height (1.0×)", self.root)
+        vreset_act.triggered.connect(self.timeline.reset_vertical_zoom)
+        view_menu.addAction(vreset_act)
 
-            # Pan control (0.0 = Left, 0.5 = Center, 1.0 = Right)
-            pan_label_var = tk.StringVar(value="Pan: C")
-            tk.Label(
-                frame,
-                textvariable=pan_label_var,
-                bg=T["bg_strip"],
-                fg=T["text_primary"],
-                font=self.font_small,
-            ).pack()
+        view_menu.addSeparator()
+        theme_menu = view_menu.addMenu("Theme")
+        theme_group = QActionGroup(self.root)
+        theme_group.setExclusive(True)
+        for key in ("studio", "classic"):
+            t_cfg = THEMES[key]
+            act = QAction(t_cfg["name"], self.root)
+            act.setCheckable(True)
+            act.setChecked(key == self._theme_key)
+            act.triggered.connect(lambda _checked=False, k=key: self.apply_theme(k, persist=True))
+            theme_group.addAction(act)
+            theme_menu.addAction(act)
+            self._theme_actions[key] = act
 
-            pan_row = tk.Frame(frame, bg=T["bg_strip"])
-            pan_row.pack(fill=tk.X, padx=8, pady=(2, 6))
+    # ---------- Console Construction ----------
 
-            tk.Label(
-                pan_row, text="L", bg=T["bg_strip"], fg=T["text_muted"], font=self.font_section
-            ).pack(side=tk.LEFT, padx=(0, 3))
-
-            pan_scale = tk.Scale(
-                pan_row,
-                from_=0.0,
-                to=1.0,
-                resolution=0.01,
-                showvalue=False,
-                orient=tk.HORIZONTAL,
-                length=116,
-                bg=T["bg_strip"],
-                troughcolor=T["bg_well"],
-                activebackground="#4a749c",
-                highlightthickness=0,
-                bd=0,
-                sliderlength=16,
-                command=lambda val, c=idx, lbl=pan_label_var: self._on_pan_change(c, val, lbl),
-            )
-            pan_scale.set(0.5)
-            pan_scale.bind("<Double-Button-1>", lambda _e, s=pan_scale: self._reset_scale(s, 0.5))
-            pan_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-            tk.Label(
-                pan_row, text="R", bg=T["bg_strip"], fg=T["text_muted"], font=self.font_section
-            ).pack(side=tk.RIGHT, padx=(3, 0))
-
-            # Dual readouts above meter & fader: [Peak dBFS] [Fader dB]
-            readout_row = tk.Frame(frame, bg=T["bg_strip"])
-            readout_row.pack(fill=tk.X, padx=8, pady=(2, 5))
-
-            peak_readout = PeakReadout(readout_row, width=8)
-            peak_readout.label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
-            self._channel_peak_readouts.append(peak_readout)
-
-            vol_label_var = tk.StringVar(value="0.0 dB")
-            vol_badge = tk.Label(
-                readout_row,
-                textvariable=vol_label_var,
-                bg=T["bg_well"],
-                fg=T["unity_gold"],
-                font=("Helvetica", 8, "bold"),
-                width=8,
-                pady=2,
-                highlightthickness=1,
-                highlightbackground="#2c465e",
-            )
-            vol_badge.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(3, 0))
-
-            fader_row = tk.Frame(frame, bg=T["bg_strip"])
-            fader_row.pack(pady=(0, 8))
-
-            fader_len = 148
-
-            # Independent dBFS scale + real-time vertical VU LED meter next to the volume fader
-            ch_meter_ticks = (
-                (0.0, "0"),
-                (-6.0, "-6"),
-                (-12.0, "-12"),
-                (-18.0, "-18"),
-                (-24.0, "-24"),
-                (-36.0, "-36"),
-                (-48.0, "-48"),
-                (-60.0, "-60"),
-            )
-            m_ticks_cv = self._make_meter_ticks_canvas(
-                fader_row,
-                bg=T["bg_strip"],
-                meter_len=fader_len,
-                major_ticks=ch_meter_ticks,
-                minor_step_db=3.0,
-                width=24,
-            )
-            m_ticks_cv.pack(side=tk.LEFT, padx=(0, 2))
-
-            meter = ChannelMeter(fader_row, width=16, height=fader_len, segments=22)
-            meter.canvas.pack(side=tk.LEFT, padx=(0, 6))
-            self._channel_meters.append(meter)
-
-            vol_scale = tk.Scale(
-                fader_row,
-                from_=MAX_FADER_DB,
-                to=MIN_FADER_DB,
-                resolution=0.5,
-                showvalue=False,
-                orient=tk.VERTICAL,
-                length=fader_len,
-                bg=T["bg_strip"],
-                troughcolor=T["bg_well"],
-                activebackground="#4a749c",
-                highlightthickness=0,
-                bd=0,
-                sliderlength=22,
-                command=lambda val, c=idx, lbl=vol_label_var, bdg=vol_badge: self._on_vol_change(
-                    c, val, lbl, bdg
-                ),
-            )
-            vol_scale.set(0.0)
-            vol_scale.bind("<Double-Button-1>", lambda _e, s=vol_scale: self._reset_scale(s, 0.0))
-            vol_scale.pack(side=tk.LEFT, padx=(0, 2))
-
-            ch_ticks = (
-                (6.0, "+6"),
-                (0.0, "0"),
-                (-6.0, "-6"),
-                (-12.0, "-12"),
-                (-18.0, "-18"),
-                (-24.0, "-24"),
-                (-30.0, "-30"),
-                (-36.0, "-36"),
-                (-42.0, "-42"),
-                (-48.0, "-48"),
-                (-54.0, "-54"),
-                (MIN_FADER_DB, "-∞"),
-            )
-            ticks_cv = self._make_fader_ticks_canvas(
-                fader_row,
-                bg=T["bg_strip"],
-                fader_len=fader_len,
-                pad_frac=0.08,
-                major_ticks=ch_ticks,
-                minor_step_db=3.0,
-            )
-            ticks_cv.pack(side=tk.LEFT)
-
-            # Channel control toggle pads pinned cleanly at bottom
-            ctrl_grid = tk.Frame(frame, bg=T["bg_strip"])
-            ctrl_grid.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 8))
-
-            solo_var = tk.BooleanVar(value=False)
-            mute_var = tk.BooleanVar(value=False)
-            pol_var = tk.BooleanVar(value=False)
-            rec_var = tk.BooleanVar(value=False)
-
-            solo_pad = self._make_toggle_pad(
-                ctrl_grid,
-                text="S  Solo",
-                var=solo_var,
-                accent_color="#f5c542",
-                off_bg="#332c19",
-                off_hover_bg="#473d22",
-                off_fg="#fae08c",
-                off_border="#7a662b",
-                on_bg="#dba316",
-                on_fg="#1c1400",
-                on_border="#fff1ad",
-                on_change=lambda en, c=idx: self.channel_states[c].set_solo(en),
-            )
-            mute_pad = self._make_toggle_pad(
-                ctrl_grid,
-                text="M  Mute",
-                var=mute_var,
-                accent_color="#f27a30",
-                off_bg="#382319",
-                off_hover_bg="#4d2f21",
-                off_fg="#ffa873",
-                off_border="#804a2c",
-                on_bg="#d95516",
-                on_fg="#ffffff",
-                on_border="#ffc6a3",
-                on_change=lambda en, c=idx: self.channel_states[c].set_mute(en),
-            )
-            pol_pad = self._make_toggle_pad(
-                ctrl_grid,
-                text="Ø  Phase",
-                var=pol_var,
-                accent_color="#a375ff",
-                off_bg="#2b2142",
-                off_hover_bg="#3b2d5c",
-                off_fg="#d1b3ff",
-                off_border="#614994",
-                on_bg="#7242d6",
-                on_fg="#ffffff",
-                on_border="#dec9ff",
-                on_change=lambda en, c=idx: self.channel_states[c].set_polarity_invert(en),
-            )
-            def _on_rec_arm_toggle(en, c=idx, rv=rec_var):
-                with self._state_lock:
-                    rec_active = self.recording
-                if rec_active:
-                    rv.set(self.channel_states[c].snapshot().rec_armed)
-                    return
-                self.channel_states[c].set_rec_armed(en)
-
-            rec_pad = self._make_toggle_pad(
-                ctrl_grid,
-                text="●  Rec",
-                var=rec_var,
-                accent_color="#f24957",
-                off_bg="#3a1c22",
-                off_hover_bg="#52252e",
-                off_fg="#ff8c96",
-                off_border="#853743",
-                on_bg="#cc2431",
-                on_fg="#ffffff",
-                on_border="#ffb8bf",
-                on_change=_on_rec_arm_toggle,
-            )
-
-            solo_pad.grid(row=0, column=0, padx=2, pady=2, sticky="ew")
-            mute_pad.grid(row=0, column=1, padx=2, pady=2, sticky="ew")
-            pol_pad.grid(row=1, column=0, padx=2, pady=2, sticky="ew")
-            rec_pad.grid(row=1, column=1, padx=2, pady=2, sticky="ew")
-            ctrl_grid.columnconfigure(0, weight=1, uniform="ctrl")
-            ctrl_grid.columnconfigure(1, weight=1, uniform="ctrl")
-
-            self._rec_pad_modes.append(rec_pad.set_flash_mode)
-
-            self._ch_widgets.append(
-                {
-                    "file_var": file_var,
-                    "meta_var": meta_var,
-                    "fx_vars": fx_vars,
-                    "pan_scale": pan_scale,
-                    "vol_scale": vol_scale,
-                    "solo_var": solo_var,
-                    "mute_var": mute_var,
-                    "pol_var": pol_var,
-                    "rec_var": rec_var,
-                }
-            )
-
-    def _build_master_bus_strip(self):
-        """Dedicated Master Bus fader & Stereo L/R VU meter strip (sum of Channels 1–4)."""
+    def _build_channel_strips(self, parent):
         T = self.THEME
-
-        strip = tk.Frame(
-            self.board,
-            bg="#263e54",
-            highlightthickness=1,
-            highlightbackground="#4f7496",
-        )
-        strip.grid(row=1, column=4, sticky="nsew", padx=(2, 10))
-
-        # Matching top header bar
-        header = tk.Frame(strip, bg="#1b2f40", height=30)
-        header.pack(fill=tk.X)
-        header.pack_propagate(False)
-        tk.Label(
-            header,
-            text="MASTER BUS",
-            bg="#1b2f40",
-            fg=T["unity_gold"],
-            font=self.font_header,
-        ).pack(expand=True)
-
-        # Bus label badge
-        tk.Label(
-            strip,
-            text="SUM · CH 1–4",
-            bg=T["bg_well"],
-            fg="#8fc5f5",
-            font=("Helvetica", 8, "bold"),
-            pady=5,
-            highlightthickness=1,
-            highlightbackground="#38546e",
-        ).pack(fill=tk.X, padx=8, pady=(8, 12))
-
-        # Peak dBFS clip indicator + Master Fader dB readout
-        tk.Label(
-            strip,
-            text="PEAK  /  FADER",
-            bg="#263e54",
-            fg=T["text_muted"],
-            font=self.font_section,
-        ).pack(pady=(2, 4))
-
-        master_readout_row = tk.Frame(strip, bg="#263e54")
-        master_readout_row.pack(fill=tk.X, padx=8, pady=(0, 8))
-
-        self._master_peak_readout = PeakReadout(master_readout_row, width=7)
-        self._master_peak_readout.label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
-
-        self.master_vol_var = tk.StringVar(value="0.0 dB")
-        self.master_vol_badge = tk.Label(
-            master_readout_row,
-            textvariable=self.master_vol_var,
-            bg=T["bg_well"],
-            fg=T["unity_gold"],
-            font=("Helvetica", 8, "bold"),
-            width=7,
-            pady=2,
-            highlightthickness=1,
-            highlightbackground="#2c465e",
-        )
-        self.master_vol_badge.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(3, 0))
-
-        # Stereo L/R VU meters + Master Fader + dB ticks (sized to fill Master Bus strip)
-        fader_len = 302
-        bus_row = tk.Frame(strip, bg="#263e54")
-        bus_row.pack(expand=True, pady=(2, 4))
-
-        meters_col = tk.Frame(bus_row, bg="#263e54")
-        meters_col.pack(side=tk.LEFT, padx=(0, 6))
-
-        lr_pair = tk.Frame(meters_col, bg="#263e54")
-        lr_pair.pack()
-
-        master_meter_ticks = (
+        ch_ticks = (
+            (6.0, "+6"),
             (0.0, "0"),
-            (-3.0, "-3"),
             (-6.0, "-6"),
-            (-9.0, "-9"),
             (-12.0, "-12"),
             (-18.0, "-18"),
             (-24.0, "-24"),
@@ -3438,57 +1681,201 @@ class Window:
             (-42.0, "-42"),
             (-48.0, "-48"),
             (-54.0, "-54"),
-            (-60.0, "-60"),
+            (MIN_FADER_DB, "-∞"),
         )
-        m_bus_ticks = self._make_meter_ticks_canvas(
-            lr_pair,
-            bg="#263e54",
-            meter_len=fader_len,
-            major_ticks=master_meter_ticks,
-            minor_step_db=1.5,
-            width=24,
-        )
-        m_bus_ticks.pack(side=tk.LEFT, padx=(0, 2))
 
-        meter_l = ChannelMeter(lr_pair, width=16, height=fader_len, segments=38)
-        meter_r = ChannelMeter(lr_pair, width=16, height=fader_len, segments=38)
-        meter_l.canvas.pack(side=tk.LEFT, padx=(0, 3))
-        meter_r.canvas.pack(side=tk.LEFT)
-        self._master_meters = [meter_l, meter_r]
+        for idx in range(4):
+            ch_num = idx + 1
+            accent = self.TRACK_ACCENTS[idx]
 
-        lr_labels = tk.Frame(meters_col, bg="#263e54")
-        lr_labels.pack(fill=tk.X, pady=(3, 0))
-        tk.Frame(lr_labels, bg="#263e54", width=26, height=1).pack(side=tk.LEFT)
-        tk.Label(
-            lr_labels, text="L", bg="#263e54", fg=T["text_muted"], font=("Helvetica", 8, "bold")
-        ).pack(side=tk.LEFT, padx=(4, 0))
-        tk.Label(
-            lr_labels, text="R", bg="#263e54", fg=T["text_muted"], font=("Helvetica", 8, "bold")
-        ).pack(side=tk.RIGHT, padx=(0, 4))
+            strip = QFrame(parent)
+            strip.setProperty("class", "channelStrip")
+            strip.setMinimumWidth(164)
+            strip.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            strip_layout = QVBoxLayout(strip)
+            strip_layout.setContentsMargins(0, 0, 0, 8)
+            strip_layout.setSpacing(0)
 
-        fader_col = tk.Frame(bus_row, bg="#263e54")
-        fader_col.pack(side=tk.LEFT, anchor="n")
+            # Header bar with subtle track-color top accent
+            header = QFrame(strip)
+            header.setObjectName("chHeader")
+            header.setFixedHeight(32)
+            self._themed_headers.append((header, "chHeader", accent))
+            header.setStyleSheet(
+                f"QFrame#chHeader {{ background-color: {T['bg_header']}; border-top: 3px solid {accent}; "
+                "border-bottom: 1px solid #2e4963; border-top-left-radius: 5px; border-top-right-radius: 5px; }"
+            )
+            hdr_layout = QHBoxLayout(header)
+            hdr_layout.setContentsMargins(8, 0, 8, 0)
+            hdr_lbl = QLabel(f"CHANNEL {ch_num}", header)
+            hdr_lbl.setProperty("class", "stripTitle")
+            hdr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            hdr_layout.addWidget(hdr_lbl)
+            strip_layout.addWidget(header)
 
-        self.master_scale = tk.Scale(
-            fader_col,
-            from_=MAX_FADER_DB,
-            to=MIN_FADER_DB,
-            resolution=0.5,
-            showvalue=False,
-            orient=tk.VERTICAL,
-            length=fader_len,
-            bg="#263e54",
-            troughcolor=T["bg_well"],
-            activebackground="#ffd166",
-            highlightthickness=0,
-            bd=0,
-            sliderlength=26,
-            command=self._on_master_vol_change,
-        )
-        self.master_scale.set(0.0)
-        self.master_scale.bind("<Double-Button-1>", lambda _e: self._reset_scale(self.master_scale, 0.0))
-        self.master_scale.pack(side=tk.LEFT, padx=(0, 2))
+            body = QWidget(strip)
+            body.setStyleSheet("background: transparent;")
+            body_layout = QVBoxLayout(body)
+            body_layout.setContentsMargins(8, 7, 8, 0)
+            body_layout.setSpacing(6)
+            strip_layout.addWidget(body, 1)
 
+            # File well (click or drag & drop WAV)
+            file_well = ChannelFileWell(body)
+            file_well.loadClicked.connect(lambda c=idx: self.open_channel_file(c))
+            file_well.clearClicked.connect(lambda c=idx: self.clear_channel_file(c))
+            file_well.fileDropped.connect(lambda path, c=idx: self.load_channel_file_path(c, path))
+            body_layout.addWidget(file_well)
+
+            # Inserts section
+            ins_lbl = QLabel("INSERTS", body)
+            ins_lbl.setProperty("class", "sectionLbl")
+            body_layout.addWidget(ins_lbl)
+
+            fx_slots = {}
+            ins_box = QVBoxLayout()
+            ins_box.setSpacing(4)
+            for fx_key, fx_label, active_bg, led_color, inactive_bg, hover_bg, _ in self.EFFECT_SPECS:
+                slot = InsertSlotWidget(
+                    fx_label=fx_label,
+                    active_bg=active_bg,
+                    led_color=led_color,
+                    inactive_bg=inactive_bg,
+                    hover_bg=hover_bg,
+                    parent=body,
+                )
+                slot.toggled.connect(lambda en, c=idx, k=fx_key: self._on_effect_toggle(c, k, en))
+                slot.editClicked.connect(lambda c=idx, k=fx_key: self.open_effect_window(c, k))
+                ins_box.addWidget(slot)
+                fx_slots[fx_key] = slot
+            body_layout.addLayout(ins_box)
+
+            # Divider
+            div = QFrame(body)
+            div.setProperty("class", "hDivider")
+            body_layout.addWidget(div)
+
+            # Pan control
+            pan_lbl = QLabel("Pan: C", body)
+            pan_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pan_lbl.setStyleSheet("background: transparent; color: #f0f6fc; font-size: 11px;")
+            body_layout.addWidget(pan_lbl)
+
+            pan_row = QHBoxLayout()
+            pan_row.setContentsMargins(0, 0, 0, 0)
+            pan_row.setSpacing(4)
+            l_lbl = QLabel("L", body)
+            l_lbl.setProperty("class", "sectionLbl")
+            r_lbl = QLabel("R", body)
+            r_lbl.setProperty("class", "sectionLbl")
+            pan_slider = PanSlider(body)
+            pan_slider.panChanged.connect(lambda val, c=idx, lbl=pan_lbl: self._on_pan_change(c, val, lbl))
+            pan_row.addWidget(l_lbl)
+            pan_row.addWidget(pan_slider, 1)
+            pan_row.addWidget(r_lbl)
+            body_layout.addLayout(pan_row)
+
+            # Dual readouts: [Peak dBFS] [Fader dB]
+            readout_row = QHBoxLayout()
+            readout_row.setContentsMargins(0, 0, 0, 0)
+            readout_row.setSpacing(4)
+            peak_readout = PeakReadout(body)
+            self._channel_peak_readouts.append(peak_readout)
+
+            vol_badge = FaderBadge("0.0 dB", body)
+
+            readout_row.addWidget(peak_readout, 1)
+            readout_row.addWidget(vol_badge, 1)
+            body_layout.addLayout(readout_row)
+
+            # Independent dBFS Meter Scale + Meter + Custom DAW Fader + Painted dB Scale
+            fader_row = QHBoxLayout()
+            fader_row.setContentsMargins(0, 2, 0, 2)
+            fader_row.setSpacing(4)
+            fader_row.addStretch(1)
+
+            meter_ticks = MeterScaleTicks(MeterScaleTicks.CHANNEL_TICKS, minor_step_db=3.0, parent=body)
+            meter = ChannelMeter(body, width=16, height=150, segments=22)
+            self._channel_meters.append(meter)
+            fader_with_scale = FaderWithScale(ch_ticks, accent_color=accent, parent=body)
+            fader_with_scale.fader.dbChanged.connect(
+                lambda db, c=idx, bdg=vol_badge: self._on_vol_change(c, db, bdg)
+            )
+
+            fader_row.addWidget(meter_ticks)
+            fader_row.addWidget(meter)
+            fader_row.addSpacing(4)
+            fader_row.addWidget(fader_with_scale)
+            fader_row.addStretch(1)
+            body_layout.addLayout(fader_row, 1)
+
+            # Channel toggle pads: Solo / Mute / Phase / Rec
+            ctrl_grid = QGridLayout()
+            ctrl_grid.setContentsMargins(0, 2, 0, 0)
+            ctrl_grid.setHorizontalSpacing(4)
+            ctrl_grid.setVerticalSpacing(4)
+            ctrl_grid.setColumnStretch(0, 1)
+            ctrl_grid.setColumnStretch(1, 1)
+
+            solo_pad = TogglePadButton(
+                "S  Solo", "#f5c542", "#332c19", "#473d22", "#fae08c", "#7a662b",
+                "#dba316", "#1c1400", "#fff1ad", parent=body,
+            )
+            solo_pad.toggled.connect(lambda en, c=idx: self.channel_states[c].set_solo(en))
+
+            mute_pad = TogglePadButton(
+                "M  Mute", "#f27a30", "#382319", "#4d2f21", "#ffa873", "#804a2c",
+                "#d95516", "#ffffff", "#ffc6a3", parent=body,
+            )
+            mute_pad.toggled.connect(lambda en, c=idx: self.channel_states[c].set_mute(en))
+
+            pol_pad = TogglePadButton(
+                "Ø  Phase", "#a375ff", "#2b2142", "#3b2d5c", "#d1b3ff", "#614994",
+                "#7242d6", "#ffffff", "#dec9ff", parent=body,
+            )
+            pol_pad.toggled.connect(lambda en, c=idx: self.channel_states[c].set_polarity_invert(en))
+
+            rec_pad = TogglePadButton(
+                "●  Rec", "#f24957", "#3a1c22", "#52252e", "#ff8c96", "#853743",
+                "#cc2431", "#ffffff", "#ffb8bf", parent=body,
+            )
+            def _on_rec_pad_toggle(en, c=idx, pad=rec_pad):
+                with self._state_lock:
+                    rec_active = self.recording
+                if rec_active:
+                    pad.blockSignals(True)
+                    pad.setChecked(self.channel_states[c].snapshot().rec_armed)
+                    pad.blockSignals(False)
+                    return
+                self.channel_states[c].set_rec_armed(en)
+
+            rec_pad.toggled.connect(_on_rec_pad_toggle)
+
+            ctrl_grid.addWidget(solo_pad, 0, 0)
+            ctrl_grid.addWidget(mute_pad, 0, 1)
+            ctrl_grid.addWidget(pol_pad, 1, 0)
+            ctrl_grid.addWidget(rec_pad, 1, 1)
+            body_layout.addLayout(ctrl_grid)
+
+            self._rec_pad_modes.append(rec_pad.set_flash_mode)
+            self._ch_widgets.append(
+                {
+                    "file_well": file_well,
+                    "fx_slots": fx_slots,
+                    "pan_slider": pan_slider,
+                    "vol_fader": fader_with_scale.fader,
+                    "fader_with_scale": fader_with_scale,
+                    "vol_badge": vol_badge,
+                    "solo_pad": solo_pad,
+                    "mute_pad": mute_pad,
+                    "pol_pad": pol_pad,
+                    "rec_pad": rec_pad,
+                }
+            )
+            self._mixer_layout.addWidget(strip, 1)
+
+    def _build_master_bus_strip(self, parent):
+        T = self.THEME
         master_ticks = (
             (6.0, "+6"),
             (3.0, "+3"),
@@ -3507,35 +1894,122 @@ class Window:
             (-54.0, "-54"),
             (MIN_FADER_DB, "-∞"),
         )
-        ticks_cv = self._make_fader_ticks_canvas(
-            fader_col,
-            bg="#263e54",
-            fader_len=fader_len,
-            pad_frac=0.04,
-            major_ticks=master_ticks,
-            minor_step_db=1.5,
-        )
-        ticks_cv.pack(side=tk.LEFT)
 
-        # Unity reset & Master Safety Limiter at bottom of Master Bus strip
-        reset_btn = self._make_flat_button(
-            strip,
-            text="0.0 dB Unity",
-            command=lambda: self.master_scale.set(0.0),
-            bg="#1e3447",
-            hover_bg="#2b4863",
-            active_bg="#162636",
-            fg="#ffd166",
-            font_spec=("Helvetica", 8, "bold"),
-            pady=5,
-        )
-        reset_btn.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 8))
+        strip = QFrame(parent)
+        strip.setProperty("class", "masterStrip")
+        strip.setMinimumWidth(168)
+        strip.setMaximumWidth(200)
+        strip_layout = QVBoxLayout(strip)
+        strip_layout.setContentsMargins(0, 0, 0, 8)
+        strip_layout.setSpacing(0)
 
-        self._master_lim_var = tk.BooleanVar(value=False)
-        lim_pad = self._make_toggle_pad(
-            strip,
+        header = QFrame(strip)
+        header.setObjectName("masterHeader")
+        header.setFixedHeight(32)
+        self._themed_headers.append((header, "masterHeader", T["unity_gold"]))
+        header.setStyleSheet(
+            f"QFrame#masterHeader {{ background-color: {T['bg_header']}; border-top: 3px solid {T['unity_gold']}; "
+            "border-bottom: 1px solid #2e4963; border-top-left-radius: 5px; border-top-right-radius: 5px; }"
+        )
+        hdr_layout = QHBoxLayout(header)
+        hdr_layout.setContentsMargins(8, 0, 8, 0)
+        hdr_lbl = QLabel("MASTER BUS", header)
+        hdr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hdr_lbl.setStyleSheet(
+            f"background: transparent; border: none; color: {T['unity_gold']}; "
+            "font-size: 12px; font-weight: 700; letter-spacing: 0.6px;"
+        )
+        hdr_layout.addWidget(hdr_lbl)
+        strip_layout.addWidget(header)
+
+        body = QWidget(strip)
+        body.setStyleSheet("background: transparent;")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(8, 8, 8, 0)
+        body_layout.setSpacing(7)
+        strip_layout.addWidget(body, 1)
+
+        bus_badge = QLabel("SUM · CH 1–4", body)
+        bus_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._themed_wells.append(
+            (bus_badge, "color: #8fc5f5; padding: 5px; font-size: 10px; font-weight: 700;")
+        )
+        bus_badge.setStyleSheet(
+            f"background-color: {T['bg_well']}; color: #8fc5f5; border: 1px solid #38546e; "
+            "border-radius: 4px; padding: 5px; font-size: 10px; font-weight: 700;"
+        )
+        body_layout.addWidget(bus_badge)
+
+        pf_lbl = QLabel("PEAK  /  FADER", body)
+        pf_lbl.setProperty("class", "sectionLbl")
+        pf_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        body_layout.addWidget(pf_lbl)
+
+        readout_row = QHBoxLayout()
+        readout_row.setSpacing(4)
+        self._master_peak_readout = PeakReadout(body)
+        self.master_vol_badge = FaderBadge("0.0 dB", body)
+        readout_row.addWidget(self._master_peak_readout, 1)
+        readout_row.addWidget(self.master_vol_badge, 1)
+        body_layout.addLayout(readout_row)
+
+        # Independent dBFS Meter Scale + Stereo L/R VU meters + Master Fader + dB ticks
+        bus_row = QHBoxLayout()
+        bus_row.setContentsMargins(0, 4, 0, 4)
+        bus_row.setSpacing(6)
+        bus_row.addStretch(1)
+
+        meters_col = QVBoxLayout()
+        meters_col.setSpacing(3)
+        lr_pair = QHBoxLayout()
+        lr_pair.setSpacing(3)
+        master_meter_ticks = MeterScaleTicks(MeterScaleTicks.MASTER_TICKS, minor_step_db=3.0, parent=body)
+        meter_l = ChannelMeter(body, width=16, height=230, segments=36)
+        meter_r = ChannelMeter(body, width=16, height=230, segments=36)
+        lr_pair.addWidget(master_meter_ticks)
+        lr_pair.addWidget(meter_l)
+        lr_pair.addWidget(meter_r)
+        self._master_meters = [meter_l, meter_r]
+        meters_col.addLayout(lr_pair, 1)
+
+        lr_labels = QHBoxLayout()
+        lr_labels.setSpacing(3)
+        lr_pad = QWidget(body)
+        lr_pad.setFixedWidth(25)
+        lr_pad.setStyleSheet("background: transparent;")
+        lbl_l = QLabel("L", body)
+        lbl_l.setProperty("class", "sectionLbl")
+        lbl_l.setFixedWidth(16)
+        lbl_l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_r = QLabel("R", body)
+        lbl_r.setProperty("class", "sectionLbl")
+        lbl_r.setFixedWidth(16)
+        lbl_r.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lr_labels.addWidget(lr_pad)
+        lr_labels.addWidget(lbl_l)
+        lr_labels.addWidget(lbl_r)
+        meters_col.addLayout(lr_labels)
+
+        self._master_fader_widget = FaderWithScale(
+            master_ticks, accent_color=T["unity_gold"], is_master=True, parent=body
+        )
+        self.master_scale = self._master_fader_widget.fader
+        self.master_scale.dbChanged.connect(self._on_master_vol_change)
+
+        fader_col = QVBoxLayout()
+        fader_col.setSpacing(3)
+        fader_col.addWidget(self._master_fader_widget, 1)
+        spacer_lbl = QLabel(" ", body)
+        spacer_lbl.setProperty("class", "sectionLbl")
+        fader_col.addWidget(spacer_lbl)
+
+        bus_row.addLayout(meters_col)
+        bus_row.addLayout(fader_col)
+        bus_row.addStretch(1)
+        body_layout.addLayout(bus_row, 1)
+
+        self._master_lim_btn = TogglePadButton(
             text="LIM -0.3 dB",
-            var=self._master_lim_var,
             accent_color="#48d18a",
             off_bg="#1a2e3e",
             off_hover_bg="#243f54",
@@ -3544,271 +2018,265 @@ class Window:
             on_bg="#1f5c43",
             on_fg="#ffffff",
             on_border="#68d391",
-            on_change=self._on_master_limiter_toggle,
+            parent=body,
         )
-        lim_pad.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
+        self._master_lim_btn.setToolTip(
+            "Stereo-linked Master Safety Limiter (-0.3 dBFS brickwall ceiling)"
+        )
+        self._master_lim_btn.toggled.connect(self._on_master_limiter_toggle)
+        body_layout.addWidget(self._master_lim_btn)
 
-    def _build_master_panel(self):
+        unity_btn = QPushButton("0.0 dB Unity", body)
+        unity_btn.setObjectName("unityBtn")
+        unity_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        unity_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        unity_btn.clicked.connect(lambda: self.master_scale.set_db(0.0))
+        body_layout.addWidget(unity_btn)
+
+        self._mixer_layout.addWidget(strip)
+
+    def _build_master_panel(self, parent):
         T = self.THEME
 
-        panel = tk.Frame(
-            self.board,
-            bg=T["bg_strip"],
-            highlightthickness=1,
-            highlightbackground=T["border"],
-        )
-        panel.grid(row=1, column=5, sticky="nsew", padx=(0, 0))
+        panel = QFrame(parent)
+        panel.setProperty("class", "channelStrip")
+        panel.setMinimumWidth(248)
+        panel.setMaximumWidth(285)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 10)
+        panel_layout.setSpacing(0)
 
-        # Matching top header bar
-        header = tk.Frame(panel, bg=T["bg_header"], height=30)
-        header.pack(fill=tk.X)
-        header.pack_propagate(False)
-        tk.Label(
-            header,
-            text="CONTROL & EXPORT",
-            bg=T["bg_header"],
-            fg=T["text_primary"],
-            font=self.font_header,
-        ).pack(expand=True)
+        header = QFrame(panel)
+        header.setObjectName("ctrlHeader")
+        header.setFixedHeight(32)
+        self._themed_headers.append((header, "ctrlHeader", "#5aa9f5"))
+        header.setStyleSheet(
+            f"QFrame#ctrlHeader {{ background-color: {T['bg_header']}; border-top: 3px solid #5aa9f5; "
+            "border-bottom: 1px solid #2e4963; border-top-left-radius: 5px; border-top-right-radius: 5px; }"
+        )
+        hdr_layout = QHBoxLayout(header)
+        hdr_layout.setContentsMargins(8, 0, 8, 0)
+        hdr_lbl = QLabel("CONTROL & EXPORT", header)
+        hdr_lbl.setProperty("class", "stripTitle")
+        hdr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hdr_layout.addWidget(hdr_lbl)
+        panel_layout.addWidget(header)
+
+        body = QWidget(panel)
+        body.setStyleSheet("background: transparent;")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(10, 7, 10, 0)
+        body_layout.setSpacing(5)
+        panel_layout.addWidget(body, 1)
 
         # Transport bay
-        tk.Label(
-            panel,
-            text="TRANSPORT",
-            bg=T["bg_strip"],
-            fg=T["text_muted"],
-            font=self.font_section,
-            anchor="w",
-        ).pack(fill=tk.X, padx=12, pady=(12, 4))
+        t_lbl = QLabel("TRANSPORT", body)
+        t_lbl.setProperty("class", "sectionLbl")
+        body_layout.addWidget(t_lbl)
 
-        transport_bay = tk.Frame(
-            panel,
-            bg=T["bg_well"],
-            padx=8,
-            pady=10,
-            highlightthickness=1,
-            highlightbackground="#38546e",
+        transport_bay = QFrame(body)
+        self._themed_wells.append((transport_bay, ""))
+        transport_bay.setStyleSheet(
+            f"background-color: {T['bg_well']}; border: 1px solid #38546e; border-radius: 6px;"
         )
-        transport_bay.pack(fill=tk.X, padx=12)
+        tb_layout = QHBoxLayout(transport_bay)
+        tb_layout.setContentsMargins(6, 7, 6, 7)
+        tb_layout.setSpacing(6)
 
-        transport_inner = tk.Frame(transport_bay, bg=T["bg_well"])
-        transport_inner.pack(anchor="center")
-
-        self.stop_button, _ = self._make_transport_button(
-            transport_inner,
-            kind="stop",
-            caption="STOP",
-            command=self.stop,
-            icon_color="#d5e4f2",
-            hover_icon_color="#ffffff",
-            width=46,
+        self.stop_button = TransportButton(
+            kind="stop", caption="STOP", icon_color="#d5e4f2", hover_icon_color="#ffffff", parent=transport_bay
         )
-        self.play_button, self._set_play_lit = self._make_transport_button(
-            transport_inner,
+        self.stop_button.clicked.connect(self.stop)
+
+        self.play_button = TransportButton(
             kind="play",
             caption="PLAY",
-            command=self.press_play,
             icon_color="#48d18a",
             hover_icon_color="#7ef2b8",
             lit_bg="#246e4c",
             lit_border="#68d391",
-            lit_icon_color="#ffffff",
-            width=46,
+            parent=transport_bay,
         )
-        self.pause_button, self._set_pause_lit = self._make_transport_button(
-            transport_inner,
+        self.play_button.clicked.connect(self.press_play)
+        self._set_play_lit = self.play_button.set_lit
+
+        self.pause_button = TransportButton(
             kind="pause",
             caption="PAUSE",
-            command=self.press_pause,
             icon_color="#f5c542",
             hover_icon_color="#ffe28a",
             lit_bg="#b88414",
             lit_border="#ffe28a",
-            lit_icon_color="#ffffff",
-            width=46,
+            parent=transport_bay,
         )
-        self.rec_button, self._set_rec_lit = self._make_transport_button(
-            transport_inner,
+        self.pause_button.clicked.connect(self.press_pause)
+        self._set_pause_lit = self.pause_button.set_lit
+
+        self.rec_button = TransportButton(
             kind="rec",
             caption="REC",
-            command=self.press_rec,
             icon_color="#f24957",
             hover_icon_color="#ff7a85",
             lit_bg="#b82530",
             lit_border="#ff858f",
-            lit_icon_color="#ffffff",
-            width=46,
+            parent=transport_bay,
         )
-        self._set_rec_mode = self._set_rec_lit.set_mode
+        self.rec_button.clicked.connect(self.press_rec)
+        self._set_rec_lit = self.rec_button.set_lit
+        self._set_rec_mode = self.rec_button.set_mode
 
-        self.stop_button.grid(row=0, column=0, padx=3)
-        self.play_button.grid(row=0, column=1, padx=3)
-        self.pause_button.grid(row=0, column=2, padx=3)
-        self.rec_button.grid(row=0, column=3, padx=3)
+        tb_layout.addStretch(1)
+        tb_layout.addWidget(self.stop_button)
+        tb_layout.addWidget(self.play_button)
+        tb_layout.addWidget(self.pause_button)
+        tb_layout.addWidget(self.rec_button)
+        tb_layout.addStretch(1)
+        body_layout.addWidget(transport_bay)
 
         # Status screen
-        tk.Label(
-            panel,
-            text="STATUS",
-            bg=T["bg_strip"],
-            fg=T["text_muted"],
-            font=self.font_section,
-            anchor="w",
-        ).pack(fill=tk.X, padx=12, pady=(14, 4))
+        s_lbl = QLabel("STATUS", body)
+        s_lbl.setProperty("class", "sectionLbl")
+        body_layout.addWidget(s_lbl)
 
-        self.status_var = tk.StringVar(value="Ready")
-        tk.Label(
-            panel,
-            textvariable=self.status_var,
-            bg=T["bg_well"],
-            fg=T["status_fg"],
-            font=("Helvetica", 10, "bold"),
-            wraplength=192,
-            justify=tk.CENTER,
-            padx=8,
-            pady=7,
-            highlightthickness=1,
-            highlightbackground="#38546e",
-        ).pack(padx=12, fill=tk.X)
-
-        # Divider
-        tk.Frame(panel, bg=T["divider"], height=1).pack(fill=tk.X, padx=12, pady=6)
-
-        # Bounce / Export section
-        tk.Label(
-            panel,
-            text="MIX / RECORDING NAME",
-            bg=T["bg_strip"],
-            fg=T["text_muted"],
-            font=self.font_section,
-            anchor="w",
-        ).pack(fill=tk.X, padx=12, pady=(0, 3))
-
-        self.nameEntry = tk.StringVar()
-        self.nameBox = tk.Entry(
-            panel,
-            textvariable=self.nameEntry,
-            bg=T["bg_well"],
-            fg=T["text_primary"],
-            insertbackground=T["text_primary"],
-            font=("Helvetica", 10),
-            relief=tk.FLAT,
-            highlightthickness=1,
-            highlightbackground="#45698a",
-            highlightcolor="#63b3ed",
+        self.status_label = QLabel("Ready", body)
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setWordWrap(True)
+        self.status_label.setMinimumHeight(32)
+        self._themed_wells.append(
+            (self.status_label, f"color: {T['status_fg']}; padding: 5px; font-size: 11px; font-weight: 700;")
         )
-        self.nameBox.pack(padx=12, pady=(0, 6), ipady=3, fill=tk.X)
-        self.nameBox.bind("<Return>", lambda _e: self.root.focus_set())
-        self.nameBox.bind("<Escape>", lambda _e: self.root.focus_set())
-
-        # Recording & Bounce bit depth + TPDF dither controls
-        tk.Label(
-            panel,
-            text="REC / BOUNCE FORMAT",
-            bg=T["bg_strip"],
-            fg=T["text_muted"],
-            font=self.font_section,
-            anchor="w",
-        ).pack(fill=tk.X, padx=12, pady=(0, 3))
-
-        fmt_box = tk.Frame(
-            panel,
-            bg=T["bg_well"],
-            padx=6,
-            pady=5,
-            highlightthickness=1,
-            highlightbackground="#38546e",
+        self.status_label.setStyleSheet(
+            f"background-color: {T['bg_well']}; color: {T['status_fg']}; "
+            "border: 1px solid #38546e; border-radius: 5px; padding: 5px; "
+            "font-size: 11px; font-weight: 700;"
         )
-        fmt_box.pack(padx=12, pady=(0, 7), fill=tk.X)
+        body_layout.addWidget(self.status_label)
 
-        rec_fmt_row = tk.Frame(fmt_box, bg=T["bg_well"])
-        rec_fmt_row.pack(fill=tk.X, pady=(0, 4))
-        tk.Label(
-            rec_fmt_row,
-            text="REC",
-            bg=T["bg_well"],
-            fg="#f27a85",
-            font=("Helvetica", 7, "bold"),
-            width=4,
-            anchor="w",
-        ).grid(row=0, column=0, sticky="w")
+        div = QFrame(body)
+        div.setProperty("class", "hDivider")
+        body_layout.addWidget(div)
+
+        # Mix / Recording Name & Export
+        n_lbl = QLabel("MIX / RECORDING NAME", body)
+        n_lbl.setProperty("class", "sectionLbl")
+        body_layout.addWidget(n_lbl)
+
+        self.nameBox = QLineEdit(body)
+        self.nameBox.setObjectName("nameBox")
+        self.nameBox.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.nameBox.setPlaceholderText("Optional filename (e.g. final_mix)")
+        self.nameBox.returnPressed.connect(self.nameBox.clearFocus)
+        self._app.installEventFilter(self.root)
+        body_layout.addWidget(self.nameBox)
+
+        # Recording & Export bit depth + TPDF dither selector
+        fmt_lbl = QLabel("REC / BOUNCE FORMAT", body)
+        fmt_lbl.setProperty("class", "sectionLbl")
+        body_layout.addWidget(fmt_lbl)
+
+        fmt_box = QFrame(body)
+        self._themed_wells.append((fmt_box, ""))
+        fmt_box.setStyleSheet(
+            f"background-color: {T['bg_well']}; border: 1px solid #38546e; border-radius: 5px;"
+        )
+        fmt_layout = QVBoxLayout(fmt_box)
+        fmt_layout.setContentsMargins(6, 6, 6, 6)
+        fmt_layout.setSpacing(5)
+
+        rec_row = QHBoxLayout()
+        rec_row.setContentsMargins(0, 0, 0, 0)
+        rec_row.setSpacing(4)
+        rec_tag_lbl = QLabel("REC", fmt_box)
+        rec_tag_lbl.setFixedWidth(28)
+        rec_tag_lbl.setStyleSheet(
+            "background: transparent; border: none; color: #f27a85; font-size: 9px; font-weight: 700;"
+        )
+        rec_row.addWidget(rec_tag_lbl)
         self._rec_depth_btns = {}
 
         def _refresh_rec_fmt():
+            btn_r = int(self.THEME.get("btn_radius", 4))
             cur_rec = (self.rec_bitdepth, self.rec_sample_format)
-            for key, lbl in self._rec_depth_btns.items():
+            for key, btn in self._rec_depth_btns.items():
                 if key == cur_rec:
-                    lbl.config(bg="#8f242f", fg="#ffffff", highlightbackground="#ff7a85")
+                    btn.setStyleSheet(
+                        f"background-color: #8f242f; color: #ffffff; border: 1px solid #ff7a85; "
+                        f"border-radius: {btn_r}px; padding: 2px; font-size: 10px; font-weight: 700;"
+                    )
                 else:
-                    lbl.config(bg="#1d3042", fg="#9cb8d1", highlightbackground="#33506b")
+                    btn.setStyleSheet(
+                        f"background-color: #1d3042; color: #9cb8d1; border: 1px solid #33506b; "
+                        f"border-radius: {btn_r}px; padding: 2px; font-size: 10px; font-weight: 700;"
+                    )
 
         def _select_rec_fmt(depth, sfmt):
             self.rec_bitdepth = depth
             self.rec_sample_format = sfmt
             _refresh_rec_fmt()
 
-        for col_i, (depth, sfmt, text_lbl) in enumerate(
-            ((16, "pcm", "16-bit"), (24, "pcm", "24-bit"), (32, "float", "32f"))
+        for depth, sfmt, text_lbl, tip in (
+            (16, "pcm", "16-bit", "Record mono tracks at 16-bit integer PCM WAV"),
+            (24, "pcm", "24-bit", "Record mono tracks at 24-bit integer PCM WAV (studio headroom)"),
+            (32, "float", "32f", "Record mono tracks at 32-bit IEEE Float WAV"),
         ):
-            rbtn = tk.Label(
-                rec_fmt_row,
-                text=text_lbl,
-                bg="#1d3042",
-                fg="#9cb8d1",
-                font=("Helvetica", 8, "bold"),
-                pady=2,
-                cursor="hand2",
-                highlightthickness=1,
-                highlightbackground="#33506b",
-            )
-            rbtn.bind("<Button-1>", lambda _e, d=depth, sf=sfmt: _select_rec_fmt(d, sf))
-            rbtn.grid(row=0, column=col_i + 1, sticky="ew", padx=(3, 0))
-            rec_fmt_row.columnconfigure(col_i + 1, weight=1, uniform="recdepth")
+            rbtn = QPushButton(text_lbl, fmt_box)
+            rbtn.setFixedHeight(22)
+            rbtn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            rbtn.setCursor(Qt.CursorShape.PointingHandCursor)
+            rbtn.setToolTip(tip)
+            rbtn.clicked.connect(lambda _checked=False, d=depth, sf=sfmt: _select_rec_fmt(d, sf))
+            rec_row.addWidget(rbtn, 1)
             self._rec_depth_btns[(depth, sfmt)] = rbtn
+        self._refresh_rec_fmt_cb = _refresh_rec_fmt
         _refresh_rec_fmt()
+        fmt_layout.addLayout(rec_row)
 
-        depth_row = tk.Frame(fmt_box, bg=T["bg_well"])
-        depth_row.pack(fill=tk.X, pady=(0, 4))
+        depth_row = QHBoxLayout()
+        depth_row.setContentsMargins(0, 0, 0, 0)
+        depth_row.setSpacing(4)
         self._depth_btns = {}
 
         def _refresh_export_fmt():
+            btn_r = int(self.THEME.get("btn_radius", 4))
             cur_key = (self.bounce_bitdepth, self.bounce_sample_format)
-            for key, lbl in self._depth_btns.items():
+            for key, btn in self._depth_btns.items():
                 if key == cur_key:
-                    lbl.config(bg="#245994", fg="#ffffff", highlightbackground="#63b3ed")
+                    btn.setStyleSheet(
+                        f"background-color: #245994; color: #ffffff; border: 1px solid #63b3ed; "
+                        f"border-radius: {btn_r}px; padding: 2px; font-size: 10px; font-weight: 700;"
+                    )
                 else:
-                    lbl.config(bg="#1d3042", fg="#9cb8d1", highlightbackground="#33506b")
+                    btn.setStyleSheet(
+                        f"background-color: #1d3042; color: #9cb8d1; border: 1px solid #33506b; "
+                        f"border-radius: {btn_r}px; padding: 2px; font-size: 10px; font-weight: 700;"
+                    )
             if self.bounce_sample_format == "float":
-                self._dither_lbl.config(
-                    text="○  TPDF Dither (N/A · 32f Float)",
-                    bg="#182735",
-                    fg="#637e96",
-                    highlightbackground="#2b4257",
-                    cursor="arrow",
+                self._dither_btn.setEnabled(False)
+                self._dither_btn.setText("○  TPDF Dither (N/A · 32f Float)")
+                self._dither_btn.setStyleSheet(
+                    f"background-color: #182735; color: #637e96; border: 1px solid #2b4257; "
+                    f"border-radius: {btn_r}px; padding: 2px 6px; font-size: 10px; font-weight: 700;"
                 )
             elif self.bounce_bitdepth >= 32:
-                self._dither_lbl.config(
-                    text="○  TPDF Dither (N/A at 32-bit)",
-                    bg="#182735",
-                    fg="#637e96",
-                    highlightbackground="#2b4257",
-                    cursor="arrow",
+                self._dither_btn.setEnabled(False)
+                self._dither_btn.setText("○  TPDF Dither (N/A at 32-bit)")
+                self._dither_btn.setStyleSheet(
+                    f"background-color: #182735; color: #637e96; border: 1px solid #2b4257; "
+                    f"border-radius: {btn_r}px; padding: 2px 6px; font-size: 10px; font-weight: 700;"
                 )
             elif self.bounce_dither:
-                self._dither_lbl.config(
-                    text="●  TPDF Dither (1-LSB)",
-                    bg="#1f4d3b",
-                    fg="#8cf5c0",
-                    highlightbackground="#48d18a",
-                    cursor="hand2",
+                self._dither_btn.setEnabled(True)
+                self._dither_btn.setText("●  TPDF Dither (1-LSB)")
+                self._dither_btn.setStyleSheet(
+                    f"background-color: #1f4d3b; color: #8cf5c0; border: 1px solid #48d18a; "
+                    f"border-radius: {btn_r}px; padding: 2px 6px; font-size: 10px; font-weight: 700;"
                 )
             else:
-                self._dither_lbl.config(
-                    text="○  TPDF Dither (Off · Round)",
-                    bg="#1d3042",
-                    fg="#9cb8d1",
-                    highlightbackground="#33506b",
-                    cursor="hand2",
+                self._dither_btn.setEnabled(True)
+                self._dither_btn.setText("○  TPDF Dither (Off · Round)")
+                self._dither_btn.setStyleSheet(
+                    f"background-color: #1d3042; color: #9cb8d1; border: 1px solid #33506b; "
+                    f"border-radius: {btn_r}px; padding: 2px 6px; font-size: 10px; font-weight: 700;"
                 )
 
         def _select_bitdepth(depth, sfmt):
@@ -3820,195 +2288,141 @@ class Window:
                 self.bounce_dither = False
             _refresh_export_fmt()
 
-        def _toggle_dither(_e=None):
+        def _toggle_dither():
             if self.bounce_bitdepth >= 32 or self.bounce_sample_format == "float":
                 return
             self.bounce_dither = not self.bounce_dither
             _refresh_export_fmt()
 
         fmt_choices = (
-            (16, "pcm", "16-bit"),
-            (24, "pcm", "24-bit"),
-            (32, "pcm", "32i"),
-            (32, "float", "32f"),
+            (16, "pcm", "16-bit", "16-bit integer PCM WAV (universal playback)"),
+            (24, "pcm", "24-bit", "24-bit integer PCM WAV (studio headroom)"),
+            (32, "pcm", "32i", "32-bit signed integer PCM WAV"),
+            (32, "float", "32f", "32-bit IEEE Float WAV (unclipped stems above 0 dBFS)"),
         )
-        for col_i, (depth, sfmt, text_lbl) in enumerate(fmt_choices):
-            btn = tk.Label(
-                depth_row,
-                text=text_lbl,
-                bg="#1d3042",
-                fg="#9cb8d1",
-                font=("Helvetica", 8, "bold"),
-                pady=3,
-                cursor="hand2",
-                highlightthickness=1,
-                highlightbackground="#33506b",
-            )
-            btn.bind("<Button-1>", lambda _e, d=depth, sf=sfmt: _select_bitdepth(d, sf))
-            btn.grid(row=0, column=col_i, sticky="ew", padx=(0 if col_i == 0 else 3, 0))
-            depth_row.columnconfigure(col_i, weight=1, uniform="bitdepth")
+        for depth, sfmt, text_lbl, tip in fmt_choices:
+            btn = QPushButton(text_lbl, fmt_box)
+            btn.setFixedHeight(22)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.clicked.connect(lambda _checked=False, d=depth, sf=sfmt: _select_bitdepth(d, sf))
+            depth_row.addWidget(btn, 1)
             self._depth_btns[(depth, sfmt)] = btn
+        fmt_layout.addLayout(depth_row)
 
-        self._dither_lbl = tk.Label(
-            fmt_box,
-            text="●  TPDF Dither (1-LSB)",
-            bg="#1f4d3b",
-            fg="#8cf5c0",
-            font=("Helvetica", 8, "bold"),
-            pady=3,
-            cursor="hand2",
-            highlightthickness=1,
-            highlightbackground="#48d18a",
+        self._dither_btn = QPushButton("●  TPDF Dither (1-LSB)", fmt_box)
+        self._dither_btn.setFixedHeight(22)
+        self._dither_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._dither_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._dither_btn.setToolTip(
+            "1-LSB Triangular PDF dither eliminates quantization distortion when reducing bit depth"
         )
-        self._dither_lbl.pack(fill=tk.X)
-        self._dither_lbl.bind("<Button-1>", _toggle_dither)
+        self._dither_btn.clicked.connect(_toggle_dither)
+        fmt_layout.addWidget(self._dither_btn)
+        self._refresh_export_fmt_cb = _refresh_export_fmt
         _refresh_export_fmt()
+        body_layout.addWidget(fmt_box)
 
-        self.export_button = self._make_flat_button(
-            panel,
-            text="Bounce Mix (.wav)",
-            command=self.bounce,
-            bg="#3b7a47",
-            hover_bg="#4a9458",
-            active_bg="#2d6037",
-            pady=7,
+        self.export_button = QPushButton("Bounce Mix (.wav)", body)
+        self.export_button.setObjectName("exportBtn")
+        self.export_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.export_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.export_button.clicked.connect(self.bounce)
+        body_layout.addWidget(self.export_button)
+
+        self._bounce_prog_lbl = QLabel("Bounce: ready", body)
+        self._bounce_prog_lbl.setStyleSheet("background: transparent; color: #9cb8d1; font-size: 10px; font-weight: 700;")
+        body_layout.addWidget(self._bounce_prog_lbl)
+
+        self._bounce_bar = QProgressBar(body)
+        self._bounce_bar.setObjectName("bounceBar")
+        self._bounce_bar.setRange(0, 1000)
+        self._bounce_bar.setValue(0)
+        self._bounce_bar.setTextVisible(False)
+        body_layout.addWidget(self._bounce_bar)
+
+        body_layout.addStretch(1)
+
+        # Quick Guide
+        tips_box = QFrame(body)
+        self._themed_wells.append((tips_box, ""))
+        tips_box.setStyleSheet(
+            f"background-color: {T['bg_header']}; border: 1px solid #38546e; border-radius: 6px;"
         )
-        self.export_button.pack(padx=12, fill=tk.X)
+        tips_layout = QVBoxLayout(tips_box)
+        tips_layout.setContentsMargins(8, 6, 8, 6)
+        tips_layout.setSpacing(3)
 
-        # Bounce progress bar & readout
-        self._bounce_prog_var = tk.StringVar(value="Bounce: ready")
-        tk.Label(
-            panel,
-            textvariable=self._bounce_prog_var,
-            bg=T["bg_strip"],
-            fg=T["text_muted"],
-            font=("Helvetica", 8, "bold"),
-            anchor="w",
-        ).pack(fill=tk.X, padx=12, pady=(8, 2))
+        tips_hdr = QLabel("QUICK GUIDE", tips_box)
+        tips_hdr.setProperty("class", "sectionLbl")
+        tips_layout.addWidget(tips_hdr)
 
-        self._bounce_canvas = tk.Canvas(
-            panel,
-            height=12,
-            bg=T["bg_well"],
-            bd=0,
-            highlightthickness=1,
-            highlightbackground="#38546e",
-        )
-        self._bounce_canvas.pack(fill=tk.X, padx=12, pady=(0, 8))
-        self._bounce_bar_id = self._bounce_canvas.create_rectangle(
-            0, 0, 0, 12, fill="#48d18a", outline=""
-        )
-
-        # Quick guide anchored cleanly at the bottom
-        tips_box = tk.Frame(
-            panel,
-            bg=T["bg_header"],
-            padx=10,
-            pady=8,
-            highlightthickness=1,
-            highlightbackground="#38546e",
-        )
-        tips_box.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(0, 10))
-
-        tk.Label(
-            tips_box,
-            text="QUICK GUIDE",
-            bg=T["bg_header"],
-            fg=T["text_muted"],
-            font=self.font_section,
-            anchor="w",
-        ).pack(fill=tk.X, pady=(0, 4))
-
-        tips = (
-            "• Click / drag top bar to scrub\n"
-            "• Scroll / ± keys to zoom waveform\n"
+        tips_text = QLabel(
+            "• Drag & drop .wav onto any track or slot\n"
+            "• Scroll wheel over waveforms to zoom\n"
+            "• Click / drag top view to scrub playhead\n"
             "• Spacebar toggles Play / Pause\n"
             "• Double-click fader / pan to reset\n"
-            "• Arm ● Rec (flashes), click REC"
-        )
-        tk.Label(
+            "• Arm ● Rec (flashes), click REC",
             tips_box,
-            text=tips,
-            bg=T["bg_header"],
-            fg="#c9dced",
-            font=("Helvetica", 9),
-            justify=tk.LEFT,
-            anchor="w",
-        ).pack(fill=tk.X)
+        )
+        tips_text.setWordWrap(True)
+        tips_text.setStyleSheet("background: transparent; color: #c9dced; font-size: 10px;")
+        tips_layout.addWidget(tips_text)
+        body_layout.addWidget(tips_box)
+
+        self._mixer_layout.addWidget(panel)
 
     # ---------- Thread-safe UI helper ----------
 
     def _ui_call(self, fn, *args, **kwargs):
         if self._closing:
             return
-        if threading.get_ident() == self._main_thread_id:
-            try:
-                fn(*args, **kwargs)
-            except tk.TclError:
-                pass
-        else:
-            self._ui_queue.put((fn, args, kwargs))
-
-    def _drain_ui_queue(self):
-        while not self._closing:
-            try:
-                fn, args, kwargs = self._ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                fn(*args, **kwargs)
-            except tk.TclError:
-                pass
+        self._ui_bridge.post(fn, *args, **kwargs)
 
     def _set_status(self, text):
-        self._ui_call(self.status_var.set, text)
+        self._ui_call(self.status_label.setText, text)
+
+    def _show_info(self, title, message):
+        QMessageBox.information(self.root, title, message)
+
+    def _show_error(self, title, message):
+        QMessageBox.critical(self.root, title, message)
 
     def _set_meter_peaks(
         self, ch_levels, master_levels=None, ch_true_peaks=None, master_true_peaks=None
     ):
-        if hasattr(self, "_meter_lock"):
-            with self._meter_lock:
-                for i in range(min(4, len(ch_levels))):
-                    self._channel_peaks[i] = ch_levels[i]
-                if master_levels is not None and len(master_levels) >= 2:
-                    self._master_peaks[0] = master_levels[0]
-                    self._master_peaks[1] = master_levels[1]
-                # Latch highest true peak between GUI ticks so transient clips are never missed
-                if ch_true_peaks is not None and hasattr(self, "_channel_true_peaks"):
-                    for i in range(min(4, len(ch_true_peaks))):
-                        if ch_true_peaks[i] > self._channel_true_peaks[i]:
-                            self._channel_true_peaks[i] = ch_true_peaks[i]
-                if (
-                    master_true_peaks is not None
-                    and len(master_true_peaks) >= 2
-                    and hasattr(self, "_master_true_peaks")
-                ):
-                    if master_true_peaks[0] > self._master_true_peaks[0]:
-                        self._master_true_peaks[0] = master_true_peaks[0]
-                    if master_true_peaks[1] > self._master_true_peaks[1]:
-                        self._master_true_peaks[1] = master_true_peaks[1]
+        with self._meter_lock:
+            for i in range(min(4, len(ch_levels))):
+                self._channel_peaks[i] = ch_levels[i]
+            if master_levels is not None and len(master_levels) >= 2:
+                self._master_peaks[0] = master_levels[0]
+                self._master_peaks[1] = master_levels[1]
+            if ch_true_peaks is not None:
+                for i in range(min(4, len(ch_true_peaks))):
+                    if ch_true_peaks[i] > self._channel_true_peaks[i]:
+                        self._channel_true_peaks[i] = ch_true_peaks[i]
+            if master_true_peaks is not None and len(master_true_peaks) >= 2:
+                if master_true_peaks[0] > self._master_true_peaks[0]:
+                    self._master_true_peaks[0] = master_true_peaks[0]
+                if master_true_peaks[1] > self._master_true_peaks[1]:
+                    self._master_true_peaks[1] = master_true_peaks[1]
 
     def _reset_meter_peaks(self):
-        if hasattr(self, "_meter_lock"):
-            with self._meter_lock:
-                self._channel_peaks = [0.0, 0.0, 0.0, 0.0]
-                self._master_peaks = [0.0, 0.0]
-                if hasattr(self, "_channel_true_peaks"):
-                    self._channel_true_peaks = [0.0, 0.0, 0.0, 0.0]
-                if hasattr(self, "_master_true_peaks"):
-                    self._master_true_peaks = [0.0, 0.0]
+        with self._meter_lock:
+            self._channel_peaks = [0.0, 0.0, 0.0, 0.0]
+            self._master_peaks = [0.0, 0.0]
+            self._channel_true_peaks = [0.0, 0.0, 0.0, 0.0]
+            self._master_true_peaks = [0.0, 0.0]
 
     def _get_master_volume(self):
-        if hasattr(self, "_master_lock"):
-            with self._master_lock:
-                return self._master_volume
-        return 1.0
+        with self._master_lock:
+            return self._master_volume
 
     def _get_master_limiter_enabled(self):
-        if hasattr(self, "_master_lock"):
-            with self._master_lock:
-                return bool(getattr(self, "_master_limiter_enabled", False))
-        return False
+        with self._master_lock:
+            return bool(getattr(self, "_master_limiter_enabled", False))
 
     def _on_master_limiter_toggle(self, enabled):
         flag = bool(enabled)
@@ -4078,20 +2492,11 @@ class Window:
                     last_exc = exc
         raise last_exc if last_exc is not None else OSError("Could not open audio input stream")
 
-    def _on_master_vol_change(self, value):
-        db = float(value)
+    def _on_master_vol_change(self, db):
         gain = db_to_linear(db)
         with self._master_lock:
             self._master_volume = gain
-        self.master_vol_var.set(format_fader_db(db))
-        if db <= MIN_FADER_DB:
-            self.master_vol_badge.config(fg=self.THEME["text_muted"])
-        elif db > 0.05:
-            self.master_vol_badge.config(fg=self.THEME["boost_coral"])
-        elif abs(db) <= 0.05:
-            self.master_vol_badge.config(fg=self.THEME["unity_gold"])
-        else:
-            self.master_vol_badge.config(fg=self.THEME["text_primary"])
+        self.master_vol_badge.set_db_display(format_fader_db(db), db)
 
     def _update_session_duration(self):
         """Recompute total session duration (max length across loaded channels) and update playhead bar."""
@@ -4113,9 +2518,8 @@ class Window:
             if self._playhead_sec > max_dur:
                 self._playhead_sec = 0.0
             cur_pos = self._playhead_sec
-        if hasattr(self, "timeline"):
-            self._ui_call(self.timeline.set_duration, max_dur)
-            self._ui_call(self.timeline.set_position, cur_pos)
+        self._ui_call(self.timeline.set_duration, max_dur)
+        self._ui_call(self.timeline.set_position, cur_pos)
 
     def seek_to_seconds(self, target_sec):
         """Scrub / seek playhead to target_sec (works stopped, playing, or paused)."""
@@ -4127,191 +2531,147 @@ class Window:
                 is_playing = self.playing
             if is_playing:
                 self._pending_seek_sec = clamped
-        if hasattr(self, "timeline"):
-            self.timeline.set_position(clamped)
+        self.timeline.set_position(clamped)
         if not is_playing and dur > 0.0:
             self._set_status(f"Playhead: {format_timecode(clamped)}")
 
     def _poll_meters(self):
-        """30 FPS main-thread loop: UI queue drain, VU meters, playhead sync, and Rec LED flash."""
+        """60 FPS main-thread loop: VU meters, playhead sync, and armed Rec LED flashing."""
         if self._closing:
             return
 
-        try:
-            self._drain_ui_queue()
-            if self._closing:
-                return
-
-            with self._state_lock:
-                is_playing = self.playing
-                is_paused = self.paused
-                is_recording = self.recording
-
-            with self._meter_lock:
-                ch_peaks = list(self._channel_peaks)
-                m_peaks = list(self._master_peaks)
-                ch_true = list(self._channel_true_peaks)
-                m_true = list(self._master_true_peaks)
-                # Clear latched true peaks after reading so next tick gets fresh peaks
-                self._channel_true_peaks = [0.0, 0.0, 0.0, 0.0]
-                self._master_true_peaks = [0.0, 0.0]
-                if not is_playing and not is_recording:
-                    self._channel_peaks = [0.0, 0.0, 0.0, 0.0]
-                    self._master_peaks = [0.0, 0.0]
-
-            now = time.monotonic()
-            for idx, meter in enumerate(self._channel_meters):
-                meter.update_level(ch_peaks[idx])
-            for idx, readout in enumerate(self._channel_peak_readouts):
-                readout.update(ch_true[idx], now=now)
-            for idx, meter in enumerate(self._master_meters):
-                meter.update_level(m_peaks[idx])
-            if self._master_peak_readout is not None:
-                self._master_peak_readout.update(max(m_true[0], m_true[1]), now=now)
-
-            # Sync playhead indicator, muted clip dimming & live recording waveform overlay
-            if hasattr(self, "timeline"):
-                snaps_aud = [ch.snapshot() for ch in self.channel_states]
-                any_s = any(s.solo for s in snaps_aud)
-                self.timeline.set_audible_flags(
-                    [(not s.mute) and (not any_s or s.solo) for s in snaps_aud]
-                )
-                if is_recording and hasattr(self, "_rec_wave_lock"):
-                    with self._rec_wave_lock:
-                        r_act = self._rec_wave_active
-                        r_armed = list(self._rec_wave_armed)
-                        r_peaks = list(self._rec_wave_peaks)
-                        r_elapsed = self._rec_wave_elapsed
-                    if r_act:
-                        self.timeline.update_live_recording(True, r_armed, r_peaks, r_elapsed)
-                elif is_playing and not is_paused:
-                    with self._seek_lock:
-                        pos_sec = self._playhead_sec
-                    self.timeline.set_position(pos_sec, follow=True)
-
-            # Synchronized ~2 Hz flash for armed Rec buttons (solid red while actively recording)
-            self._blink_tick += 1
-            blink_hi = (self._blink_tick // 14) % 2 == 0
-            any_armed = False
-            for idx, ch in enumerate(self.channel_states):
-                armed = ch.snapshot().rec_armed
-                if armed:
-                    any_armed = True
-                if idx < len(self._rec_pad_modes):
-                    if armed and is_recording:
-                        self._rec_pad_modes[idx]("solid")
-                    elif armed:
-                        self._rec_pad_modes[idx]("blink_hi" if blink_hi else "blink_lo")
-                    else:
-                        self._rec_pad_modes[idx](None)
-
-            if is_recording:
-                self._set_rec_mode("solid")
-            elif any_armed:
-                self._set_rec_mode("blink_hi" if blink_hi else "blink_lo")
-            else:
-                self._set_rec_mode("off")
-        except tk.TclError:
-            return
-        except Exception as exc:
-            print(f"Meter loop warning: {exc}")
-        finally:
-            if not self._closing:
-                try:
-                    self.root.after(33, self._poll_meters)
-                except tk.TclError:
-                    pass
-
-    def _on_root_click(self, event):
-        """Release focus from nameBox when clicking elsewhere so Spacebar shortcut keeps working."""
-        if hasattr(self, "nameBox") and event.widget is not self.nameBox:
-            try:
-                if self.root.focus_get() == self.nameBox:
-                    self.root.focus_set()
-            except Exception:
-                pass
-
-    def _on_zoom_key(self, action):
-        """Keyboard zoom shortcuts (+ / - / 0), ignored while typing in Name box."""
-        try:
-            if self.root.focus_get() == self.nameBox:
-                return
-        except Exception:
-            pass
-        if not hasattr(self, "timeline"):
-            return
-        if action == "in":
-            self.timeline.zoom_in()
-        elif action == "out":
-            self.timeline.zoom_out()
-        elif action == "reset":
-            self.timeline.reset_zoom()
-
-    def _on_space_key(self, _event):
-        """Spacebar shortcut to Play / Pause / Resume (ignored while typing in Name box)."""
-        try:
-            if self.root.focus_get() == self.nameBox:
-                return
-        except Exception:
-            pass
         with self._state_lock:
             is_playing = self.playing
-            is_busy_other = self.recording or self.bouncing
-        if is_busy_other:
+            is_paused = self.paused
+            is_recording = self.recording
+
+        with self._meter_lock:
+            ch_peaks = list(self._channel_peaks)
+            m_peaks = list(self._master_peaks)
+            ch_true = list(self._channel_true_peaks)
+            m_true = list(self._master_true_peaks)
+            self._channel_true_peaks = [0.0, 0.0, 0.0, 0.0]
+            self._master_true_peaks = [0.0, 0.0]
+            if not is_playing and not is_recording:
+                self._channel_peaks = [0.0, 0.0, 0.0, 0.0]
+                self._master_peaks = [0.0, 0.0]
+
+        now = time.monotonic()
+        for idx, meter in enumerate(self._channel_meters):
+            meter.update_level(ch_peaks[idx])
+        for idx, readout in enumerate(self._channel_peak_readouts):
+            readout.update_peak(ch_true[idx], now=now)
+        for idx, meter in enumerate(self._master_meters):
+            meter.update_level(m_peaks[idx])
+        if self._master_peak_readout is not None:
+            self._master_peak_readout.update_peak(max(m_true[0], m_true[1]), now=now)
+
+        snaps_aud = [ch.snapshot() for ch in self.channel_states]
+        any_s = any(s.solo for s in snaps_aud)
+        self.timeline.set_audible_flags([(not s.mute) and (not any_s or s.solo) for s in snaps_aud])
+
+        if is_recording:
+            with self._rec_wave_lock:
+                r_act = self._rec_wave_active
+                r_armed = list(self._rec_wave_armed)
+                r_peaks = list(self._rec_wave_peaks)
+                r_elapsed = self._rec_wave_elapsed
+            if r_act:
+                self.timeline.update_live_recording(True, r_armed, r_peaks, r_elapsed)
+        elif is_playing and not is_paused:
+            with self._seek_lock:
+                pos_sec = self._playhead_sec
+            self.timeline.set_position(pos_sec)
+
+        # Synchronized ~2 Hz flash for armed Rec buttons (30 FPS -> toggle every 14 ticks)
+        self._blink_tick += 1
+        blink_hi = (self._blink_tick // 14) % 2 == 0
+        any_armed = False
+        for idx, snap in enumerate(snaps_aud):
+            armed = snap.rec_armed
+            if armed:
+                any_armed = True
+            if idx < len(self._rec_pad_modes):
+                if armed and is_recording:
+                    self._rec_pad_modes[idx]("solid")
+                elif armed:
+                    self._rec_pad_modes[idx]("blink_hi" if blink_hi else "blink_lo")
+                else:
+                    self._rec_pad_modes[idx](None)
+
+        if is_recording:
+            self._set_rec_mode("solid")
+        elif any_armed:
+            self._set_rec_mode("blink_hi" if blink_hi else "blink_lo")
+        else:
+            self._set_rec_mode("off")
+
+    def _on_space_key(self, ignore_focus=False):
+        """Spacebar shortcut: Play/Pause/Resume, or Stop when recording (ignored while typing or bouncing)."""
+        if not ignore_focus and self.nameBox.hasFocus():
             return
-        if is_playing:
+        with self._state_lock:
+            is_playing = self.playing
+            is_recording = self.recording
+            is_bouncing = self.bouncing
+        if is_bouncing:
+            return
+        if is_recording:
+            self.stop()
+        elif is_playing:
             self.press_pause()
         else:
             self.press_play()
 
     def _set_bounce_progress(self, fraction, label=None, bar_color="#48d18a"):
-        """Update the Bounce progress bar (must run on the Tkinter main thread)."""
         frac = max(0.0, min(1.0, float(fraction)))
-        try:
-            width = self._bounce_canvas.winfo_width()
-            if width <= 1:
-                width = 204
-            self._bounce_canvas.coords(self._bounce_bar_id, 0, 0, int(round(width * frac)), 12)
-            self._bounce_canvas.itemconfig(self._bounce_bar_id, fill=bar_color)
-            if label is not None:
-                self._bounce_prog_var.set(label)
-        except Exception:
-            pass
+        self._bounce_bar.setValue(int(round(frac * 1000)))
+        if bar_color != self._last_bounce_color:
+            self._last_bounce_color = bar_color
+            self._bounce_bar.setStyleSheet(
+                f"""
+                QProgressBar#bounceBar {{
+                    background-color: {self.THEME['bg_well']};
+                    border: 1px solid #38546e;
+                    border-radius: 4px;
+                    max-height: 12px;
+                    min-height: 12px;
+                }}
+                QProgressBar#bounceBar::chunk {{
+                    background-color: {bar_color};
+                    border-radius: 3px;
+                }}
+                """
+            )
+        if label is not None:
+            self._bounce_prog_lbl.setText(label)
 
     # ---------- Slider & Effect Popup Callbacks ----------
 
-    def _on_vol_change(self, channel_idx, value, label_var, badge=None):
-        db = float(value)
-        self.channel_states[channel_idx].set_volume_db(db)
-        label_var.set(format_fader_db(db))
+    def _on_vol_change(self, channel_idx, db, badge=None):
+        val = float(db)
+        self.channel_states[channel_idx].set_volume_db(val)
         if badge is not None:
-            if db <= MIN_FADER_DB:
-                badge.config(fg=self.THEME["text_muted"])
-            elif db > 0.05:
-                badge.config(fg=self.THEME["boost_coral"])
-            elif abs(db) <= 0.05:
-                badge.config(fg=self.THEME["unity_gold"])
-            else:
-                badge.config(fg=self.THEME["text_primary"])
+            badge.set_db_display(format_fader_db(val), val)
 
-    def _on_pan_change(self, channel_idx, value, label_var):
+    def _on_pan_change(self, channel_idx, value, label_widget):
         val = float(value)
         self.channel_states[channel_idx].set_pan(val)
         if abs(val - 0.5) < 0.02:
-            label_var.set("Pan: C")
+            label_widget.setText("Pan: C")
         elif val < 0.5:
             pct = int(round((0.5 - val) * 200))
-            label_var.set(f"Pan: {pct}% L")
+            label_widget.setText(f"Pan: {pct}% L")
         else:
             pct = int(round((val - 0.5) * 200))
-            label_var.set(f"Pan: {pct}% R")
+            label_widget.setText(f"Pan: {pct}% R")
 
-    def _on_effect_toggle(self, channel_idx, effect_key, var):
-        enabled = bool(var.get())
-        if enabled and effect_key in ("delay", "chorus"):
+    def _on_effect_toggle(self, channel_idx, effect_key, enabled):
+        en = bool(enabled)
+        if en and effect_key in ("delay", "chorus"):
             self.channel_states[channel_idx].get_processor(effect_key).reset()
-        self.channel_states[channel_idx].set_effect_enabled(effect_key, enabled)
-        if enabled:
+        self.channel_states[channel_idx].set_effect_enabled(effect_key, en)
+        if en:
             self.open_effect_window(channel_idx, effect_key)
         else:
             self._close_effect_window(channel_idx, effect_key)
@@ -4344,6 +2704,56 @@ class Window:
         )
         self._effect_windows[key] = popup
 
+    def _position_effect_window(self, popup):
+        """Tile newly opened effect popups side-by-side instead of stacking on top of each other."""
+        try:
+            screen = self.root.screen() or QApplication.primaryScreen()
+            avail = screen.availableGeometry() if screen is not None else self.root.frameGeometry()
+            root_geo = self.root.frameGeometry()
+
+            # Include titlebar allowance (~28 px on macOS) so rows never overlap frame-to-frame
+            frame_extra_h = max(28, popup.frameGeometry().height() - popup.height())
+            pw = max(popup.width(), popup.sizeHint().width(), 340)
+            ph = max(popup.height(), popup.sizeHint().height(), 240) + frame_extra_h
+            gap = 12
+
+            occupied = [
+                p.frameGeometry()
+                for p in self._effect_windows.values()
+                if p is not popup and p.is_open()
+            ]
+
+            start_x = max(avail.left() + gap, root_geo.left() + 24)
+            if start_x + pw > avail.right() - gap:
+                start_x = avail.left() + gap
+            start_y = max(avail.top() + gap, root_geo.top() + 72)
+            if start_y + ph > avail.bottom() - gap:
+                start_y = avail.top() + gap
+
+            # Search left-to-right, top-to-bottom for the first non-overlapping slot
+            y = start_y
+            placed = False
+            while y + ph <= avail.bottom() - gap:
+                x = start_x
+                while x + pw <= avail.right() - gap:
+                    cand = QRect(x, y, pw, ph)
+                    if not any(cand.adjusted(-6, -6, 6, 6).intersects(r) for r in occupied):
+                        popup.move(x, y)
+                        placed = True
+                        break
+                    x += pw + gap
+                if placed:
+                    break
+                y += ph + gap
+
+            if not placed:
+                offset = (len(occupied) % 6) * 28
+                cx = min(avail.right() - pw - gap, start_x + offset)
+                cy = min(avail.bottom() - ph - gap, start_y + offset)
+                popup.move(max(avail.left() + gap, cx), max(avail.top() + gap, cy))
+        except Exception:
+            pass
+
     def _close_effect_window(self, channel_idx, effect_key):
         key = (channel_idx, effect_key)
         popup = self._effect_windows.pop(key, None)
@@ -4353,20 +2763,23 @@ class Window:
     # ---------- File Loading ----------
 
     def open_channel_file(self, channel_idx):
-        if self._is_busy():
-            messagebox.showinfo(
-                "Mixer Busy",
-                "Please stop playback, recording, or bounce before loading a channel.",
-                parent=self.root,
-            )
-            return
-
-        filepath = askopenfilename(
-            parent=self.root,
-            title=f"Load WAV for Channel {channel_idx + 1}",
-            filetypes=(("WAV files", "*.wav"), ("All files", "*.*")),
+        filepath, _ = QFileDialog.getOpenFileName(
+            self.root,
+            f"Load WAV for Channel {channel_idx + 1}",
+            BASE_DIR,
+            "WAV files (*.wav);;All files (*.*)",
         )
-        if not filepath or self._closing or self._is_busy():
+        if not filepath:
+            return
+        self.load_channel_file_path(channel_idx, filepath)
+
+    def load_channel_file_path(self, channel_idx, filepath):
+        """Load a WAV file path directly into a channel (used by file dialog and drag-and-drop)."""
+        if self._is_busy():
+            self._show_info(
+                "Mixer Busy",
+                "Please stop playback, recording, or bounce before loading a new file.",
+            )
             return
 
         try:
@@ -4384,17 +2797,14 @@ class Window:
                     raise ValueError(f"Unsupported IEEE Float WAV bit depth: {bitdepth}-bit")
                 length = int(wf.getnframes() / samplefreq)
         except Exception as exc:
-            messagebox.showerror("Error loading WAV", f"Could not open file:\n{exc}", parent=self.root)
+            self._show_error("Error loading WAV", f"Could not open file:\n{exc}")
             return
 
         self.channel_states[channel_idx].set_filepath(filepath)
-        short_name = os.path.basename(filepath)
-        if len(short_name) > 17:
-            short_name = short_name[:14] + "..."
-        self._ch_widgets[channel_idx]["file_var"].set(short_name)
-        self._ch_widgets[channel_idx]["meta_var"].set(
-            format_audio_meta(samplefreq, bitdepth, channels, samplefmt)
-        )
+        well = self._ch_widgets[channel_idx]["file_well"]
+        well.set_file_text(os.path.basename(filepath))
+        well.file_btn.setToolTip(filepath)
+        well.set_meta_text(format_audio_meta(samplefreq, bitdepth, channels, samplefmt))
 
         mins, secs = divmod(length, 60)
         print(
@@ -4405,45 +2815,86 @@ class Window:
             f"  Bit Depth: {bitdepth}-bit\n"
             f"  Duration: {mins}:{secs:02d}"
         )
-        if hasattr(self, "timeline"):
-            self.timeline.clear_track(channel_idx)
+        self.timeline.clear_track(channel_idx)
         self._update_session_duration()
         self._load_channel_waveform_async(channel_idx, filepath)
         self._set_status(f"Loaded Ch {channel_idx + 1}: {os.path.basename(filepath)}")
 
     def _load_channel_waveform_async(self, channel_idx, filepath):
-        """Extract waveform envelope on a background thread and paint it on the Arrange view."""
+        """Extract high-resolution waveform envelope on a background thread and paint it on the Arrange view."""
+
         def _worker():
             try:
                 peaks, dur = extract_waveform_peaks(filepath, num_bins=2400)
             except Exception as exc:
                 print(f"Waveform extraction skipped: {exc}")
                 return
-            def _apply_waveform():
-                if self.channel_states[channel_idx].get_filepath() != filepath:
-                    return
-                if hasattr(self, "timeline"):
-                    self.timeline.set_track_waveform(
-                        channel_idx,
-                        peaks,
-                        dur,
-                        os.path.basename(filepath),
-                    )
-
-            # Only apply if channel still points to the same file (re-checked on main thread)
             if self.channel_states[channel_idx].get_filepath() != filepath:
                 return
-            self._ui_call(_apply_waveform)
+
+            def _apply():
+                if self.channel_states[channel_idx].get_filepath() != filepath:
+                    return
+                self.timeline.set_track_waveform(
+                    channel_idx,
+                    peaks,
+                    dur,
+                    os.path.basename(filepath),
+                )
+
+            self._ui_call(_apply)
 
         threading.Thread(target=_worker, name=f"WaveformCh{channel_idx + 1}", daemon=True).start()
+
+    def _load_zoomed_waveforms_async(self, start_sec, end_sec, num_bins):
+        """Extract sample-accurate zoomed waveform detail for the currently visible timeline window."""
+        self._zoom_detail_gen += 1
+        gen = self._zoom_detail_gen
+        paths = [ch.get_filepath() for ch in self.channel_states]
+        if not any(paths):
+            return
+
+        def _worker():
+            for ch_idx, path in enumerate(paths):
+                if self._closing or gen != self._zoom_detail_gen:
+                    return
+                if not path:
+                    continue
+                try:
+                    with open_wav_read(path) as wf:
+                        track_dur = wf.getnframes() / float(max(1, wf.getframerate()))
+                    vis_s = max(0.0, float(start_sec))
+                    vis_e = min(track_dur, float(end_sec))
+                    if vis_e <= vis_s:
+                        continue
+                    bins, _ = extract_waveform_peaks(
+                        path,
+                        num_bins=max(200, int(num_bins)),
+                        start_sec=vis_s,
+                        end_sec=vis_e,
+                    )
+                except Exception:
+                    continue
+                if self._closing or gen != self._zoom_detail_gen:
+                    return
+                if self.channel_states[ch_idx].get_filepath() != path:
+                    continue
+
+                def _apply_detail(c=ch_idx, p=path, b=bins, s=vis_s, e=vis_e, g=gen):
+                    if g != self._zoom_detail_gen or self.channel_states[c].get_filepath() != p:
+                        return
+                    self.timeline.set_track_detail(c, b, s, e)
+
+                self._ui_call(_apply_detail)
+
+        threading.Thread(target=_worker, name=f"WaveformZoom{gen}", daemon=True).start()
 
     def clear_channel_file(self, channel_idx):
         """Clear the loaded WAV file from a channel without needing to load another."""
         if self._is_busy():
-            messagebox.showinfo(
+            self._show_info(
                 "Mixer Busy",
                 "Please stop playback, recording, or bounce before clearing a channel.",
-                parent=self.root,
             )
             return
 
@@ -4452,10 +2903,13 @@ class Window:
 
         self.channel_states[channel_idx].set_filepath(None)
         self.channel_states[channel_idx].reset_effects()
-        self._ch_widgets[channel_idx]["file_var"].set("(click to load)")
-        self._ch_widgets[channel_idx]["meta_var"].set("—")
-        if hasattr(self, "timeline"):
-            self.timeline.clear_track(channel_idx)
+        self._channel_meters[channel_idx].reset()
+        self._channel_peak_readouts[channel_idx].clear()
+        well = self._ch_widgets[channel_idx]["file_well"]
+        well.set_file_text("(click or drop .wav)")
+        well.file_btn.setToolTip("Click to browse for a .wav file, or drag & drop one here")
+        well.set_meta_text("—")
+        self.timeline.clear_track(channel_idx)
         self._update_session_duration()
         self._set_status(f"Cleared Channel {channel_idx + 1}")
 
@@ -4468,71 +2922,53 @@ class Window:
     def _require_pyaudio(self, action_name):
         if pyaudio is None:
             detail = f"\n\nImport error: {_PYAUDIO_IMPORT_ERROR}" if _PYAUDIO_IMPORT_ERROR else ""
-            messagebox.showerror(
+            self._show_error(
                 "PyAudio Not Installed",
                 f"Cannot start {action_name} because 'pyaudio' could not be loaded in this Python environment.{detail}\n\n"
                 "Install PortAudio and PyAudio, e.g.:\n"
                 "  brew install portaudio\n"
                 "  pip install pyaudio\n\n"
                 "(Note: Offline Bounce still works without PyAudio.)",
-                parent=self.root,
             )
             return False
         return True
-
-    @staticmethod
-    def _audible_delay_indices(snapshots, master_gain=1.0):
-        """Return indices of loaded, audible channels that have Delay enabled."""
-        if float(master_gain) <= 0.0:
-            return []
-        any_solo = any(s.solo for s in snapshots)
-        return [
-            idx
-            for idx, s in enumerate(snapshots)
-            if s.filepath
-            and s.delay_enabled
-            and (not s.mute)
-            and (not any_solo or s.solo)
-            and s.volume > 0.0
-        ]
 
     def press_play(self):
         if not self._require_pyaudio("playback"):
             return
 
         resumed = False
-        busy = False
         already_playing = False
+        busy = False
         with self._state_lock:
             if self.playing:
-                already_playing = True
                 if self.paused:
-                    # Resume seamlessly from paused position
                     self.paused = False
                     self._pause_event.set()
                     resumed = True
+                else:
+                    already_playing = True
             elif self.recording or self.bouncing:
                 busy = True
 
+        if resumed:
+            self._ui_call(self._set_pause_lit, False)
+            self._ui_call(self._set_play_lit, True)
+            return
         if already_playing:
-            if resumed:
-                self._ui_call(self._set_pause_lit, False)
-                self._ui_call(self._set_play_lit, True)
             return
         if busy:
-            messagebox.showinfo(
+            self._show_info(
                 "Mixer Busy",
                 "Please stop recording or wait for bounce to finish before playing.",
-                parent=self.root,
             )
             return
 
         loaded = [ch.get_filepath() for ch in self.channel_states if ch.get_filepath()]
         if not loaded:
-            messagebox.showinfo(
+            self._show_info(
                 "No Audio Loaded",
                 "There's no audio file opened to play. Please load at least one .wav file.",
-                parent=self.root,
             )
             return
 
@@ -4578,12 +3014,27 @@ class Window:
             self._ui_call(self._set_play_lit, False)
             self._ui_call(self._set_pause_lit, True)
 
+    @staticmethod
+    def _audible_delay_indices(snapshots, master_gain=1.0):
+        """Return indices of loaded, audible channels that have Delay enabled."""
+        if float(master_gain) <= 0.0:
+            return []
+        any_solo = any(s.solo for s in snapshots)
+        return [
+            idx
+            for idx, s in enumerate(snapshots)
+            if s.filepath
+            and s.delay_enabled
+            and (not s.mute)
+            and (not any_solo or s.solo)
+            and s.volume > 0.0
+        ]
+
     def _play_worker(self):
         pa = None
         stream = None
         wav_handles = [None] * 4
         readers = [None] * 4
-        play_err = None
 
         try:
             print("Now playing...")
@@ -4635,29 +3086,24 @@ class Window:
             chunk_true_peaks = [0.0, 0.0, 0.0, 0.0]
             master_true_peaks = [0.0, 0.0]
 
-            # Start playback from current scrubbed playhead position (if > 0 and < duration)
-            if hasattr(self, "_seek_lock"):
+            with self._seek_lock:
+                start_sec = self._playhead_sec
+                dur_sec = self._session_duration_sec
+                self._pending_seek_sec = None
+            if start_sec > 0.01 and (dur_sec <= 0.0 or start_sec < dur_sec - 0.05):
+                _apply_seek(start_sec)
+            else:
                 with self._seek_lock:
-                    start_sec = self._playhead_sec
-                    dur_sec = self._session_duration_sec
-                    self._pending_seek_sec = None
-                if start_sec > 0.01 and (dur_sec <= 0.0 or start_sec < dur_sec - 0.05):
-                    _apply_seek(start_sec)
-                else:
-                    with self._seek_lock:
-                        self._playhead_sec = 0.0
+                    self._playhead_sec = 0.0
 
             while not self._stop_event.is_set():
-                # Check for live scrub / seek request
-                if hasattr(self, "_seek_lock"):
-                    with self._seek_lock:
-                        req_seek = self._pending_seek_sec
-                        self._pending_seek_sec = None
-                    if req_seek is not None:
-                        _apply_seek(req_seek)
+                with self._seek_lock:
+                    req_seek = self._pending_seek_sec
+                    self._pending_seek_sec = None
+                if req_seek is not None:
+                    _apply_seek(req_seek)
 
-                # Handle Pause / Resume cleanly at chunk boundary with zero CPU spin
-                if hasattr(self, "_pause_event") and not self._pause_event.is_set():
+                if not self._pause_event.is_set():
                     elapsed = int(frames_played / float(session_rate))
                     self._set_status(f"Paused {format_timecode(elapsed)}")
                     self._reset_meter_peaks()
@@ -4666,17 +3112,21 @@ class Window:
                     except Exception:
                         pass
                     while not self._pause_event.is_set() and not self._stop_event.is_set():
-                        # Allow scrubbing while paused so resume starts at the new spot
-                        if hasattr(self, "_seek_lock"):
-                            with self._seek_lock:
-                                req_seek = self._pending_seek_sec
-                                self._pending_seek_sec = None
-                            if req_seek is not None:
-                                _apply_seek(req_seek)
-                                self._set_status(f"Paused {format_timecode(req_seek)}")
+                        with self._seek_lock:
+                            req_seek = self._pending_seek_sec
+                            self._pending_seek_sec = None
+                        if req_seek is not None:
+                            _apply_seek(req_seek)
+                            self._set_status(f"Paused {format_timecode(req_seek)}")
                         self._pause_event.wait(timeout=0.05)
                     if self._stop_event.is_set():
                         break
+                    # Drain any seek queued right before resume so we never play a stale chunk
+                    with self._seek_lock:
+                        req_seek = self._pending_seek_sec
+                        self._pending_seek_sec = None
+                    if req_seek is not None:
+                        _apply_seek(req_seek)
                     try:
                         stream.start_stream()
                     except Exception:
@@ -4748,7 +3198,6 @@ class Window:
                 )
 
                 if in_tail and tail_frames_emitted > min_tail_frames and pcm_bytes:
-                    # Stop tail early once past one full delay cycle and virtually silent
                     if max(master_true_peaks[0], master_true_peaks[1]) < 1.2e-4:
                         print("Audio ended")
                         break
@@ -4756,37 +3205,32 @@ class Window:
                 if pcm_bytes:
                     stream.write(pcm_bytes)
                     frames_played += len(pcm_bytes) // out_frame_bytes
-                    if hasattr(self, "_seek_lock") and not self._stop_event.is_set():
-                        with self._seek_lock:
-                            if self._pending_seek_sec is None:
-                                self._playhead_sec = frames_played / float(session_rate)
+                    with self._seek_lock:
+                        if self._pending_seek_sec is None and not self._stop_event.is_set():
+                            self._playhead_sec = frames_played / float(session_rate)
 
                 now = time.monotonic()
-                if now - last_ui_update >= 0.25:
+                if now - last_ui_update >= 0.25 and not self._stop_event.is_set():
                     elapsed = int(frames_played / float(session_rate))
                     self._set_status(f"Playing {format_timecode(elapsed)}")
                     last_ui_update = now
 
             if self._stop_event.is_set():
-                if hasattr(self, "_seek_lock"):
-                    with self._seek_lock:
-                        self._playhead_sec = 0.0
-                        self._pending_seek_sec = None
-                if hasattr(self, "timeline"):
-                    self._ui_call(self.timeline.set_position, 0.0)
+                with self._seek_lock:
+                    self._playhead_sec = 0.0
+                    self._pending_seek_sec = None
+                self._ui_call(self.timeline.set_position, 0.0)
                 self._set_status("Stopped")
             else:
                 self._set_status("Playback finished")
-                if hasattr(self, "_seek_lock"):
-                    with self._seek_lock:
-                        self._playhead_sec = 0.0
-                if hasattr(self, "timeline"):
-                    self._ui_call(self.timeline.set_position, 0.0)
+                with self._seek_lock:
+                    self._playhead_sec = 0.0
+                self._ui_call(self.timeline.set_position, 0.0)
 
         except Exception as exc:
             print(f"Playback error: {exc}")
             self._set_status("Playback error")
-            play_err = str(exc)
+            self._ui_call(self._show_error, "Playback Error", f"An error occurred during playback:\n{exc}")
         finally:
             self._reset_meter_peaks()
             for wf in wav_handles:
@@ -4809,16 +3253,9 @@ class Window:
             with self._state_lock:
                 self.playing = False
                 self.paused = False
-            if hasattr(self, "_pause_event"):
-                self._pause_event.set()
-            if hasattr(self, "_set_play_lit"):
-                self._ui_call(self._set_play_lit, False)
-            if hasattr(self, "_set_pause_lit"):
-                self._ui_call(self._set_pause_lit, False)
-        if play_err is not None:
-            self._ui_call(
-                messagebox.showerror, "Playback Error", f"An error occurred during playback:\n{play_err}", parent=self.root
-            )
+            self._pause_event.set()
+            self._ui_call(self._set_play_lit, False)
+            self._ui_call(self._set_pause_lit, False)
 
     # ---------- Recording (Multithreaded, with Overdub Support) ----------
 
@@ -4830,7 +3267,6 @@ class Window:
         busy = False
         with self._state_lock:
             if self.recording:
-                # Clicking Rec again stops recording
                 self._stop_event.set()
                 stopping = True
             elif self.playing or self.bouncing:
@@ -4840,36 +3276,31 @@ class Window:
             self._set_status("Stopping recording...")
             return
         if busy:
-            messagebox.showinfo(
+            self._show_info(
                 "Mixer Busy",
                 "Please stop playback or wait for bounce to finish before recording.",
-                parent=self.root,
             )
             return
 
-        armed_indices = [
-            idx for idx, ch in enumerate(self.channel_states) if ch.snapshot().rec_armed
-        ]
+        armed_indices = [idx for idx, ch in enumerate(self.channel_states) if ch.snapshot().rec_armed]
         if not armed_indices:
-            messagebox.showinfo(
+            self._show_info(
                 "No Channel Armed",
-                "Please arm at least one channel by enabling its '● Rec' button before recording.",
-                parent=self.root,
+                "Please arm at least one channel by clicking its '● Rec' pad before recording.",
             )
             return
 
-        raw_name = self.nameEntry.get().strip()
-        if not raw_name:
-            base_name = f"recording_{time.strftime('%Y%m%d_%H%M%S')}"
-        else:
+        raw_name = self.nameBox.text().strip()
+        if raw_name:
             base_name = sanitize_filename_stem(raw_name)
             if not base_name:
-                messagebox.showerror(
+                self._show_error(
                     "Invalid Recording Name",
                     "Please enter a valid filename (avoid slashes or special path characters).",
-                    parent=self.root,
                 )
                 return
+        else:
+            base_name = f"recording_{time.strftime('%Y%m%d_%H%M%S')}"
 
         with self._state_lock:
             if self.playing or self.recording or self.bouncing:
@@ -4900,8 +3331,6 @@ class Window:
         wav_handles = [None] * 4
         readers = [None] * 4
         recorded_frames = []
-        armed_set = set(armed_indices)
-        rec_err = None
 
         try:
             rec_sfmt = "float" if rec_sample_format == "float" else "pcm"
@@ -4914,10 +3343,9 @@ class Window:
                 pa, session_rate, rec_bd, rec_sfmt
             )
 
-            # Open non-armed loaded channels for synchronized overdub playback
             has_overdub = False
             for idx, ch in enumerate(self.channel_states):
-                if idx in armed_set:
+                if idx in armed_indices:
                     continue
                 path = ch.get_filepath()
                 if path:
@@ -4952,27 +3380,26 @@ class Window:
             overdub_tail_rem = 0
             overdub_tail_emitted = 0
             overdub_min_tail = 0
+            armed_set = set(armed_indices)
             chunk_levels = [0.0, 0.0, 0.0, 0.0]
             master_levels = [0.0, 0.0]
             chunk_true_peaks = [0.0, 0.0, 0.0, 0.0]
             master_true_peaks = [0.0, 0.0]
 
-            if hasattr(self, "_rec_wave_lock"):
-                with self._rec_wave_lock:
-                    self._rec_wave_armed = list(armed_indices)
-                    self._rec_wave_peaks = []
-                    self._rec_wave_stride = 1
-                    self._rec_wave_accum = 0.0
-                    self._rec_wave_count = 0
-                    self._rec_wave_elapsed = 0.0
-                    self._rec_wave_active = True
+            with self._rec_wave_lock:
+                self._rec_wave_armed = list(armed_indices)
+                self._rec_wave_peaks = []
+                self._rec_wave_stride = 1
+                self._rec_wave_accum = 0.0
+                self._rec_wave_count = 0
+                self._rec_wave_elapsed = 0.0
+                self._rec_wave_active = True
 
             while not self._stop_event.is_set():
                 raw_in = in_stream.read(self.buffer, exception_on_overflow=False)
                 recorded_frames.append(raw_in)
                 frames_recorded += len(raw_in) // in_frame_bytes
 
-                # Compute live VU RMS + true sample peak for armed microphone input channels
                 if cap_fmt == "float32":
                     in_arr = array.array("f")
                     in_arr.frombytes(raw_in[: (len(raw_in) // 4) * 4])
@@ -5016,7 +3443,6 @@ class Window:
                 master_true_peaks[0] = 0.0
                 master_true_peaks[1] = 0.0
 
-                # Play back non-armed tracks in sync if available
                 if out_stream is not None:
                     chunks = [[] for _ in range(4)]
                     any_data = False
@@ -5030,11 +3456,9 @@ class Window:
                         chunks[idx] = mono
 
                     raw_snaps = [ch.snapshot() for ch in self.channel_states]
-                    # Mask armed channels so Solo on an armed track cannot silence backing tracks
+                    # Mask armed channels so Solo on an armed channel never silences backing tracks
                     snapshots = [
-                        s._replace(solo=False, mute=True, filepath=None)
-                        if idx in armed_set
-                        else s
+                        s._replace(solo=False, mute=True, filepath=None) if idx in armed_set else s
                         for idx, s in enumerate(raw_snaps)
                     ]
                     master_gain = self._get_master_volume()
@@ -5106,37 +3530,34 @@ class Window:
                     chunk_levels, master_levels, chunk_true_peaks, master_true_peaks
                 )
 
-                if hasattr(self, "_rec_wave_lock"):
-                    with self._rec_wave_lock:
-                        # Uniform stride accumulation keeps live waveform linearly aligned with ruler
-                        if in_pk > self._rec_wave_accum:
-                            self._rec_wave_accum = in_pk
-                        self._rec_wave_count += 1
-                        if self._rec_wave_count >= self._rec_wave_stride:
-                            self._rec_wave_peaks.append(self._rec_wave_accum)
-                            self._rec_wave_accum = 0.0
-                            self._rec_wave_count = 0
-                            if len(self._rec_wave_peaks) >= 1200:
-                                n_p = len(self._rec_wave_peaks)
-                                compacted = [
-                                    max(self._rec_wave_peaks[k], self._rec_wave_peaks[k + 1])
-                                    for k in range(0, n_p - 1, 2)
-                                ]
-                                if n_p % 2 == 1:
-                                    self._rec_wave_accum = self._rec_wave_peaks[-1]
-                                    self._rec_wave_count = self._rec_wave_stride
-                                self._rec_wave_peaks = compacted
-                                self._rec_wave_stride *= 2
-                        self._rec_wave_elapsed = frames_recorded / float(session_rate)
+                with self._rec_wave_lock:
+                    # Uniform stride accumulation keeps live waveform linearly aligned with ruler
+                    if in_pk > self._rec_wave_accum:
+                        self._rec_wave_accum = in_pk
+                    self._rec_wave_count += 1
+                    if self._rec_wave_count >= self._rec_wave_stride:
+                        self._rec_wave_peaks.append(self._rec_wave_accum)
+                        self._rec_wave_accum = 0.0
+                        self._rec_wave_count = 0
+                        if len(self._rec_wave_peaks) >= 1200:
+                            n_p = len(self._rec_wave_peaks)
+                            compacted = [
+                                max(self._rec_wave_peaks[k], self._rec_wave_peaks[k + 1])
+                                for k in range(0, n_p - 1, 2)
+                            ]
+                            if n_p % 2 == 1:
+                                self._rec_wave_accum = self._rec_wave_peaks[-1]
+                                self._rec_wave_count = self._rec_wave_stride
+                            self._rec_wave_peaks = compacted
+                            self._rec_wave_stride *= 2
+                    self._rec_wave_elapsed = frames_recorded / float(session_rate)
 
                 now = time.monotonic()
                 if now - last_ui_update >= 0.25:
                     elapsed = int(frames_recorded / float(session_rate))
-                    mins, secs = divmod(elapsed, 60)
-                    self._set_status(f"Recording {mins:02d}:{secs:02d}")
+                    self._set_status(f"Recording {format_timecode(elapsed)}")
                     last_ui_update = now
 
-            # Save recorded WAV file(s) and load them into armed channels
             raw_all = b"".join(recorded_frames)
             if not raw_all:
                 self._set_status("Recording cancelled")
@@ -5150,23 +3571,19 @@ class Window:
                     ) as wf_out:
                         wf_out.writeframes(out_bytes)
                     self.channel_states[idx].set_filepath(out_path)
-                    short_name = filename if len(filename) <= 17 else filename[:14] + "..."
-                    self._ui_call(self._ch_widgets[idx]["file_var"].set, short_name)
-                    if "meta_var" in self._ch_widgets[idx]:
-                        self._ui_call(
-                            self._ch_widgets[idx]["meta_var"].set,
-                            format_audio_meta(session_rate, rec_bd, 1, rec_sfmt),
-                        )
+                    well = self._ch_widgets[idx]["file_well"]
+                    self._ui_call(well.set_file_text, filename)
+                    self._ui_call(well.file_btn.setToolTip, out_path)
+                    self._ui_call(
+                        well.set_meta_text, format_audio_meta(session_rate, rec_bd, 1, rec_sfmt)
+                    )
                     saved_files.append(filename)
                     print(f"Saved recording ({rec_tag}) to {out_path}")
 
-                if hasattr(self, "_rec_wave_lock"):
-                    with self._rec_wave_lock:
-                        self._rec_wave_active = False
-                if hasattr(self, "timeline"):
-                    self._ui_call(self.timeline.update_live_recording, False)
-                if hasattr(self, "_seek_lock"):
-                    self._update_session_duration()
+                with self._rec_wave_lock:
+                    self._rec_wave_active = False
+                self._ui_call(self.timeline.update_live_recording, False)
+                self._update_session_duration()
                 for idx in armed_indices:
                     path = self.channel_states[idx].get_filepath()
                     if path:
@@ -5176,13 +3593,11 @@ class Window:
         except Exception as exc:
             print(f"Recording error: {exc}")
             self._set_status("Recording error")
-            rec_err = str(exc)
+            self._ui_call(self._show_error, "Recording Error", f"An error occurred while recording:\n{exc}")
         finally:
-            if hasattr(self, "_rec_wave_lock"):
-                with self._rec_wave_lock:
-                    self._rec_wave_active = False
-            if hasattr(self, "timeline"):
-                self._ui_call(self.timeline.update_live_recording, False)
+            with self._rec_wave_lock:
+                self._rec_wave_active = False
+            self._ui_call(self.timeline.update_live_recording, False)
             self._reset_meter_peaks()
             for wf in wav_handles:
                 if wf is not None:
@@ -5209,12 +3624,7 @@ class Window:
                     pass
             with self._state_lock:
                 self.recording = False
-            if hasattr(self, "_set_rec_lit"):
-                self._ui_call(self._set_rec_lit, False)
-        if rec_err is not None:
-            self._ui_call(
-                messagebox.showerror, "Recording Error", f"An error occurred while recording:\n{rec_err}", parent=self.root
-            )
+            self._ui_call(self._set_rec_lit, False)
 
     # Backward-compatible alias
     rec = press_rec
@@ -5227,70 +3637,59 @@ class Window:
             self.paused = False
         if active:
             self._stop_event.set()
-            if hasattr(self, "_pause_event"):
-                self._pause_event.set()
+            self._pause_event.set()
             self._reset_meter_peaks()
-            if hasattr(self, "_set_pause_lit"):
-                self._ui_call(self._set_pause_lit, False)
+            self._ui_call(self._set_pause_lit, False)
             print("Stopped")
             self._set_status("Stopping...")
-        # Rewind playhead to 00:00 on Stop
-        if hasattr(self, "_seek_lock"):
-            with self._seek_lock:
-                self._playhead_sec = 0.0
-                self._pending_seek_sec = None
-        if hasattr(self, "timeline"):
-            self._ui_call(self.timeline.set_position, 0.0)
+        with self._seek_lock:
+            self._playhead_sec = 0.0
+            self._pending_seek_sec = None
+        self._ui_call(self.timeline.set_position, 0.0)
 
     # ---------- Offline Bounce / Export (Multithreaded) ----------
 
     def bounce(self):
         loaded = [ch.get_filepath() for ch in self.channel_states if ch.get_filepath()]
         if not loaded:
-            messagebox.showinfo(
-                "No Audio Loaded",
-                "Load at least one .wav file before bouncing.",
-                parent=self.root,
-            )
+            self._show_info("No Audio Loaded", "Load at least one .wav file before bouncing.")
             return
 
         if self._is_busy():
-            messagebox.showinfo(
-                "Mixer Busy",
-                "Please stop playback/recording before bouncing.",
-                parent=self.root,
-            )
+            self._show_info("Mixer Busy", "Please stop playback/recording before bouncing.")
             return
 
-        raw_name = self.nameEntry.get().strip()
+        raw_name = self.nameBox.text().strip()
         if raw_name:
             stem = sanitize_filename_stem(raw_name)
             if not stem:
-                messagebox.showerror(
+                self._show_error(
                     "Invalid Mix Name",
                     "Please enter a valid filename (avoid slashes or special path characters).",
-                    parent=self.root,
                 )
                 return
             out_path = os.path.join(BASE_DIR, f"{stem}.wav")
             if os.path.exists(out_path):
-                overwrite = messagebox.askyesno(
+                reply = QMessageBox.question(
+                    self.root,
                     "Overwrite File?",
                     f"'{os.path.basename(out_path)}' already exists.\nDo you want to overwrite it?",
-                    parent=self.root,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
                 )
-                if not overwrite:
+                if reply != QMessageBox.StandardButton.Yes:
                     return
         else:
-            out_path = asksaveasfilename(
-                parent=self.root,
-                title="Save Bounced Mix",
-                initialdir=BASE_DIR,
-                defaultextension=".wav",
-                filetypes=(("WAV files", "*.wav"),),
+            out_path, _ = QFileDialog.getSaveFileName(
+                self.root,
+                "Save Bounced Mix",
+                os.path.join(BASE_DIR, "bounced_mix.wav"),
+                "WAV files (*.wav)",
             )
             if not out_path:
                 return
+            if not out_path.lower().endswith(".wav"):
+                out_path += ".wav"
 
         if self._closing:
             return
@@ -5298,20 +3697,15 @@ class Window:
         # Prevent overwriting any currently loaded channel WAV (would truncate source before reading)
         loaded_now = [ch.get_filepath() for ch in self.channel_states if ch.get_filepath()]
         if not loaded_now:
-            messagebox.showinfo(
-                "No Audio Loaded",
-                "Load at least one .wav file before bouncing.",
-                parent=self.root,
-            )
+            self._show_info("No Audio Loaded", "Load at least one .wav file before bouncing.")
             return
         out_real = os.path.realpath(out_path)
         for lp in loaded_now:
             if os.path.realpath(lp) == out_real:
-                messagebox.showerror(
+                self._show_error(
                     "Invalid Bounce Destination",
                     "Cannot overwrite a WAV file that is currently loaded in a channel.\n"
                     "Choose a different output filename.",
-                    parent=self.root,
                 )
                 return
 
@@ -5324,16 +3718,11 @@ class Window:
                 self._stop_event.clear()
 
         if busy_now:
-            messagebox.showinfo(
-                "Mixer Busy",
-                "Please stop playback/recording before bouncing.",
-                parent=self.root,
-            )
+            self._show_info("Mixer Busy", "Please stop playback/recording before bouncing.")
             return
 
         self._set_status("Bouncing... 0%")
-        if hasattr(self, "_bounce_canvas"):
-            self._ui_call(self._set_bounce_progress, 0.0, "Bouncing... 0%", "#48d18a")
+        self._ui_call(self._set_bounce_progress, 0.0, "Bouncing... 0%", "#48d18a")
         t = threading.Thread(
             target=self._bounce_worker,
             args=(out_path, self.bounce_bitdepth, self.bounce_dither, self.bounce_sample_format),
@@ -5377,11 +3766,8 @@ class Window:
             and (bit_depth < 32)
         )
         dither_rng = ctypes.c_uint64((time.time_ns() ^ 0xA0761D6478BD642F) & 0xFFFFFFFFFFFFFFFF or 1)
-        cancelled = False
-        wrote_output = False
-        bounce_done_msg = None
-        bounce_err_msg = None
 
+        wrote_output = False
         try:
             limiter_on = self._get_master_limiter_enabled() and hasattr(self, "_master_limiter")
             offline_limiter = self._master_limiter.clone_for_offline() if limiter_on else None
@@ -5415,7 +3801,6 @@ class Window:
                 if wf is not None:
                     readers[idx] = StreamingWavReader(wf, session_rate)
 
-            # Estimate total output frames for progress bar accuracy
             total_frames = 0
             for idx, wf in enumerate(wav_handles):
                 if wf is None:
@@ -5443,6 +3828,7 @@ class Window:
             frame_bytes = 2 * sampwidth
             out_fmt_arg = "float32" if sample_format == "float" else "pcm"
 
+            cancelled = False
             fx_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="BounceFX") if use_c else None
             try:
                 with open_wav_write(
@@ -5454,7 +3840,6 @@ class Window:
                         if self._stop_event.is_set():
                             cancelled = True
                             break
-
                         chunks = [[] for _ in range(4)]
                         any_data = False
 
@@ -5515,13 +3900,12 @@ class Window:
                                 last_prog_pct = pct
                                 last_prog_time = now
                                 self._set_status(f"Bouncing... {pct}%")
-                                if hasattr(self, "_bounce_canvas"):
-                                    self._ui_call(
-                                        self._set_bounce_progress,
-                                        frac,
-                                        f"Bouncing... {pct}%",
-                                        "#48d18a",
-                                    )
+                                self._ui_call(
+                                    self._set_bounce_progress,
+                                    frac,
+                                    f"Bouncing... {pct}%",
+                                    "#48d18a",
+                                )
             finally:
                 if fx_pool is not None:
                     fx_pool.shutdown(wait=True)
@@ -5533,17 +3917,19 @@ class Window:
                 except OSError:
                     pass
                 print("Bounce cancelled")
-                if hasattr(self, "_bounce_canvas"):
-                    self._ui_call(self._set_bounce_progress, 0.0, "Bounce cancelled", "#f5c542")
+                self._ui_call(self._set_bounce_progress, 0.0, "Bounce cancelled", "#f5c542")
                 self._set_status("Bounce cancelled")
             else:
                 depth_label = "32f" if sample_format == "float" else f"{bit_depth}-bit"
                 meta_txt = f"{format_audio_meta(int(session_rate), bit_depth, 2, sample_format)} · {dither_tag}"
                 print(f"Bounce completed successfully ({meta_txt})")
-                if hasattr(self, "_bounce_canvas"):
-                    self._ui_call(self._set_bounce_progress, 1.0, f"Bounce complete ({depth_label})", "#7ef2b8")
+                self._ui_call(self._set_bounce_progress, 1.0, f"Bounce complete ({depth_label})", "#7ef2b8")
                 self._set_status(f"Bounced ({depth_label}): {os.path.basename(out_path)}")
-                bounce_done_msg = f"Mix successfully exported to:\n{out_path}\n\nFormat: {meta_txt}"
+                self._ui_call(
+                    self._show_info,
+                    "Bounce Complete",
+                    f"Mix successfully exported to:\n{out_path}\n\nFormat: {meta_txt}",
+                )
 
         except Exception as exc:
             print(f"Bounce error: {exc}")
@@ -5553,10 +3939,9 @@ class Window:
                         os.remove(out_path)
                 except OSError:
                     pass
-            if hasattr(self, "_bounce_canvas"):
-                self._ui_call(self._set_bounce_progress, 0.0, "Bounce failed", "#fc8181")
+            self._ui_call(self._set_bounce_progress, 0.0, "Bounce failed", "#fc8181")
             self._set_status("Bounce error")
-            bounce_err_msg = f"Could not export mix:\n{exc}"
+            self._ui_call(self._show_error, "Bounce Error", f"Could not export mix:\n{exc}")
         finally:
             self._reset_meter_peaks()
             for wf in wav_handles:
@@ -5568,20 +3953,18 @@ class Window:
             with self._state_lock:
                 self.bouncing = False
 
-        if bounce_done_msg is not None:
-            self._ui_call(messagebox.showinfo, "Bounce Complete", bounce_done_msg, parent=self.root)
-        elif bounce_err_msg is not None:
-            self._ui_call(messagebox.showerror, "Bounce Error", bounce_err_msg, parent=self.root)
-
     # ---------- Graceful Shutdown ----------
 
-    def on_close(self):
+    def _shutdown_resources(self):
+        if self._closing:
+            return
         self._closing = True
+        self._app.removeEventFilter(self.root)
+        self._meter_timer.stop()
+        self._ui_bridge.shutdown()
         self._stop_event.set()
-        if hasattr(self, "_pause_event"):
-            self._pause_event.set()
+        self._pause_event.set()
 
-        # Close all effect popups cleanly
         for popup in list(self._effect_windows.values()):
             try:
                 popup.close()
@@ -5589,15 +3972,13 @@ class Window:
                 pass
         self._effect_windows.clear()
 
-        # Wait briefly for any background audio thread to clean up PyAudio/WAV handles
         t = self._active_thread
         if t is not None and t.is_alive():
             t.join(timeout=1.5)
 
-        try:
-            self.root.destroy()
-        except tk.TclError:
-            pass
+    def on_close(self):
+        self._shutdown_resources()
+        self.root.close()
 
 
 def Main():

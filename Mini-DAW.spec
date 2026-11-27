@@ -2,18 +2,20 @@
 import os
 import sys
 
-portaudio_candidates = [
+_portaudio_candidates = [
     os.path.join(sys.prefix, "lib", "libportaudio.dylib"),
-    "/opt/homebrew/lib/libportaudio.dylib",
     "/opt/homebrew/opt/portaudio/lib/libportaudio.dylib",
-    "/usr/local/lib/libportaudio.dylib",
     "/usr/local/opt/portaudio/lib/libportaudio.dylib",
 ]
-portaudio_lib = next((p for p in portaudio_candidates if os.path.exists(p)), None)
-extra_binaries = [(portaudio_lib, ".")] if portaudio_lib else []
-dsp_lib = os.path.join(SPECPATH, "libminidaw_dsp.dylib")
-if os.path.exists(dsp_lib):
-    extra_binaries.append((dsp_lib, "."))
+extra_binaries = []
+for _candidate in _portaudio_candidates:
+    if os.path.exists(_candidate):
+        extra_binaries.append((_candidate, "."))
+        break
+
+_dsp_lib = os.path.join(SPECPATH, "libminidaw_dsp.dylib")
+if os.path.exists(_dsp_lib):
+    extra_binaries.append((_dsp_lib, "."))
 
 a = Analysis(
     ["window.py"],
@@ -25,15 +27,47 @@ a = Analysis(
         "dsp_accel",
         "wav_io",
         "MasterLimiter",
+        "themes",
         "Delay",
         "Tremolo",
         "Chorus",
         "Compressor",
+        "fx_dialog_base",
+        "ui_widgets",
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        "tkinter",
+        "_tkinter",
+        "PySide6.Qt3DCore",
+        "PySide6.Qt3DRender",
+        "PySide6.QtCharts",
+        "PySide6.QtDBus",
+        "PySide6.QtDesigner",
+        "PySide6.QtHelp",
+        "PySide6.QtMultimedia",
+        "PySide6.QtMultimediaWidgets",
+        "PySide6.QtNetwork",
+        "PySide6.QtOpenGL",
+        "PySide6.QtOpenGLWidgets",
+        "PySide6.QtPdf",
+        "PySide6.QtPositioning",
+        "PySide6.QtPrintSupport",
+        "PySide6.QtQml",
+        "PySide6.QtQuick",
+        "PySide6.QtQuickWidgets",
+        "PySide6.QtSensors",
+        "PySide6.QtSql",
+        "PySide6.QtSvg",
+        "PySide6.QtTest",
+        "PySide6.QtWebChannel",
+        "PySide6.QtWebEngineCore",
+        "PySide6.QtWebEngineWidgets",
+        "PySide6.QtWebSockets",
+        "PySide6.QtXml",
+    ],
     noarchive=False,
     optimize=0,
 )
@@ -76,8 +110,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "Mini-DAW",
         "CFBundleDisplayName": "Mini-DAW",
-        "CFBundleShortVersionString": "1.4.0",
-        "CFBundleVersion": "1.4.0",
+        "CFBundleShortVersionString": "2.0.0",
+        "CFBundleVersion": "2.0.0",
         "NSHighResolutionCapable": True,
         "NSMicrophoneUsageDescription": "Mini-DAW needs microphone access to record audio tracks.",
     },

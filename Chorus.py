@@ -1,8 +1,9 @@
-# Chorus Effect (DSP Processor + Tkinter Popup Window)
+# Chorus Effect (DSP Processor + PySide6 Parameter Dialog)
 import ctypes
 import math
 import threading
-import tkinter as tk
+
+from fx_dialog_base import EffectDialogBase
 
 try:
     import dsp_accel as _dsp
@@ -181,8 +182,8 @@ class ChorusProcessor:
         return out
 
 
-class ChorusWindow:
-    """Non-blocking Toplevel popup to control a channel's ChorusProcessor."""
+class ChorusWindow(EffectDialogBase):
+    """Non-blocking PySide6 dialog to control a channel's ChorusProcessor."""
 
     BG_DARK = "#173c42"
     BG_HEADER = "#112e33"
@@ -191,160 +192,76 @@ class ChorusWindow:
 
     def __init__(self, parent=None, processor=None, channel_num=None, on_close=None):
         self.processor = processor if processor is not None else ChorusProcessor()
-        self.on_close_callback = on_close
-        self._standalone = parent is None
-
-        if self._standalone:
-            self.window = tk.Tk()
-        else:
-            self.window = tk.Toplevel(parent)
-            self.window.transient(parent)
-
         title = f"Chorus - Channel {channel_num}" if channel_num is not None else "Chorus"
-        self.window.title(title)
-        self.window.geometry("320x320")
-        self.window.resizable(False, False)
-        self.window.configure(bg=self.BG_DARK)
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
 
-        header = tk.Frame(self.window, bg=self.BG_HEADER, height=30)
-        header.pack(fill=tk.X)
-        header.pack_propagate(False)
-        tk.Label(
-            header, text=title.upper(), bg=self.BG_HEADER, fg=self.ACCENT,
-            font=("Helvetica", 10, "bold")
-        ).pack(expand=True)
+        super().__init__(
+            title=title,
+            bg_dark=self.BG_DARK,
+            bg_header=self.BG_HEADER,
+            bg_well=self.BG_WELL,
+            accent=self.ACCENT,
+            btn_reset_bg="#23545c",
+            btn_reset_hover="#2d6c75",
+            btn_close_bg="#1c747d",
+            btn_close_hover="#24929e",
+            parent=parent,
+            on_close=on_close,
+            width=340,
+        )
 
         rate, depth_ms, base_delay_ms, mix = self.processor.get_params()
 
-        self.rate_label_var = tk.StringVar(value=f"Rate: {rate:.2f} Hz")
-        self.depth_label_var = tk.StringVar(value=f"Depth: {depth_ms:.1f} ms")
-        self.delay_label_var = tk.StringVar(value=f"Base Delay: {base_delay_ms:.1f} ms")
-        self.mix_label_var = tk.StringVar(value=f"Wet/Dry Mix: {int(round(mix * 100))}%")
-
-        container = tk.Frame(self.window, bg=self.BG_DARK, padx=16, pady=12)
-        container.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(container, textvariable=self.rate_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.rate_slider = tk.Scale(
-            container, from_=0.1, to=5.0, resolution=0.05, orient=tk.HORIZONTAL,
-            length=275, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_rate_change
+        self.rate_slider, _ = self.add_param_slider(
+            "Rate",
+            0.1,
+            5.0,
+            0.05,
+            rate,
+            ChorusProcessor.DEFAULT_RATE,
+            lambda v: f"{v:.2f} Hz",
+            lambda v: self.processor.set_params(rate=v),
         )
-        self.rate_slider.set(rate)
-        self.rate_slider.pack(fill=tk.X, pady=(2, 6))
-
-        tk.Label(container, textvariable=self.depth_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.depth_slider = tk.Scale(
-            container, from_=0.5, to=15.0, resolution=0.5, orient=tk.HORIZONTAL,
-            length=275, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_depth_change
+        self.depth_slider, _ = self.add_param_slider(
+            "Depth",
+            0.5,
+            15.0,
+            0.5,
+            depth_ms,
+            ChorusProcessor.DEFAULT_DEPTH_MS,
+            lambda v: f"{v:.1f} ms",
+            lambda v: self.processor.set_params(depth_ms=v),
         )
-        self.depth_slider.set(depth_ms)
-        self.depth_slider.pack(fill=tk.X, pady=(2, 6))
-
-        tk.Label(container, textvariable=self.delay_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.delay_slider = tk.Scale(
-            container, from_=5.0, to=35.0, resolution=0.5, orient=tk.HORIZONTAL,
-            length=275, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_delay_change
+        self.delay_slider, _ = self.add_param_slider(
+            "Base Delay",
+            5.0,
+            35.0,
+            0.5,
+            base_delay_ms,
+            ChorusProcessor.DEFAULT_BASE_DELAY_MS,
+            lambda v: f"{v:.1f} ms",
+            lambda v: self.processor.set_params(base_delay_ms=v),
         )
-        self.delay_slider.set(base_delay_ms)
-        self.delay_slider.pack(fill=tk.X, pady=(2, 6))
-
-        tk.Label(container, textvariable=self.mix_label_var, bg=self.BG_DARK, fg="#f0f6fc",
-                 font=("Helvetica", 9, "bold")).pack(anchor="w")
-        self.mix_slider = tk.Scale(
-            container, from_=0.0, to=1.0, resolution=0.01, orient=tk.HORIZONTAL,
-            length=275, showvalue=False, troughcolor=self.BG_WELL, bg=self.BG_DARK,
-            activebackground=self.ACCENT, fg="white", highlightthickness=0, bd=0,
-            command=self._on_mix_change
+        self.mix_slider, _ = self.add_param_slider(
+            "Wet/Dry Mix",
+            0.0,
+            1.0,
+            0.01,
+            mix,
+            ChorusProcessor.DEFAULT_MIX,
+            lambda v: f"{int(round(v * 100))}%",
+            lambda v: self.processor.set_params(mix=v),
         )
-        self.mix_slider.set(mix)
-        self.mix_slider.pack(fill=tk.X, pady=(2, 12))
 
-        btn_frame = tk.Frame(container, bg=self.BG_DARK)
-        btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
-        self._make_btn(btn_frame, "Reset", self._reset_defaults, "#23545c", "#2d6c75").pack(side=tk.LEFT)
-        self._make_btn(btn_frame, "Close", self.close, "#1c747d", "#24929e").pack(side=tk.RIGHT)
-
-        if self._standalone:
-            self.window.mainloop()
-
-    def _make_btn(self, parent, text, command, bg, hover_bg):
-        lbl = tk.Label(
-            parent, text=text, bg=bg, fg="#ffffff", font=("Helvetica", 9, "bold"),
-            padx=14, pady=5, cursor="hand2"
-        )
-        lbl.bind("<Enter>", lambda _e: lbl.config(bg=hover_bg))
-        lbl.bind("<Leave>", lambda _e: lbl.config(bg=bg))
-
-        def on_release(event):
-            try:
-                x = event.x_root - lbl.winfo_rootx()
-                y = event.y_root - lbl.winfo_rooty()
-                inside = 0 <= x <= lbl.winfo_width() and 0 <= y <= lbl.winfo_height()
-            except Exception:
-                inside = True
-            if inside:
-                command()
-
-        lbl.bind("<ButtonRelease-1>", on_release)
-        return lbl
-
-    def _on_rate_change(self, value):
-        val = float(value)
-        self.processor.set_params(rate=val)
-        self.rate_label_var.set(f"Rate: {val:.2f} Hz")
-
-    def _on_depth_change(self, value):
-        val = float(value)
-        self.processor.set_params(depth_ms=val)
-        self.depth_label_var.set(f"Depth: {val:.1f} ms")
-
-    def _on_delay_change(self, value):
-        val = float(value)
-        self.processor.set_params(base_delay_ms=val)
-        self.delay_label_var.set(f"Base Delay: {val:.1f} ms")
-
-    def _on_mix_change(self, value):
-        val = float(value)
-        self.processor.set_params(mix=val)
-        self.mix_label_var.set(f"Wet/Dry Mix: {int(round(val * 100))}%")
+        self.reset_btn.clicked.connect(self._reset_defaults)
+        self.finalize_and_show()
 
     def _reset_defaults(self):
         self.processor.reset_defaults()
         rate, depth_ms, base_delay_ms, mix = self.processor.get_params()
-        self.rate_slider.set(rate)
-        self.depth_slider.set(depth_ms)
-        self.delay_slider.set(base_delay_ms)
-        self.mix_slider.set(mix)
-
-    def focus(self):
-        if self.is_open():
-            self.window.deiconify()
-            self.window.lift()
-            self.window.focus_force()
-
-    def is_open(self):
-        try:
-            return bool(self.window.winfo_exists())
-        except tk.TclError:
-            return False
-
-    def close(self):
-        if self.on_close_callback is not None:
-            cb = self.on_close_callback
-            self.on_close_callback = None
-            cb()
-        if self.is_open():
-            self.window.destroy()
+        self.rate_slider.set_value_float(rate)
+        self.depth_slider.set_value_float(depth_ms)
+        self.delay_slider.set_value_float(base_delay_ms)
+        self.mix_slider.set_value_float(mix)
 
 
 # Backward-compatible alias
