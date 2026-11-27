@@ -1,20 +1,20 @@
 # 4-Channel Python Audio Mixer & Multitrack Recorder
 
-A desktop 4-track multitrack recorder, real-time DSP mixer, and DAW-style arrange workstation built in Python with **PySide6 (Qt 6)** and **PyAudio**. Originally written in 2019 as a Tkinter prototype, the codebase was re-architected into a thread-safe audio engine and migrated to a modern **Qt 6** interface featuring 60 FPS anti-aliased `QPainter` metering and waveforms, drag-and-drop WAV loading, timeline zoom, and a resizable console layout.
+A desktop 4-track multitrack recorder, real-time DSP mixer, and DAW-style arrange workstation built in Python with **PySide6 (Qt 6)** and **PyAudio**. Originally written in 2019 as a Tkinter prototype (preserved on the Tkinter branch), the codebase was re-architected into a 64-bit floating-point thread-safe audio engine with an optional native C DSP accelerator and migrated to a modern **Qt 6** interface featuring 30 FPS anti-aliased `QPainter` metering, Retina cached waveforms, drag-and-drop WAV loading, dynamic timeline zoom, and switchable **Studio Dark (Qt 6)** and **Classic Blue (v1.3)** themes.
 
 ---
 
 ## Architecture Evolution
 
-| Subsystem | 2019 Baseline (`main`) | 2026 PySide6 / Qt 6 Architecture |
+| Subsystem | 2019 Baseline | 2026 PySide6 / Qt 6 Architecture (`v2.0`) |
 | :--- | :--- | :--- |
-| **GUI Framework** | Legacy Tkinter with PNG buttons & macOS Aqua workarounds | **PySide6 (Qt 6)** with dark-studio QSS, Retina/HiDPI `QPainter` custom widgets, native menu bar, and resizable `QSplitter` layout |
-| **DSP Effects** | Incomplete, copy-pasted stubs with broken popups | Independent, thread-safe per-channel DSP processors (`Compressor`, `Chorus`, `Tremolo`, `Delay`) with non-blocking dark `QDialog` editors (`EffectDialogBase`) |
-| **Signal Routing** | Partial mono/stereo handling and pan bugs | Full per-channel insert chain, polarity invert (`Ø`), Mute/Solo logic, dB faders, constant-power stereo panning, and Master Bus summing |
+| **GUI Framework** | Legacy Tkinter with PNG buttons & macOS Aqua workarounds | **PySide6 (Qt 6)** with switchable **Studio Dark** & **Classic Blue (v1.3)** themes (`themes.py`), Retina/HiDPI `QPainter` custom widgets, native menu bar, and resizable `QSplitter` layout |
+| **DSP Effects** | Incomplete, copy-pasted stubs with broken popups | Independent, thread-safe per-channel DSP processors (`Compressor`, `Chorus`, `Tremolo`, `Delay`) + stereo-linked `MasterLimiterProcessor` (`-0.3 dBFS`), with floating `QDialog` editors (`EffectDialogBase`) |
+| **DSP Acceleration** | Pure-Python sample loops only | Optional native `-O3` C DSP library (`dsp_accel.c` → `libminidaw_dsp.dylib`) via stdlib `ctypes` + 4-core parallel offline FX, with automatic bit-exact pure-Python fallback |
+| **Audio I/O & Output** | Legacy Python `<3.9` calls and rigid WAV assumptions | 64-bit float internal summing, stdlib universal `wav_io.py` (8/16/24/32-bit PCM & 32/64-bit IEEE Float WAV), `paFloat32` live output with automatic `paInt16` fallback, and selectable `16-bit` / `24-bit` / `32i` / `32f` (unclipped) bounce with 1-LSB TPDF dithering |
 | **Concurrency** | Blocking transport calls and unsafe shared state | Lock-protected `ChannelState` snapshots, `threading.Event` cancellation, background offline `bounce()`, and queued Qt `Signal` UI marshaling (`_UiBridge`) |
-| **Audio I/O** | Legacy Python `<3.9` calls and rigid WAV assumptions | Python 3.9+ `array.tobytes()`, 8/16/24/32-bit mono/stereo WAV decoding, linear resampling, and automatic device sample-rate fallback |
 | **Transport & Overdub** | Unreliable stop/playback state and incomplete recording | Glitch-free Pause/Resume, Spacebar / Cmd shortcuts, synchronized multithreaded `_rec_worker` overdubbing, and live recording waveform overlay |
-| **UI & Visualization** | Basic sliders and no visual feedback | Custom-painted DAW faders with dynamic dB scales, bipolar pan sliders, 60 FPS anti-aliased VU + peak-hold dBFS meters, and a zoomable 4-track Peak + RMS Arrange View with drag-and-drop |
+| **UI & Visualization** | Basic sliders and no visual feedback | Custom-painted hardware & classic DAW faders with dynamic dB scales, bipolar pan sliders, 30 FPS anti-aliased VU + peak-hold dBFS meters, and a zoomable (`1×`–`50×`) 4-track Peak + RMS Arrange View with drag-and-drop and pinch zoom |
 
 ---
 

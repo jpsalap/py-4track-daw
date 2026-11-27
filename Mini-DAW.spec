@@ -25,6 +25,9 @@ a = Analysis(
     hiddenimports=[
         "pyaudio",
         "dsp_accel",
+        "wav_io",
+        "MasterLimiter",
+        "themes",
         "Delay",
         "Tremolo",
         "Chorus",
@@ -107,7 +110,7 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "Mini-DAW",
         "CFBundleDisplayName": "Mini-DAW",
-        "CFBundleShortVersionString": "2.0.0-beta.2",
+        "CFBundleShortVersionString": "2.0.0",
         "CFBundleVersion": "2.0.0",
         "NSHighResolutionCapable": True,
         "NSMicrophoneUsageDescription": "Mini-DAW needs microphone access to record audio tracks.",

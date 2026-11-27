@@ -9,6 +9,7 @@ import os
 import sys
 
 _c_double_p = ctypes.POINTER(ctypes.c_double)
+_c_float_p = ctypes.POINTER(ctypes.c_float)
 _c_int16_p = ctypes.POINTER(ctypes.c_int16)
 _c_uint8_p = ctypes.POINTER(ctypes.c_uint8)
 _c_uint64_p = ctypes.POINTER(ctypes.c_uint64)
@@ -175,13 +176,74 @@ def _load_library():
             ]
             lib.dsp_is_silent_i16.restype = ctypes.c_int
 
-            return lib
+            # Optional newer kernels (strictly additive ABI; fall back to Python if absent)
+            has_float_io = False
+            try:
+                lib.dsp_decode_f32_to_mono_f64.argtypes = [
+                    ctypes.c_char_p,
+                    ctypes.c_size_t,
+                    ctypes.c_int,
+                    _c_double_p,
+                ]
+                lib.dsp_decode_f32_to_mono_f64.restype = ctypes.c_size_t
+
+                lib.dsp_decode_f64_to_mono_f64.argtypes = [
+                    ctypes.c_char_p,
+                    ctypes.c_size_t,
+                    ctypes.c_int,
+                    _c_double_p,
+                ]
+                lib.dsp_decode_f64_to_mono_f64.restype = ctypes.c_size_t
+
+                lib.dsp_master_pack_f32.argtypes = [
+                    _c_double_p,
+                    _c_double_p,
+                    ctypes.c_size_t,
+                    ctypes.c_double,
+                    ctypes.c_int,
+                    _c_float_p,
+                    ctypes.c_int,
+                    _c_double_p,
+                    _c_double_p,
+                    _c_double_p,
+                    _c_double_p,
+                ]
+                lib.dsp_master_pack_f32.restype = None
+
+                lib.dsp_pack_mono_f32_to_i24.argtypes = [
+                    _c_float_p,
+                    ctypes.c_size_t,
+                    _c_uint8_p,
+                ]
+                lib.dsp_pack_mono_f32_to_i24.restype = None
+                has_float_io = True
+            except AttributeError:
+                has_float_io = False
+
+            has_limiter = False
+            try:
+                lib.dsp_master_limiter_inplace.argtypes = [
+                    _c_double_p,
+                    _c_double_p,
+                    ctypes.c_size_t,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    _c_double_p,
+                ]
+                lib.dsp_master_limiter_inplace.restype = None
+                has_limiter = True
+            except AttributeError:
+                has_limiter = False
+
+            return lib, has_float_io, has_limiter
         except (OSError, AttributeError):
             continue
-    return None
+    return None, False, False
 
 
-LIB = _load_library()
+LIB, HAS_FLOAT_IO, HAS_LIMITER = _load_library()
 AVAILABLE = LIB is not None
 
 
@@ -197,6 +259,11 @@ def f64_ptr(arr):
     return ctypes.cast(arr.buffer_info()[0], _c_double_p)
 
 
+def f32_ptr(arr):
+    """Return ctypes POINTER(c_float) to an array.array('f') buffer."""
+    return ctypes.cast(arr.buffer_info()[0], _c_float_p)
+
+
 def i16_ptr(arr):
     """Return ctypes POINTER(c_int16) to an array.array('h') buffer."""
     return ctypes.cast(arr.buffer_info()[0], _c_int16_p)
@@ -206,6 +273,13 @@ def alloc_f64(n):
     """Fast zero-initialized array.array('d') of length n."""
     out = array.array("d")
     out.frombytes(bytes(n * 8))
+    return out
+
+
+def alloc_f32(n):
+    """Fast zero-initialized array.array('f') of length n."""
+    out = array.array("f")
+    out.frombytes(bytes(n * 4))
     return out
 
 

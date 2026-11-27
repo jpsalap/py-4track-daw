@@ -108,7 +108,6 @@ class ChannelMeter(QWidget):
         self.setMinimumSize(self._min_w, max(90, self._min_h - 30))
         self.setFixedWidth(self._min_w)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
         self._lit_colors = []
         self._dim_colors = []
@@ -119,6 +118,7 @@ class ChannelMeter(QWidget):
         self._border_pen = QPen(QColor("#36536e"), 1)
         self._peak_clip_col = QColor("#ff7a85")
         self._peak_norm_col = QColor("#eef7ff")
+        self._meter_style = "gradient"
 
         self._seg_rects = []
         self._displayed_level = 0.0
@@ -126,6 +126,8 @@ class ChannelMeter(QWidget):
         self._hold_ticks = 0
         self._lit_count = 0
         self._peak_seg = -1
+        self._last_drawn_level = -1.0
+        self._last_drawn_peak = -1.0
 
     def _rebuild_palette(self, count):
         self._segments = max(8, int(count))
@@ -150,8 +152,9 @@ class ChannelMeter(QWidget):
     def _rebuild_rects(self):
         w = self.width()
         h = self.height()
+        bezel_y = 4
         pad_x = 3
-        pad_y = 3
+        pad_y = bezel_y + 2
         usable_h = max(10.0, float(h - 2 * pad_y))
         if self._target_pitch is not None:
             desired = max(8, int(round(usable_h / self._target_pitch)))
@@ -219,10 +222,26 @@ class ChannelMeter(QWidget):
             else -1
         )
 
-        if new_lit != self._lit_count or new_peak != self._peak_seg:
+        if self._meter_style == "gradient":
+            if (
+                abs(self._displayed_level - self._last_drawn_level) > 0.003
+                or abs(self._peak_hold - self._last_drawn_peak) > 0.003
+            ):
+                self._lit_count = new_lit
+                self._peak_seg = new_peak
+                self.update()
+        elif new_lit != self._lit_count or new_peak != self._peak_seg:
             self._lit_count = new_lit
             self._peak_seg = new_peak
             self.update()
+
+    def set_theme(self, theme):
+        self._bg_col = QColor(theme.get("meter_bg", "#0e1924"))
+        self._border_pen = QPen(QColor(theme.get("meter_border", "#36536e")), 1)
+        self._meter_style = theme.get("meter_style", "gradient")
+        self._last_drawn_level = -1.0
+        self._last_drawn_peak = -1.0
+        self.update()
 
     def reset(self):
         self._displayed_level = 0.0
@@ -230,17 +249,23 @@ class ChannelMeter(QWidget):
         self._hold_ticks = 0
         self._lit_count = 0
         self._peak_seg = -1
+        self._last_drawn_level = -1.0
+        self._last_drawn_peak = -1.0
         self.update()
 
     def paintEvent(self, _event):
+        if self._meter_style == "gradient":
+            self._paint_gradient()
+            return
         if not self._seg_rects:
             self._rebuild_rects()
         p = QPainter(self)
         w = self.width()
         h = self.height()
-        p.fillRect(0, 0, w, h, self._bg_col)
+        bezel_y = 4
+        p.fillRect(0, bezel_y, w, h - 2 * bezel_y, self._bg_col)
         p.setPen(self._border_pen)
-        p.drawRect(0, 0, w - 1, h - 1)
+        p.drawRect(0, bezel_y, w - 1, h - 2 * bezel_y - 1)
 
         lit_count = self._lit_count
         peak_seg = self._peak_seg
@@ -255,6 +280,196 @@ class ChannelMeter(QWidget):
                 p.fillRect(rect, self._peak_clip_col if idx >= clip_idx else self._peak_norm_col)
             else:
                 p.fillRect(rect, dim_colors[idx])
+
+    def _paint_gradient(self):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w = float(self.width())
+        h = float(self.height())
+        self._last_drawn_level = self._displayed_level
+        self._last_drawn_peak = self._peak_hold
+
+        # Recessed dark studio meter bezel (4px top/bottom inset aligns 0/-60 dBFS ticks dead-center)
+        bezel_y = 4.0
+        bezel_h = max(12.0, h - 2.0 * bezel_y)
+        p.fillRect(QRectF(0.0, bezel_y, w, bezel_h), QColor("#091119"))
+        p.setPen(self._border_pen)
+        p.drawRect(QRectF(0.5, bezel_y + 0.5, w - 1.0, bezel_h - 1.0))
+
+        pad_x = 2.5
+        pad_y = bezel_y + 2.0
+        bar_w = max(2.0, w - 2.0 * pad_x)
+        bar_h = max(8.0, h - 2.0 * pad_y)
+        bar_top = pad_y
+        bar_bot = pad_y + bar_h
+        bar_rect = QRectF(pad_x, bar_top, bar_w, bar_h)
+
+        # Subtle unlit background gradient showing full calibration zones
+        dim_grad = QLinearGradient(QPointF(0.0, bar_bot), QPointF(0.0, bar_top))
+        dim_grad.setColorAt(0.00, QColor(20, 62, 46, 90))
+        dim_grad.setColorAt(0.68, QColor(26, 74, 52, 95))
+        dim_grad.setColorAt(0.82, QColor(74, 62, 24, 100))
+        dim_grad.setColorAt(0.94, QColor(82, 30, 36, 115))
+        dim_grad.setColorAt(1.00, QColor(96, 26, 34, 125))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(dim_grad))
+        p.drawRoundedRect(bar_rect, 1.5, 1.5)
+
+        # Smooth continuous illuminated level bar
+        lvl = max(0.0, min(1.0, self._displayed_level))
+        if lvl > 0.002:
+            lit_h = max(1.5, bar_h * lvl)
+            lit_y = bar_bot - lit_h
+            lit_rect = QRectF(pad_x, lit_y, bar_w, lit_h)
+
+            lit_grad = QLinearGradient(QPointF(0.0, bar_bot), QPointF(0.0, bar_top))
+            lit_grad.setColorAt(0.00, QColor("#159957"))
+            lit_grad.setColorAt(0.52, QColor("#2ecc71"))
+            lit_grad.setColorAt(0.70, QColor("#9be15d"))
+            lit_grad.setColorAt(0.80, QColor("#f5c542"))
+            lit_grad.setColorAt(0.90, QColor("#f97316"))
+            lit_grad.setColorAt(0.97, QColor("#f24957"))
+            lit_grad.setColorAt(1.00, QColor("#ff5c6c"))
+
+            p.setBrush(QBrush(lit_grad))
+            p.drawRoundedRect(lit_rect, 1.2, 1.2)
+
+            # Subtle specular glass edge highlight along left side of active bar
+            p.setBrush(QColor(255, 255, 255, 42))
+            p.drawRect(QRectF(pad_x + 0.5, lit_y, max(1.0, bar_w * 0.28), lit_h))
+
+            # Crisp luminous top meniscus line
+            p.setPen(QPen(QColor(255, 255, 255, 150), 1.0))
+            p.drawLine(QPointF(pad_x + 0.5, lit_y + 0.5), QPointF(pad_x + bar_w - 0.5, lit_y + 0.5))
+
+        # Subtle dB calibration hairline ticks (-6, -12, -24, -36, -48 dBFS)
+        p.setPen(QPen(QColor(6, 12, 18, 165), 1.0))
+        for norm_tick in (0.90, 0.80, 0.60, 0.40, 0.20):
+            ty = bar_bot - bar_h * norm_tick
+            p.drawLine(QPointF(pad_x, ty), QPointF(pad_x + bar_w, ty))
+
+        # Floating peak-hold indicator bar with subtle clip glow
+        pk = max(0.0, min(1.0, self._peak_hold))
+        if pk > 0.015:
+            pk_y = max(bar_top + 1.0, min(bar_bot - 1.5, bar_bot - bar_h * pk))
+            is_clip = pk >= 0.88
+            if is_clip:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(255, 92, 108, 95))
+                p.drawRect(QRectF(pad_x, pk_y - 2.0, bar_w, 4.5))
+                pk_col = QColor("#ff7a85")
+            else:
+                pk_col = QColor("#eef7ff")
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(pk_col)
+            p.drawRect(QRectF(pad_x, pk_y - 0.8, bar_w, 1.8))
+
+
+class MeterScaleTicks(QWidget):
+    """Independent responsive painted dBFS ruler (0 to -60 dBFS) aligned to ChannelMeter."""
+
+    CHANNEL_TICKS = (
+        (0.0, "0"),
+        (-6.0, "-6"),
+        (-12.0, "-12"),
+        (-18.0, "-18"),
+        (-24.0, "-24"),
+        (-36.0, "-36"),
+        (-48.0, "-48"),
+        (-60.0, "-60"),
+    )
+    MASTER_TICKS = (
+        (0.0, "0"),
+        (-3.0, "-3"),
+        (-6.0, "-6"),
+        (-9.0, "-9"),
+        (-12.0, "-12"),
+        (-18.0, "-18"),
+        (-24.0, "-24"),
+        (-30.0, "-30"),
+        (-36.0, "-36"),
+        (-42.0, "-42"),
+        (-48.0, "-48"),
+        (-54.0, "-54"),
+        (-60.0, "-60"),
+    )
+
+    def __init__(self, ticks=None, minor_step_db=3.0, parent=None):
+        super().__init__(parent)
+        self._ticks = list(ticks) if ticks is not None else list(self.CHANNEL_TICKS)
+        self._minor_step = float(minor_step_db)
+        self._font_reg = QFont("Helvetica", 7)
+        self._font_bold = QFont("Helvetica", 7)
+        self._font_bold.setBold(True)
+        self.setFixedWidth(25)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+
+    def set_theme(self, _theme):
+        self.update()
+
+    def _db_to_y(self, db_val):
+        pad_y = 6.0  # Matches ChannelMeter bezel_y (4.0) + inner pad (2.0)
+        usable_h = max(8.0, float(self.height()) - 2.0 * pad_y)
+        return pad_y + ((0.0 - float(db_val)) / 60.0) * usable_h
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w = float(self.width())
+
+        major_ys = [self._db_to_y(db) for db, _ in self._ticks]
+        span_6db = abs(self._db_to_y(-6.0) - self._db_to_y(0.0))
+        use_fine = span_6db >= 20.0
+
+        # Minor hash marks along right edge facing the meter
+        p.setPen(QPen(QColor("#4f6e8c"), 0.9))
+        last_minor_y = -1e9
+        db = 0.0
+        while db >= -60.0 - 1e-6:
+            my = self._db_to_y(db)
+            near_major = any(abs(my - maj_y) < 3.6 for maj_y in major_ys)
+            if not near_major and (my - last_minor_y) >= 4.8:
+                p.drawLine(QPointF(w - 3.0, my), QPointF(w, my))
+                last_minor_y = my
+            step = (self._minor_step * 0.5) if (use_fine and db > -24.0) else self._minor_step
+            db -= step
+
+        # Major ticks + non-overlapping right-aligned dBFS labels
+        min_gap = 10.5
+        drawn_ys = []
+        priority = [t for t in self._ticks if t[0] in (0.0, -6.0, -12.0, -24.0, -60.0)]
+        others = [t for t in self._ticks if t[0] not in (0.0, -6.0, -12.0, -24.0, -60.0)]
+        label_allowed = set()
+        for tick_db, _ in priority + others:
+            y = self._db_to_y(tick_db)
+            if all(abs(y - py) >= min_gap for py in drawn_ys):
+                drawn_ys.append(y)
+                label_allowed.add(tick_db)
+
+        for tick_db, tick_txt in self._ticks:
+            y = self._db_to_y(tick_db)
+            show_lbl = tick_db in label_allowed
+            is_clip = tick_db >= -0.05
+            is_hot = -6.05 <= tick_db <= -5.95
+            if is_clip:
+                col = QColor("#ff7a85")
+            elif is_hot:
+                col = QColor("#f5c542")
+            elif show_lbl:
+                col = QColor("#9cb8d1")
+            else:
+                col = QColor("#5d7d9c")
+
+            p.setPen(QPen(col, 1.2 if (is_clip or is_hot) else 1.0))
+            tick_w = 4.5 if show_lbl else 3.0
+            p.drawLine(QPointF(w - tick_w, y), QPointF(w, y))
+            if show_lbl:
+                p.setFont(self._font_bold if (is_clip or is_hot) else self._font_reg)
+                p.drawText(
+                    QRectF(0.0, y - 6.0, w - 6.0, 12.0),
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                    tick_txt,
+                )
 
 
 class PeakReadout(QWidget):
@@ -276,12 +491,19 @@ class PeakReadout(QWidget):
         self._last_text = "-∞ dB"
         self._last_state = "idle"
         self._font = _mono_font(9, bold=True)
+        self._well_bg = QColor("#12202d")
+        self._radius = 4.0
 
         self.setFixedHeight(22)
         self.setMinimumWidth(56)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("True sample peak (dBFS) · Click to clear clip/peak hold")
+
+    def set_theme(self, theme):
+        self._well_bg = QColor(theme.get("badge_bg", "#12202d"))
+        self._radius = float(theme.get("btn_radius", 4))
+        self.update()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -334,12 +556,14 @@ class PeakReadout(QWidget):
 
     def paintEvent(self, _event):
         bg, fg, bd = self._STATE_COLORS[self._last_state]
+        if self._last_state != "clip":
+            bg = self._well_bg
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
         p.setPen(QPen(bd, 1.0))
         p.setBrush(bg)
-        p.drawRoundedRect(r, 4.0, 4.0)
+        p.drawRoundedRect(r, self._radius, self._radius)
         p.setFont(self._font)
         p.setPen(fg)
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, self._last_text)
@@ -361,10 +585,17 @@ class FaderBadge(QWidget):
         self._state = "unity"
         self._bg = QColor("#14222f")
         self._bd = QColor("#2c465e")
+        self._radius = 4.0
         self._font = _mono_font(9, bold=True)
         self.setFixedHeight(22)
         self.setMinimumWidth(56)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_theme(self, theme):
+        self._bg = QColor(theme.get("badge_bg", "#14222f"))
+        self._bd = QColor(theme.get("badge_border", "#2c465e"))
+        self._radius = float(theme.get("btn_radius", 4))
+        self.update()
 
     def set_db_display(self, text, db):
         if db <= MIN_FADER_DB:
@@ -386,7 +617,7 @@ class FaderBadge(QWidget):
         r = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
         p.setPen(QPen(self._bd, 1.0))
         p.setBrush(self._bg)
-        p.drawRoundedRect(r, 4.0, 4.0)
+        p.drawRoundedRect(r, self._radius, self._radius)
         p.setFont(self._font)
         p.setPen(self._FG_COLORS[self._state])
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, self._text)
@@ -408,6 +639,9 @@ class DawFader(QSlider):
         super().__init__(Qt.Orientation.Vertical, parent)
         self._accent = QColor(accent_color)
         self._is_master = bool(is_master)
+        self._fader_style = "hardware"
+        self._slot_bg = QColor("#070d14")
+        self._slot_border = QColor("#2c465e")
         self._steps_per_db = 10  # 0.1 dB internal precision
         self.setRange(
             int(round(MIN_FADER_DB * self._steps_per_db)),
@@ -545,6 +779,12 @@ class DawFader(QSlider):
         self.set_db(self.db_value() + (step_db if delta > 0 else -step_db))
         event.accept()
 
+    def set_theme(self, theme):
+        self._fader_style = theme.get("fader_style", "hardware")
+        self._slot_bg = QColor(theme.get("bg_well", "#070d14")) if self._fader_style == "classic" else QColor("#070d14")
+        self._slot_border = QColor(theme.get("border", "#2c465e"))
+        self.update()
+
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -554,6 +794,56 @@ class DawFader(QSlider):
         top_y, bot_y, cap_h = self._track_bounds()
         db = self.db_value()
         cap_y = self.db_to_y(db)
+
+        if self._fader_style == "classic":
+            # Classic Tkinter v1.3 inspired flat slate trough + clean rectangular fader thumb
+            unity_y = self.db_to_y(0.0)
+            p.setPen(QPen(QColor("#ffd166"), 1.2))
+            p.drawLine(QPointF(2.0, unity_y), QPointF(w - 2.0, unity_y))
+
+            trough_w = 8.0
+            trough_rect = QRectF(cx - trough_w * 0.5, top_y - 3.0, trough_w, (bot_y - top_y) + 6.0)
+            p.setPen(QPen(self._slot_border, 1.0))
+            p.setBrush(self._slot_bg)
+            p.drawRect(trough_rect)
+
+            # Classic active fill below cap
+            if bot_y - cap_y > 1.0:
+                fill_col = QColor(self._accent)
+                fill_col.setAlpha(120)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(fill_col)
+                p.drawRect(QRectF(cx - 2.2, cap_y, 4.4, max(0.0, bot_y + 2.0 - cap_y)))
+
+            cap_w = max(18.0, min(w - 4.0, 22.0))
+            classic_cap_h = min(cap_h, 24.0)
+            cap_rect = QRectF(cx - cap_w * 0.5, cap_y - classic_cap_h * 0.5, cap_w, classic_cap_h)
+
+            if self._is_master:
+                base_col = QColor("#d9b44a") if (self._dragging or self._hovered) else QColor("#b89535")
+                bd_col = QColor("#ffd166") if (self._dragging or self._hovered) else QColor("#6e591f")
+            else:
+                base_col = QColor("#5c85ab") if (self._dragging or self._hovered) else QColor("#466a8c")
+                bd_col = QColor("#8fc5f5") if (self._dragging or self._hovered) else QColor("#2a4359")
+
+            p.setPen(QPen(bd_col, 1.1))
+            p.setBrush(base_col)
+            p.drawRoundedRect(cap_rect, 2.0, 2.0)
+
+            # Crisp top highlight and center indicator line
+            p.setPen(QPen(QColor(255, 255, 255, 75), 1.0))
+            p.drawLine(
+                QPointF(cap_rect.left() + 1.5, cap_rect.top() + 1.2),
+                QPointF(cap_rect.right() - 1.5, cap_rect.top() + 1.2),
+            )
+            line_col = (
+                QColor("#ffd166")
+                if abs(db) <= 0.05
+                else (QColor("#ff7878") if db > 0.05 else QColor("#f4f8fc"))
+            )
+            p.setPen(QPen(line_col, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+            p.drawLine(QPointF(cap_rect.left() + 2.0, cap_y), QPointF(cap_rect.right() - 2.0, cap_y))
+            return
 
         # 1. Subtle console silkscreen calibration marks hugging the dust slot
         p.setPen(QPen(QColor("#2f4962"), 1.0))
@@ -878,6 +1168,10 @@ class FaderWithScale(QWidget):
         layout.addWidget(self.fader)
         layout.addWidget(self._ticks)
 
+    def set_theme(self, theme):
+        self.fader.set_theme(theme)
+        self._ticks.update()
+
 
 class PanSlider(QSlider):
     """Center-detented bipolar stereo pan slider (0.0 = L, 0.5 = C, 1.0 = R)."""
@@ -893,7 +1187,14 @@ class PanSlider(QSlider):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setToolTip("Stereo Pan (L / C / R) · Double-click to reset to Center")
         self._dragging = False
+        self._trough_bg = QColor("#111e2b")
+        self._trough_bd = QColor("#36536e")
         self.valueChanged.connect(lambda iv: self.panChanged.emit(iv / 100.0))
+
+    def set_theme(self, theme):
+        self._trough_bg = QColor(theme.get("pan_bg", "#111e2b"))
+        self._trough_bd = QColor(theme.get("pan_border", "#36536e"))
+        self.update()
 
     def pan_value(self):
         return self.value() / 100.0
@@ -947,8 +1248,8 @@ class PanSlider(QSlider):
         mid_x = margin + span * 0.5
         val_x = margin + (self.value() / 100.0) * span
 
-        p.setPen(QPen(QColor("#36536e"), 1.0))
-        p.setBrush(QColor("#111e2b"))
+        p.setPen(QPen(self._trough_bd, 1.0))
+        p.setBrush(self._trough_bg)
         p.drawRoundedRect(QRectF(margin, cy - 3.0, span, 6.0), 3.0, 3.0)
 
         p.setPen(QPen(QColor("#7899b8"), 1.2))
@@ -1225,6 +1526,10 @@ class TransportButton(QAbstractButton):
         self._lit_icon_color = QColor(lit_icon_color)
         self._mode = "off"
         self._hovered = False
+        self._idle_bg = QColor("#23384c")
+        self._hover_bg = QColor("#2e4b66")
+        self._idle_bd = QColor("#426382")
+        self._radius = 6.0
 
         self._cap_font = QFont("Helvetica", 8)
         self._cap_font.setBold(True)
@@ -1232,6 +1537,13 @@ class TransportButton(QAbstractButton):
         self.setFixedSize(50, 48)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_theme(self, theme):
+        self._idle_bg = QColor(theme.get("transport_bg", "#23384c"))
+        self._hover_bg = QColor(theme.get("transport_hover", "#2e4b66"))
+        self._idle_bd = QColor(theme.get("transport_border", "#426382"))
+        self._radius = float(theme.get("transport_radius", 6.0))
+        self.update()
 
     def sizeHint(self):
         return QSize(50, 48)
@@ -1279,19 +1591,19 @@ class TransportButton(QAbstractButton):
             ic = self._icon_color
             tx = QColor("#ff9ea6")
         elif self._hovered:
-            bg = QColor("#2e4b66")
+            bg = self._hover_bg
             bd = QColor("#638db3")
             ic = self._hover_icon_color
             tx = QColor("#f0f6fc")
         else:
-            bg = QColor("#23384c")
-            bd = QColor("#426382")
+            bg = self._idle_bg
+            bd = self._idle_bd
             ic = self._icon_color
             tx = QColor("#b9d2e8")
 
         p.setPen(QPen(bd, 1.2))
         p.setBrush(bg)
-        p.drawRoundedRect(QRectF(1.0, 1.0, w - 2.0, h - 2.0), 6.0, 6.0)
+        p.drawRoundedRect(QRectF(1.0, 1.0, w - 2.0, h - 2.0), self._radius, self._radius)
 
         cx = w * 0.5
         cy = 17.0
@@ -1379,6 +1691,9 @@ class ChannelFileWell(QFrame):
         self.setAcceptDrops(True)
         self.setObjectName("fileWell")
         self._drag_hover = False
+        self._well_bg = "#182836"
+        self._well_border = "#38546e"
+        self._well_radius = 5
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 5, 6, 5)
@@ -1417,15 +1732,21 @@ class ChannelFileWell(QFrame):
     def set_meta_text(self, text):
         self.meta_lbl.setText(text)
 
+    def set_theme(self, theme):
+        self._well_bg = theme.get("file_well_bg", "#182836")
+        self._well_border = theme.get("file_well_border", "#38546e")
+        self._well_radius = int(theme.get("ctrl_radius", 5))
+        self._apply_style()
+
     def _apply_style(self):
-        border = "#63b3ed" if self._drag_hover else "#38546e"
-        bg = "#1e354a" if self._drag_hover else "#182836"
+        border = "#63b3ed" if self._drag_hover else self._well_border
+        bg = "#1e354a" if self._drag_hover else self._well_bg
         self.setStyleSheet(
             f"""
             QFrame#fileWell {{
                 background-color: {bg};
                 border: 1px solid {border};
-                border-radius: 5px;
+                border-radius: {self._well_radius}px;
             }}
             QPushButton#fileClearBtn {{
                 background-color: #261d24;
@@ -1479,10 +1800,13 @@ class _TimelineCanvas(QWidget):
     seekRequested = Signal(float)
     positionScrubbed = Signal(float)
     zoomChanged = Signal(float)
+    vzoomChanged = Signal(float)
     detailRequested = Signal(float, float, int)
     fileDroppedOnChannel = Signal(int, str)
 
     MAX_ZOOM = 50.0
+    MIN_VZOOM = 1.0
+    MAX_VZOOM = 16.0
 
     # (accent_stripe, clip_bg, header_bg, peak_fill, rms_fill)
     TRACK_THEMES = [
@@ -1510,6 +1834,7 @@ class _TimelineCanvas(QWidget):
         self._last_drawn_px = -999.0
         self._dragging = False
         self._zoom = 1.0
+        self._vzoom = 1.0
         self._scroll_frac = 0.0
 
         self._tracks = [None, None, None, None]
@@ -1527,6 +1852,17 @@ class _TimelineCanvas(QWidget):
         self._static_cache = None
         self._cache_dpr = 0.0
         self._cache_dirty = True
+
+        # Theme colors for canvas background, ruler, lanes, headers, grid & clip corners
+        self._tl_canvas_bg = "#0e1822"
+        self._tl_ruler_bg = "#162534"
+        self._tl_ruler_border = "#2e4963"
+        self._tl_lane_even = "#0f1a25"
+        self._tl_lane_odd = "#121f2d"
+        self._tl_track_hdr_bg = "#192a3b"
+        self._tl_track_hdr_border = "#263d54"
+        self._tl_grid = "#172838"
+        self._tl_clip_radius = 3.0
 
         # Debounced high-res zoomed waveform detail request
         self._detail_timer = QTimer(self)
@@ -1548,6 +1884,18 @@ class _TimelineCanvas(QWidget):
         if end_sec > start_sec:
             target_bins = max(400, int(self._lane_span() * 1.25))
             self.detailRequested.emit(start_sec, end_sec, target_bins)
+
+    def set_theme(self, theme):
+        self._tl_canvas_bg = theme.get("tl_canvas_bg", "#0e1822")
+        self._tl_ruler_bg = theme.get("tl_ruler_bg", "#162534")
+        self._tl_ruler_border = theme.get("tl_ruler_border", "#2e4963")
+        self._tl_lane_even = theme.get("tl_lane_even", "#0f1a25")
+        self._tl_lane_odd = theme.get("tl_lane_odd", "#121f2d")
+        self._tl_track_hdr_bg = theme.get("tl_track_hdr_bg", "#192a3b")
+        self._tl_track_hdr_border = theme.get("tl_track_hdr_border", "#263d54")
+        self._tl_grid = theme.get("tl_grid", "#172838")
+        self._tl_clip_radius = float(theme.get("tl_clip_radius", 3.0))
+        self.invalidate_cache()
 
     def invalidate_cache(self):
         self._cache_dirty = True
@@ -1631,6 +1979,39 @@ class _TimelineCanvas(QWidget):
 
     def zoom(self):
         return self._zoom
+
+    def vzoom(self):
+        return self._vzoom
+
+    def set_vertical_zoom(self, factor):
+        new_vz = max(self.MIN_VZOOM, min(self.MAX_VZOOM, float(factor)))
+        if abs(new_vz - self._vzoom) < 1e-4:
+            return
+        self._vzoom = new_vz
+        self.vzoomChanged.emit(self._vzoom)
+        self.invalidate_cache()
+
+    def fit_vertical_zoom(self):
+        """Scale waveform amplitude vertically so loudest loaded peak fills ~92% of lane height."""
+        max_pk = 0.0
+        for track in self._tracks:
+            if track is None:
+                continue
+            for it in track[0]:
+                if isinstance(it, tuple):
+                    pk = max(abs(it[0]), abs(it[1]))
+                else:
+                    pk = abs(float(it))
+                if pk > max_pk:
+                    max_pk = pk
+        if max_pk <= 1e-4:
+            self.set_vertical_zoom(1.0)
+            return
+        target = max(self.MIN_VZOOM, min(self.MAX_VZOOM, 0.92 / max_pk))
+        if abs(self._vzoom - target) < 0.05 and self._vzoom > 1.05:
+            self.set_vertical_zoom(1.0)
+        else:
+            self.set_vertical_zoom(target)
 
     def scroll_frac(self):
         return self._scroll_frac
@@ -1791,11 +2172,11 @@ class _TimelineCanvas(QWidget):
         start_sec, end_sec, eff_dur = self._visible_window()
         vis_dur = max(1e-6, end_sec - start_sec)
 
-        p.fillRect(QRectF(0.0, 0.0, w, h), QColor("#0e1822"))
+        p.fillRect(QRectF(0.0, 0.0, w, h), QColor(self._tl_canvas_bg))
 
         # Time ruler
-        p.fillRect(QRectF(0.0, 0.0, w, self.RULER_H), QColor("#162534"))
-        p.setPen(QPen(QColor("#2e4963"), 1.0))
+        p.fillRect(QRectF(0.0, 0.0, w, self.RULER_H), QColor(self._tl_ruler_bg))
+        p.setPen(QPen(QColor(self._tl_ruler_border), 1.0))
         p.drawLine(QPointF(0.0, self.RULER_H - 0.5), QPointF(w, self.RULER_H - 0.5))
 
         hdr_font = QFont("Helvetica", 9)
@@ -1807,26 +2188,26 @@ class _TimelineCanvas(QWidget):
             is_aud = self._audible[ch]
             base_stripe = QColor(self.TRACK_THEMES[ch][0])
 
-            lane_bg = QColor("#0f1a25") if ch % 2 == 0 else QColor("#121f2d")
+            lane_bg = QColor(self._tl_lane_even) if ch % 2 == 0 else QColor(self._tl_lane_odd)
             if self._drop_hover_ch == ch:
                 lane_bg = QColor("#1c354c")
             p.fillRect(QRectF(self.HEADER_W, y0, w - self.HEADER_W, lane_h), lane_bg)
 
-            p.fillRect(QRectF(0.0, y0, self.HEADER_W, lane_h), QColor("#192a3b"))
+            p.fillRect(QRectF(0.0, y0, self.HEADER_W, lane_h), QColor(self._tl_track_hdr_bg))
             p.fillRect(
                 QRectF(0.0, y0 + 1.0, 4.0, lane_h - 2.0),
                 base_stripe if is_aud else QColor("#4a5e70"),
             )
-            p.setPen(QPen(QColor("#263d54"), 1.0))
+            p.setPen(QPen(QColor(self._tl_track_hdr_border), 1.0))
             p.drawRect(QRectF(0.5, y0 + 0.5, self.HEADER_W - 1.0, lane_h - 1.0))
 
             p.setFont(hdr_font)
             p.setPen(QColor("#d4e5f5") if is_aud else QColor("#6f869c"))
             p.drawText(QRectF(6.0, y0, self.HEADER_W - 8.0, lane_h), Qt.AlignmentFlag.AlignCenter, f"CH {ch + 1}")
 
-            p.setPen(QPen(QColor("#172737"), 1.0))
+            p.setPen(QPen(QColor(self._tl_grid), 1.0))
             p.drawLine(QPointF(self.HEADER_W, mid_y), QPointF(w - self.PAD_RIGHT, mid_y))
-            p.setPen(QPen(QColor("#22364a"), 1.0))
+            p.setPen(QPen(QColor(self._tl_track_hdr_border), 1.0))
             p.drawLine(QPointF(0.0, y1 - 0.5), QPointF(w, y1 - 0.5))
 
             if self._drop_hover_ch == ch:
@@ -1842,7 +2223,7 @@ class _TimelineCanvas(QWidget):
             for t_idx in range(num_ticks + 1):
                 frac = t_idx / float(num_ticks)
                 gx = self.HEADER_W + frac * span
-                p.setPen(QPen(QColor("#172838"), 1.0))
+                p.setPen(QPen(QColor(self._tl_grid), 1.0))
                 p.drawLine(QPointF(gx, self.RULER_H), QPointF(gx, h))
                 if t_idx < num_ticks:
                     sec_val = start_sec + frac * vis_dur
@@ -1891,7 +2272,7 @@ class _TimelineCanvas(QWidget):
                 clip_rect = QRectF(x_start, cy0, max(6.0, x_end - x_start), cy1 - cy0)
                 p.setPen(QPen(QColor(stripe_c), 1.0))
                 p.setBrush(QColor(clip_bg_c))
-                p.drawRoundedRect(clip_rect, 3.0, 3.0)
+                p.drawRoundedRect(clip_rect, self._tl_clip_radius, self._tl_clip_radius)
 
                 hdr_rect = QRectF(
                     clip_rect.left() + 1.0,
@@ -1997,16 +2378,17 @@ class _TimelineCanvas(QWidget):
                         hi_v = h0 + (h1 - h0) * f_b
                         rms_v = r0 + (r1 - r0) * f_b
 
+                    vz = self._vzoom
                     px = vx0 + frac_p * vis_w
-                    y_hi = wf_mid - max(0.0, hi_v) * max_amp
-                    y_lo = wf_mid - min(0.0, lo_v) * max_amp
+                    y_hi = wf_mid - min(1.0, max(0.0, hi_v * vz)) * max_amp
+                    y_lo = wf_mid - max(-1.0, min(0.0, lo_v * vz)) * max_amp
                     if y_lo - y_hi < 1.2:
                         y_hi = wf_mid - 0.6
                         y_lo = wf_mid + 0.6
                     pk_top.append(QPointF(px, y_hi))
                     pk_bot.append(QPointF(px, y_lo))
 
-                    r_amp = max(0.5, rms_v * max_amp)
+                    r_amp = max(0.5, min(1.0, rms_v * vz) * max_amp)
                     rms_top.append(QPointF(px, wf_mid - r_amp))
                     rms_bot.append(QPointF(px, wf_mid + r_amp))
 
@@ -2148,51 +2530,13 @@ class WaveformTimeline(QFrame):
         self._rec_view_dur = 0.0
 
         self.setObjectName("timelineFrame")
-        self.setStyleSheet(
-            """
-            QFrame#timelineFrame {
-                background-color: #182836;
-                border: 1px solid #3c5c78;
-                border-radius: 6px;
-            }
-            QFrame#timelineHeader {
-                background-color: #1b2d3e;
-                border-bottom: 1px solid #2b455e;
-                border-top-left-radius: 5px;
-                border-top-right-radius: 5px;
-            }
-            QPushButton.zoomBtn {
-                background-color: #23384c;
-                color: #cfe3f5;
-                border: 1px solid #3c5c78;
-                border-radius: 3px;
-                font-size: 10px;
-                font-weight: 700;
-                padding: 1px 6px;
-            }
-            QPushButton.zoomBtn:hover {
-                background-color: #2e4b66;
-                color: #ffffff;
-            }
-            QScrollBar:horizontal {
-                background: #101b26;
-                height: 10px;
-                margin: 0px;
-                border-bottom-left-radius: 5px;
-                border-bottom-right-radius: 5px;
-            }
-            QScrollBar::handle:horizontal {
-                background: #365673;
-                min-width: 28px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:horizontal:hover {
-                background: #4d789e;
-            }
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-                width: 0px;
-            }
-            """
+        self._apply_frame_theme(
+            frame_bg="#182836",
+            frame_bd="#3c5c78",
+            hdr_bg="#1b2d3e",
+            hdr_bd="#2b455e",
+            radius=6,
+            btn_radius=3,
         )
 
         layout = QVBoxLayout(self)
@@ -2211,33 +2555,110 @@ class WaveformTimeline(QFrame):
         top_layout.addWidget(title_lbl)
         top_layout.addStretch(1)
 
+        vzoom_lbl = QLabel("V-ZOOM", top_bar)
+        vzoom_lbl.setStyleSheet("color: #6e8fad; font-size: 9px; font-weight: 700; background: transparent;")
+
+        vzoom_out_btn = QPushButton("−", top_bar)
+        vzoom_out_btn.setProperty("class", "zoomBtn")
+        vzoom_out_btn.setFixedSize(22, 18)
+        vzoom_out_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        vzoom_out_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        vzoom_out_btn.setToolTip("Decrease vertical waveform amplitude zoom")
+        vzoom_out_btn.clicked.connect(lambda: self.canvas.set_vertical_zoom(self.canvas.vzoom() / 1.4))
+
+        self.vzoom_reset_btn = QPushButton("1.0×", top_bar)
+        self.vzoom_reset_btn.setObjectName("vzoomReadout")
+        self.vzoom_reset_btn.setFixedSize(38, 18)
+        self.vzoom_reset_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.vzoom_reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.vzoom_reset_btn.setToolTip("Restore original 1.0× waveform height")
+        self.vzoom_reset_btn.clicked.connect(self.reset_vertical_zoom)
+
+        vzoom_in_btn = QPushButton("+", top_bar)
+        vzoom_in_btn.setProperty("class", "zoomBtn")
+        vzoom_in_btn.setFixedSize(22, 18)
+        vzoom_in_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        vzoom_in_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        vzoom_in_btn.setToolTip("Increase vertical waveform amplitude zoom")
+        vzoom_in_btn.clicked.connect(lambda: self.canvas.set_vertical_zoom(self.canvas.vzoom() * 1.4))
+
+        vzoom_fit_btn = QPushButton("Fit", top_bar)
+        vzoom_fit_btn.setProperty("class", "zoomBtn")
+        vzoom_fit_btn.setFixedSize(28, 18)
+        vzoom_fit_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        vzoom_fit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        vzoom_fit_btn.setToolTip("Auto-fit waveform height to loudest peak (click again to restore 1.0×)")
+        vzoom_fit_btn.clicked.connect(self.fit_vertical_zoom)
+
+        vzoom_1x_btn = QPushButton("1×", top_bar)
+        vzoom_1x_btn.setProperty("class", "zoomBtn")
+        vzoom_1x_btn.setFixedSize(24, 18)
+        vzoom_1x_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        vzoom_1x_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        vzoom_1x_btn.setToolTip("Restore original 1.0× waveform height")
+        vzoom_1x_btn.clicked.connect(self.reset_vertical_zoom)
+
+        vzoom_grp = QHBoxLayout()
+        vzoom_grp.setContentsMargins(0, 0, 0, 0)
+        vzoom_grp.setSpacing(2)
+        vzoom_grp.addWidget(vzoom_lbl)
+        vzoom_grp.addSpacing(3)
+        vzoom_grp.addWidget(vzoom_out_btn)
+        vzoom_grp.addWidget(self.vzoom_reset_btn)
+        vzoom_grp.addWidget(vzoom_in_btn)
+        vzoom_grp.addWidget(vzoom_fit_btn)
+        vzoom_grp.addWidget(vzoom_1x_btn)
+        top_layout.addLayout(vzoom_grp)
+
+        sep_v = QLabel("│", top_bar)
+        sep_v.setStyleSheet("color: #36536e; background: transparent;")
+        top_layout.addWidget(sep_v)
+
+        hzoom_lbl = QLabel("H-ZOOM", top_bar)
+        hzoom_lbl.setStyleSheet("color: #6e8fad; font-size: 9px; font-weight: 700; background: transparent;")
+
         zoom_out_btn = QPushButton("−", top_bar)
         zoom_out_btn.setProperty("class", "zoomBtn")
-        zoom_out_btn.setFixedWidth(22)
+        zoom_out_btn.setFixedSize(22, 18)
         zoom_out_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         zoom_out_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         zoom_out_btn.setToolTip("Zoom out timeline")
         zoom_out_btn.clicked.connect(lambda: self.canvas.set_zoom(self.canvas.zoom() / 1.35))
 
-        self.zoom_reset_btn = QPushButton("100%", top_bar)
-        self.zoom_reset_btn.setProperty("class", "zoomBtn")
-        self.zoom_reset_btn.setFixedWidth(52)
+        self.zoom_reset_btn = QPushButton("1.0×", top_bar)
+        self.zoom_reset_btn.setObjectName("hzoomReadout")
+        self.zoom_reset_btn.setFixedSize(38, 18)
         self.zoom_reset_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.zoom_reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.zoom_reset_btn.setToolTip("Reset timeline zoom to 100%")
+        self.zoom_reset_btn.setToolTip("Reset timeline zoom to 1.0×")
         self.zoom_reset_btn.clicked.connect(self.reset_zoom)
 
         zoom_in_btn = QPushButton("+", top_bar)
         zoom_in_btn.setProperty("class", "zoomBtn")
-        zoom_in_btn.setFixedWidth(22)
+        zoom_in_btn.setFixedSize(22, 18)
         zoom_in_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         zoom_in_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         zoom_in_btn.setToolTip("Zoom in timeline (or scroll wheel over waveforms)")
         zoom_in_btn.clicked.connect(lambda: self.canvas.set_zoom(self.canvas.zoom() * 1.35))
 
-        top_layout.addWidget(zoom_out_btn)
-        top_layout.addWidget(self.zoom_reset_btn)
-        top_layout.addWidget(zoom_in_btn)
+        zoom_fit_btn = QPushButton("Fit", top_bar)
+        zoom_fit_btn.setProperty("class", "zoomBtn")
+        zoom_fit_btn.setFixedSize(28, 18)
+        zoom_fit_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        zoom_fit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        zoom_fit_btn.setToolTip("Fit entire session in timeline (1.0×)")
+        zoom_fit_btn.clicked.connect(self.reset_zoom)
+
+        hzoom_grp = QHBoxLayout()
+        hzoom_grp.setContentsMargins(0, 0, 0, 0)
+        hzoom_grp.setSpacing(2)
+        hzoom_grp.addWidget(hzoom_lbl)
+        hzoom_grp.addSpacing(3)
+        hzoom_grp.addWidget(zoom_out_btn)
+        hzoom_grp.addWidget(self.zoom_reset_btn)
+        hzoom_grp.addWidget(zoom_in_btn)
+        hzoom_grp.addWidget(zoom_fit_btn)
+        top_layout.addLayout(hzoom_grp)
 
         sep = QLabel("│", top_bar)
         sep.setStyleSheet("color: #36536e; background: transparent;")
@@ -2273,8 +2694,96 @@ class WaveformTimeline(QFrame):
         self.canvas.positionScrubbed.connect(self._on_scrub_pos)
         self.canvas.seekRequested.connect(self._on_seek_emit)
         self.canvas.zoomChanged.connect(self._sync_zoom_ui)
+        self.canvas.vzoomChanged.connect(self._sync_vzoom_ui)
         self.canvas.detailRequested.connect(self.detailRequested.emit)
         self.canvas.fileDroppedOnChannel.connect(self.fileDroppedOnChannel.emit)
+
+    def _apply_frame_theme(self, frame_bg, frame_bd, hdr_bg, hdr_bd, radius, btn_radius):
+        inner_r = max(1, int(radius) - 1)
+        self.setStyleSheet(
+            f"""
+            QFrame#timelineFrame {{
+                background-color: {frame_bg};
+                border: 1px solid {frame_bd};
+                border-radius: {radius}px;
+            }}
+            QFrame#timelineHeader {{
+                background-color: {hdr_bg};
+                border-bottom: 1px solid {hdr_bd};
+                border-top-left-radius: {inner_r}px;
+                border-top-right-radius: {inner_r}px;
+            }}
+            QPushButton.zoomBtn {{
+                background-color: #23384c;
+                color: #dcecf9;
+                border: 1px solid {frame_bd};
+                border-radius: {btn_radius}px;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 0px 4px;
+            }}
+            QPushButton.zoomBtn:hover {{
+                background-color: #304f6b;
+                color: #ffffff;
+            }}
+            QPushButton.zoomBtn:pressed {{
+                background-color: #162636;
+            }}
+            QPushButton#vzoomReadout {{
+                background-color: #12202d;
+                color: #8cf5c0;
+                border: 1px solid #33506b;
+                border-radius: {btn_radius}px;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 0px 4px;
+            }}
+            QPushButton#vzoomReadout:hover {{
+                border-color: #48d18a;
+            }}
+            QPushButton#hzoomReadout {{
+                background-color: #12202d;
+                color: #9bd2ff;
+                border: 1px solid #33506b;
+                border-radius: {btn_radius}px;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 0px 4px;
+            }}
+            QPushButton#hzoomReadout:hover {{
+                border-color: #63b3ed;
+            }}
+            QScrollBar:horizontal {{
+                background: #101b26;
+                height: 10px;
+                margin: 0px;
+                border-bottom-left-radius: {inner_r}px;
+                border-bottom-right-radius: {inner_r}px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: #365673;
+                min-width: 28px;
+                border-radius: {btn_radius}px;
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background: #4d789e;
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                width: 0px;
+            }}
+            """
+        )
+
+    def set_theme(self, theme):
+        self._apply_frame_theme(
+            frame_bg=theme.get("tl_frame_bg", "#182836"),
+            frame_bd=theme.get("tl_frame_border", "#3c5c78"),
+            hdr_bg=theme.get("tl_hdr_bg", "#1b2d3e"),
+            hdr_bd=theme.get("tl_hdr_border", "#2b455e"),
+            radius=int(theme.get("card_radius", 6)),
+            btn_radius=int(theme.get("btn_radius", 3)),
+        )
+        self.canvas.set_theme(theme)
 
     def _set_pos_text(self, pos_sec):
         txt = format_timecode(pos_sec)
@@ -2296,7 +2805,7 @@ class WaveformTimeline(QFrame):
             self._on_seek(pos_sec)
 
     def _sync_zoom_ui(self, zoom_val):
-        self.zoom_reset_btn.setText(f"{int(round(zoom_val * 100))}%")
+        self.zoom_reset_btn.setText(f"{zoom_val:.1f}×" if zoom_val < 10.0 else f"{int(round(zoom_val))}×")
         self._updating_scroll = True
         if zoom_val <= 1.001:
             self.hscroll.setVisible(False)
@@ -2320,6 +2829,16 @@ class WaveformTimeline(QFrame):
         self.canvas.set_zoom(1.0)
         self.canvas.set_scroll_frac(0.0)
         self._sync_zoom_ui(1.0)
+
+    def _sync_vzoom_ui(self, vzoom_val):
+        self.vzoom_reset_btn.setText(f"{vzoom_val:.1f}×" if vzoom_val < 10.0 else f"{vzoom_val:.0f}×")
+
+    def fit_vertical_zoom(self):
+        self.canvas.fit_vertical_zoom()
+
+    def reset_vertical_zoom(self):
+        self.canvas.set_vertical_zoom(1.0)
+        self._sync_vzoom_ui(1.0)
 
     # ---- Public API ----
 
