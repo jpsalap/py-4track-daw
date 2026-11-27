@@ -4,6 +4,7 @@ import array
 import ctypes
 import math
 import os
+import random
 import re
 import sys
 import threading
@@ -455,6 +456,9 @@ def mix_stereo_chunk(
     out_peaks=None,
     out_master_peaks=None,
     fx_executor=None,
+    out_bit_depth=16,
+    dither_tpdf=False,
+    dither_rng=None,
 ):
     """
     Process per-channel mono float chunks through enabled effects, polarity inversion,
@@ -624,22 +628,29 @@ def mix_stereo_chunk(
                 master_right[j] += s * r_gain
 
     m_gain = float(master_gain)
+    bit_depth = int(out_bit_depth) if int(out_bit_depth) in (16, 24, 32) else 16
+    use_dither = bool(dither_tpdf) and (bit_depth < 32)
+    sampwidth = bit_depth // 8
     want_m_vu = out_master_levels is not None and len(out_master_levels) >= 2
     want_m_pk = out_master_peaks is not None and len(out_master_peaks) >= 2
 
     if use_c:
-        stereo = _dsp.alloc_i16(max_len * 2)
+        out_u8 = _dsp.alloc_u8(max_len * 2 * sampwidth)
+        rng_ptr = ctypes.byref(dither_rng) if (use_dither and dither_rng is not None) else None
         if want_m_vu or want_m_pk:
             vl_c = ctypes.c_double(0.0)
             vr_c = ctypes.c_double(0.0)
             pl_c = ctypes.c_double(0.0)
             pr_c = ctypes.c_double(0.0)
-            _dsp.LIB.dsp_master_pack_i16(
+            _dsp.LIB.dsp_master_pack_pcm(
                 ml_ptr,
                 mr_ptr,
                 max_len,
                 m_gain,
-                _dsp.i16_ptr(stereo),
+                bit_depth,
+                1 if use_dither else 0,
+                rng_ptr,
+                _dsp.u8_ptr(out_u8),
                 1,
                 ctypes.byref(vl_c),
                 ctypes.byref(vr_c),
@@ -653,30 +664,44 @@ def mix_stereo_chunk(
                 out_master_peaks[0] = pl_c.value
                 out_master_peaks[1] = pr_c.value
         else:
-            _dsp.LIB.dsp_master_pack_i16(
+            _dsp.LIB.dsp_master_pack_pcm(
                 ml_ptr,
                 mr_ptr,
                 max_len,
                 m_gain,
-                _dsp.i16_ptr(stereo),
+                bit_depth,
+                1 if use_dither else 0,
+                rng_ptr,
+                _dsp.u8_ptr(out_u8),
                 0,
                 None,
                 None,
                 None,
                 None,
             )
-        return stereo.tobytes()
+        return out_u8.tobytes()
 
-    stereo = array.array("h", [0] * (max_len * 2))
+    if bit_depth == 24:
+        scale, q_min, q_max = 8388608.0, -8388608, 8388607
+        out_24 = bytearray(max_len * 6)
+    elif bit_depth == 32:
+        scale, q_min, q_max = 2147483648.0, -2147483648, 2147483647
+        stereo32 = array.array("i", [0] * (max_len * 2))
+    else:
+        scale, q_min, q_max = 32768.0, -32768, 32767
+        stereo16 = array.array("h", [0] * (max_len * 2))
 
-    if want_m_vu or want_m_pk:
-        l_sq = 0.0
-        r_sq = 0.0
-        l_pk = 0.0
-        r_pk = 0.0
-        for j in range(max_len):
-            lv = master_left[j] * m_gain
-            rv = master_right[j] * m_gain
+    rand = random.random
+    l_sq = 0.0
+    r_sq = 0.0
+    l_pk = 0.0
+    r_pk = 0.0
+    off24 = 0
+
+    for j in range(max_len):
+        lv = master_left[j] * m_gain
+        rv = master_right[j] * m_gain
+        if want_m_vu or want_m_pk:
             l_sq += lv * lv
             r_sq += rv * rv
             al = lv if lv >= 0.0 else -lv
@@ -685,38 +710,60 @@ def mix_stereo_chunk(
                 l_pk = al
             if ar > r_pk:
                 r_pk = ar
-            if lv > 1.0:
-                lv = 1.0
-            elif lv < -1.0:
-                lv = -1.0
-            if rv > 1.0:
-                rv = 1.0
-            elif rv < -1.0:
-                rv = -1.0
-            stereo[j * 2] = int(lv * 32767.0)
-            stereo[j * 2 + 1] = int(rv * 32767.0)
-        if want_m_vu:
-            out_master_levels[0] = math.sqrt(l_sq * inv_len) * sqrt2
-            out_master_levels[1] = math.sqrt(r_sq * inv_len) * sqrt2
-        if want_m_pk:
-            out_master_peaks[0] = l_pk
-            out_master_peaks[1] = r_pk
-    else:
-        for j in range(max_len):
-            lv = master_left[j] * m_gain
-            if lv > 1.0:
-                lv = 1.0
-            elif lv < -1.0:
-                lv = -1.0
-            rv = master_right[j] * m_gain
-            if rv > 1.0:
-                rv = 1.0
-            elif rv < -1.0:
-                rv = -1.0
-            stereo[j * 2] = int(lv * 32767.0)
-            stereo[j * 2 + 1] = int(rv * 32767.0)
+        if lv > 1.0:
+            lv = 1.0
+        elif lv < -1.0:
+            lv = -1.0
+        if rv > 1.0:
+            rv = 1.0
+        elif rv < -1.0:
+            rv = -1.0
 
-    return stereo.tobytes()
+        sl = lv * scale
+        sr = rv * scale
+        if use_dither:
+            sl += rand() - rand()
+            sr += rand() - rand()
+        ql = int(round(sl))
+        qr = int(round(sr))
+        if ql > q_max:
+            ql = q_max
+        elif ql < q_min:
+            ql = q_min
+        if qr > q_max:
+            qr = q_max
+        elif qr < q_min:
+            qr = q_min
+
+        if bit_depth == 16:
+            stereo16[j * 2] = ql
+            stereo16[j * 2 + 1] = qr
+        elif bit_depth == 24:
+            ul = ql & 0xFFFFFF
+            ur = qr & 0xFFFFFF
+            out_24[off24] = ul & 0xFF
+            out_24[off24 + 1] = (ul >> 8) & 0xFF
+            out_24[off24 + 2] = (ul >> 16) & 0xFF
+            out_24[off24 + 3] = ur & 0xFF
+            out_24[off24 + 4] = (ur >> 8) & 0xFF
+            out_24[off24 + 5] = (ur >> 16) & 0xFF
+            off24 += 6
+        else:
+            stereo32[j * 2] = ql
+            stereo32[j * 2 + 1] = qr
+
+    if want_m_vu:
+        out_master_levels[0] = math.sqrt(l_sq * inv_len) * sqrt2
+        out_master_levels[1] = math.sqrt(r_sq * inv_len) * sqrt2
+    if want_m_pk:
+        out_master_peaks[0] = l_pk
+        out_master_peaks[1] = r_pk
+
+    if bit_depth == 24:
+        return bytes(out_24)
+    if bit_depth == 32:
+        return stereo32.tobytes()
+    return stereo16.tobytes()
 
 
 class ChannelState:
@@ -914,6 +961,8 @@ class Window:
     def __init__(self, start_mainloop=True):
         self.buffer = 1024
         self.bitdepth = 16
+        self.bounce_bitdepth = 16
+        self.bounce_dither = True
         self.channels = 2
         self.rate = 44100
 
@@ -1497,7 +1546,9 @@ class Window:
         lr_labels.addWidget(lbl_r)
         meters_col.addLayout(lr_labels)
 
-        self._master_fader_widget = FaderWithScale(master_ticks, accent_color=T["unity_gold"], parent=body)
+        self._master_fader_widget = FaderWithScale(
+            master_ticks, accent_color=T["unity_gold"], is_master=True, parent=body
+        )
         self.master_scale = self._master_fader_widget.fader
         self.master_scale.dbChanged.connect(self._on_master_vol_change)
 
@@ -1651,6 +1702,93 @@ class Window:
         self.nameBox.installEventFilter(self.root)
         self._app.installEventFilter(self.root)
         body_layout.addWidget(self.nameBox)
+
+        # Export bit depth & TPDF dither selector
+        fmt_lbl = QLabel("BOUNCE FORMAT", body)
+        fmt_lbl.setProperty("class", "sectionLbl")
+        body_layout.addWidget(fmt_lbl)
+
+        fmt_box = QFrame(body)
+        fmt_box.setStyleSheet(
+            f"background-color: {T['bg_well']}; border: 1px solid #38546e; border-radius: 5px;"
+        )
+        fmt_layout = QVBoxLayout(fmt_box)
+        fmt_layout.setContentsMargins(6, 6, 6, 6)
+        fmt_layout.setSpacing(5)
+
+        depth_row = QHBoxLayout()
+        depth_row.setContentsMargins(0, 0, 0, 0)
+        depth_row.setSpacing(4)
+        self._depth_btns = {}
+
+        def _refresh_export_fmt():
+            bd = self.bounce_bitdepth
+            for d, btn in self._depth_btns.items():
+                if d == bd:
+                    btn.setStyleSheet(
+                        "background-color: #245994; color: #ffffff; border: 1px solid #63b3ed; "
+                        "border-radius: 4px; padding: 4px 2px; font-size: 10px; font-weight: 700;"
+                    )
+                else:
+                    btn.setStyleSheet(
+                        "background-color: #1d3042; color: #9cb8d1; border: 1px solid #33506b; "
+                        "border-radius: 4px; padding: 4px 2px; font-size: 10px; font-weight: 700;"
+                    )
+            if bd >= 32:
+                self._dither_btn.setEnabled(False)
+                self._dither_btn.setText("○  TPDF Dither (N/A at 32-bit)")
+                self._dither_btn.setStyleSheet(
+                    "background-color: #182735; color: #637e96; border: 1px solid #2b4257; "
+                    "border-radius: 4px; padding: 4px 6px; font-size: 10px; font-weight: 700;"
+                )
+            elif self.bounce_dither:
+                self._dither_btn.setEnabled(True)
+                self._dither_btn.setText("●  TPDF Dither (1-LSB)")
+                self._dither_btn.setStyleSheet(
+                    "background-color: #1f4d3b; color: #8cf5c0; border: 1px solid #48d18a; "
+                    "border-radius: 4px; padding: 4px 6px; font-size: 10px; font-weight: 700;"
+                )
+            else:
+                self._dither_btn.setEnabled(True)
+                self._dither_btn.setText("○  TPDF Dither (Off · Round)")
+                self._dither_btn.setStyleSheet(
+                    "background-color: #1d3042; color: #9cb8d1; border: 1px solid #33506b; "
+                    "border-radius: 4px; padding: 4px 6px; font-size: 10px; font-weight: 700;"
+                )
+
+        def _select_bitdepth(depth):
+            self.bounce_bitdepth = depth
+            if depth == 16:
+                self.bounce_dither = True
+            elif depth >= 24:
+                self.bounce_dither = False
+            _refresh_export_fmt()
+
+        def _toggle_dither():
+            if self.bounce_bitdepth >= 32:
+                return
+            self.bounce_dither = not self.bounce_dither
+            _refresh_export_fmt()
+
+        for depth in (16, 24, 32):
+            btn = QPushButton(f"{depth}-bit", fmt_box)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _checked=False, d=depth: _select_bitdepth(d))
+            depth_row.addWidget(btn, 1)
+            self._depth_btns[depth] = btn
+        fmt_layout.addLayout(depth_row)
+
+        self._dither_btn = QPushButton("●  TPDF Dither (1-LSB)", fmt_box)
+        self._dither_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._dither_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._dither_btn.setToolTip(
+            "1-LSB Triangular PDF dither eliminates quantization distortion when reducing bit depth"
+        )
+        self._dither_btn.clicked.connect(_toggle_dither)
+        fmt_layout.addWidget(self._dither_btn)
+        _refresh_export_fmt()
+        body_layout.addWidget(fmt_box)
 
         self.export_button = QPushButton("Bounce Mix (.wav)", body)
         self.export_button.setObjectName("exportBtn")
@@ -2793,22 +2931,29 @@ class Window:
         self._ui_call(self._set_bounce_progress, 0.0, "Bouncing... 0%", "#48d18a")
         t = threading.Thread(
             target=self._bounce_worker,
-            args=(out_path,),
+            args=(out_path, self.bounce_bitdepth, self.bounce_dither),
             name="MixerBounceThread",
             daemon=True,
         )
         self._active_thread = t
         t.start()
 
-    def _bounce_worker(self, out_path):
+    def _bounce_worker(self, out_path, bounce_bit_depth=None, bounce_dither=None):
         wav_handles = [None] * 4
         readers = [None] * 4
         use_c = _dsp is not None and _dsp.AVAILABLE
         chunk_size = 65536 if use_c else 4096
         tail_step = 4096
+        bit_depth = int(bounce_bit_depth if bounce_bit_depth is not None else getattr(self, "bounce_bitdepth", self.bitdepth))
+        if bit_depth not in (16, 24, 32):
+            bit_depth = 16
+        sampwidth = bit_depth // 8
+        use_dither = bool(bounce_dither if bounce_dither is not None else getattr(self, "bounce_dither", bit_depth == 16)) and (bit_depth < 32)
+        dither_rng = ctypes.c_uint64((time.time_ns() ^ 0xA0761D6478BD642F) & 0xFFFFFFFFFFFFFFFF or 1)
 
         try:
-            print(f"Bouncing audio to {out_path}...")
+            dither_tag = "TPDF Dither" if use_dither else "No Dither"
+            print(f"Bouncing {bit_depth}-bit ({dither_tag}) audio to {out_path}...")
             session_rate = None
             snapshots = [ch.snapshot() for ch in self.channel_states]
             offline_procs = [ch.clone_processors_for_offline() for ch in self.channel_states]
@@ -2852,13 +2997,15 @@ class Window:
             tail_frames_emitted = 0
             min_tail_frames = 0
             in_tail = False
+            tail_peaks = [0.0, 0.0]
+            frame_bytes = 2 * sampwidth
 
             cancelled = False
             fx_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="BounceFX") if use_c else None
             try:
                 with wave.open(out_path, "wb") as bounce_wf:
                     bounce_wf.setnchannels(2)
-                    bounce_wf.setsampwidth(self.bitdepth // 8)
+                    bounce_wf.setsampwidth(sampwidth)
                     bounce_wf.setframerate(int(session_rate))
 
                     while True:
@@ -2902,14 +3049,18 @@ class Window:
                             session_rate,
                             offline_processors=offline_procs,
                             master_gain=frozen_master_gain,
+                            out_master_peaks=tail_peaks if in_tail else None,
                             fx_executor=fx_pool,
+                            out_bit_depth=bit_depth,
+                            dither_tpdf=use_dither,
+                            dither_rng=dither_rng,
                         )
                         if in_tail and tail_frames_emitted > min_tail_frames and pcm_bytes:
-                            if _is_pcm_silent(pcm_bytes, 4):
+                            if max(tail_peaks[0], tail_peaks[1]) < 1.2e-4:
                                 break
                         if pcm_bytes:
                             bounce_wf.writeframes(pcm_bytes)
-                            frames_written += len(pcm_bytes) // 4
+                            frames_written += len(pcm_bytes) // frame_bytes
 
                             now = time.monotonic()
                             frac = min(0.99, frames_written / float(total_frames))
@@ -2938,13 +3089,14 @@ class Window:
                 self._ui_call(self._set_bounce_progress, 0.0, "Bounce cancelled", "#f5c542")
                 self._set_status("Bounce cancelled")
             else:
-                print("Bounce completed successfully")
-                self._ui_call(self._set_bounce_progress, 1.0, "Bounce complete (100%)", "#7ef2b8")
-                self._set_status(f"Bounced: {os.path.basename(out_path)}")
+                meta_txt = f"{format_audio_meta(int(session_rate), bit_depth, 2)} · {dither_tag}"
+                print(f"Bounce completed successfully ({meta_txt})")
+                self._ui_call(self._set_bounce_progress, 1.0, f"Bounce complete ({bit_depth}-bit)", "#7ef2b8")
+                self._set_status(f"Bounced ({bit_depth}-bit): {os.path.basename(out_path)}")
                 self._ui_call(
                     self._show_info,
                     "Bounce Complete",
-                    f"Mix successfully exported to:\n{out_path}",
+                    f"Mix successfully exported to:\n{out_path}\n\nFormat: {meta_txt}",
                 )
 
         except Exception as exc:

@@ -10,6 +10,8 @@ import sys
 
 _c_double_p = ctypes.POINTER(ctypes.c_double)
 _c_int16_p = ctypes.POINTER(ctypes.c_int16)
+_c_uint8_p = ctypes.POINTER(ctypes.c_uint8)
+_c_uint64_p = ctypes.POINTER(ctypes.c_uint64)
 _c_size_p = ctypes.POINTER(ctypes.c_size_t)
 
 
@@ -151,6 +153,23 @@ def _load_library():
         ]
         lib.dsp_master_pack_i16.restype = None
 
+        lib.dsp_master_pack_pcm.argtypes = [
+            _c_double_p,
+            _c_double_p,
+            ctypes.c_size_t,
+            ctypes.c_double,
+            ctypes.c_int,
+            ctypes.c_int,
+            _c_uint64_p,
+            _c_uint8_p,
+            ctypes.c_int,
+            _c_double_p,
+            _c_double_p,
+            _c_double_p,
+            _c_double_p,
+        ]
+        lib.dsp_master_pack_pcm.restype = None
+
         lib.dsp_is_silent_i16.argtypes = [
             ctypes.c_char_p,
             ctypes.c_size_t,
@@ -195,3 +214,15 @@ def alloc_i16(n):
     out = array.array("h")
     out.frombytes(bytes(n * 2))
     return out
+
+
+def alloc_u8(n):
+    """Fast zero-initialized array.array('B') of length n."""
+    out = array.array("B")
+    out.frombytes(bytes(n))
+    return out
+
+
+def u8_ptr(arr):
+    """Return ctypes POINTER(c_uint8) to an array.array('B') buffer."""
+    return ctypes.cast(arr.buffer_info()[0], _c_uint8_p)

@@ -393,28 +393,42 @@ class FaderBadge(QWidget):
 
 
 class DawFader(QSlider):
-    """Custom-painted vertical studio fader (+6.0 dB to -60 dB / -∞) with direct click/drag & unity reset."""
+    """Custom-painted studio console hardware fader (+6.0 dB to -60 dB / -∞).
+
+    Features a logarithmic hardware console taper (giving +6 to -12 dB ~42% of physical
+    travel), machined brushed-metallic concave saddle cap with milled horizontal grip
+    ridges, cast drop shadow, grab-offset dragging, Shift+drag fine trim (0.1 dB), and
+    double-click unity (0.0 dB) reset.
+    """
 
     dbChanged = Signal(float)
+    _TAPER_EXP = 1.7
 
-    def __init__(self, accent_color="#4da3ff", parent=None):
+    def __init__(self, accent_color="#4da3ff", is_master=False, parent=None):
         super().__init__(Qt.Orientation.Vertical, parent)
         self._accent = QColor(accent_color)
-        self._accent.setAlpha(185)
-        self._steps_per_db = 2  # 0.5 dB resolution
+        self._is_master = bool(is_master)
+        self._steps_per_db = 10  # 0.1 dB internal precision
         self.setRange(
             int(round(MIN_FADER_DB * self._steps_per_db)),
             int(round(MAX_FADER_DB * self._steps_per_db)),
         )
-        self.setSingleStep(1)
-        self.setPageStep(6)
+        self.setSingleStep(5)   # 0.5 dB per arrow/wheel step
+        self.setPageStep(30)    # 3.0 dB per page step
         self.setValue(0)
-        self.setFixedWidth(28)
+        self.setFixedWidth(32)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setToolTip("Volume fader (+6.0 to -∞ dB) · Double-click to reset to 0.0 dB unity")
+        self.setToolTip(
+            "Volume fader (+6.0 to -∞ dB) · Drag to adjust · Shift+drag for fine trim · Double-click for 0.0 dB unity"
+        )
         self._dragging = False
+        self._hovered = False
+        self._grab_offset_y = 0.0
+        self._last_drag_y = 0.0
+        self._virtual_cap_y = 0.0
         self.valueChanged.connect(self._emit_db)
 
     def _emit_db(self, iv):
@@ -427,30 +441,89 @@ class DawFader(QSlider):
         clamped = max(MIN_FADER_DB, min(MAX_FADER_DB, float(db)))
         self.setValue(int(round(clamped * self._steps_per_db)))
 
+    def _track_bounds(self):
+        h = float(self.height())
+        cap_h = max(28.0, min(42.0, h * 0.16))
+        top_y = cap_h * 0.5 + 4.0
+        bot_y = max(top_y + 12.0, h - cap_h * 0.5 - 6.0)
+        return top_y, bot_y, cap_h
+
+    def db_to_y(self, db):
+        top_y, bot_y, _ = self._track_bounds()
+        norm = (float(db) - MIN_FADER_DB) / (MAX_FADER_DB - MIN_FADER_DB)
+        norm = max(0.0, min(1.0, norm))
+        frac_from_top = 1.0 - (norm ** self._TAPER_EXP)
+        return top_y + frac_from_top * (bot_y - top_y)
+
     def _y_to_db(self, y):
         top_y, bot_y, _ = self._track_bounds()
-        frac = max(0.0, min(1.0, (float(y) - top_y) / max(1.0, bot_y - top_y)))
-        return MAX_FADER_DB - frac * (MAX_FADER_DB - MIN_FADER_DB)
+        frac_from_top = max(0.0, min(1.0, (float(y) - top_y) / max(1.0, bot_y - top_y)))
+        norm = (1.0 - frac_from_top) ** (1.0 / self._TAPER_EXP)
+        return MIN_FADER_DB + norm * (MAX_FADER_DB - MIN_FADER_DB)
+
+    def _is_over_cap(self, y):
+        _, _, cap_h = self._track_bounds()
+        cap_y = self.db_to_y(self.db_value())
+        return abs(float(y) - cap_y) <= cap_h * 0.5 + 2.0
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        if not self._dragging:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            y = float(event.position().y())
+            cap_y = self.db_to_y(self.db_value())
             self._dragging = True
-            self.set_db(self._y_to_db(event.position().y()))
+            self._last_drag_y = y
+            if self._is_over_cap(y):
+                self._grab_offset_y = y - cap_y
+                self._virtual_cap_y = cap_y
+            else:
+                self._grab_offset_y = 0.0
+                self._virtual_cap_y = y
+                self.set_db(self._y_to_db(y))
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.update()
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        y = float(event.position().y())
         if self._dragging:
-            self.set_db(self._y_to_db(event.position().y()))
+            dy = y - self._last_drag_y
+            self._last_drag_y = y
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self._virtual_cap_y += dy * 0.25
+            else:
+                self._virtual_cap_y = y - self._grab_offset_y
+            top_y, bot_y, _ = self._track_bounds()
+            self._virtual_cap_y = max(top_y, min(bot_y, self._virtual_cap_y))
+            self.set_db(self._y_to_db(self._virtual_cap_y))
             event.accept()
             return
+        self.setCursor(
+            Qt.CursorShape.OpenHandCursor if self._is_over_cap(y) else Qt.CursorShape.PointingHandCursor
+        )
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if self._dragging and event.button() == Qt.MouseButton.LeftButton:
             self._dragging = False
-            self.set_db(self._y_to_db(event.position().y()))
+            y = float(event.position().y())
+            self.setCursor(
+                Qt.CursorShape.OpenHandCursor if self._is_over_cap(y) else Qt.CursorShape.PointingHandCursor
+            )
+            self.update()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -458,19 +531,17 @@ class DawFader(QSlider):
     def mouseDoubleClickEvent(self, event):
         self._dragging = False
         self.set_db(0.0)
+        self.update()
         event.accept()
 
-    def _track_bounds(self):
-        cap_h = 22.0
-        top_y = cap_h * 0.5 + 2.0
-        bot_y = max(top_y + 10.0, float(self.height()) - cap_h * 0.5 - 2.0)
-        return top_y, bot_y, cap_h
-
-    def db_to_y(self, db):
-        top_y, bot_y, _ = self._track_bounds()
-        frac = (MAX_FADER_DB - float(db)) / (MAX_FADER_DB - MIN_FADER_DB)
-        frac = max(0.0, min(1.0, frac))
-        return top_y + frac * (bot_y - top_y)
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+        step_db = 0.1 if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 0.5
+        self.set_db(self.db_value() + (step_db if delta > 0 else -step_db))
+        event.accept()
 
     def paintEvent(self, _event):
         p = QPainter(self)
@@ -479,54 +550,250 @@ class DawFader(QSlider):
         w = float(self.width())
         cx = w * 0.5
         top_y, bot_y, cap_h = self._track_bounds()
-
-        # Recessed fader track slot
-        slot_w = 5.0
-        slot_rect = QRectF(cx - slot_w * 0.5, top_y - 3.0, slot_w, (bot_y - top_y) + 6.0)
-        p.setPen(QPen(QColor("#36536e"), 1.0))
-        p.setBrush(QColor("#0d1721"))
-        p.drawRoundedRect(slot_rect, 2.5, 2.5)
-
-        # Unity 0.0 dB gold notch
-        unity_y = self.db_to_y(0.0)
-        p.setPen(QPen(QColor("#ffd166"), 1.5))
-        p.drawLine(QPointF(2.0, unity_y), QPointF(cx - 5.0, unity_y))
-        p.drawLine(QPointF(cx + 5.0, unity_y), QPointF(w - 2.0, unity_y))
-
-        # Active level highlight in groove below cap
         db = self.db_value()
         cap_y = self.db_to_y(db)
-        if bot_y - cap_y > 1.0:
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(self._accent)
-            p.drawRoundedRect(
-                QRectF(cx - 1.5, cap_y, 3.0, (bot_y + 2.0) - cap_y),
-                1.5,
-                1.5,
-            )
 
-        # Studio console fader cap
-        cap_w = w - 4.0
+        # 1. Subtle console silkscreen calibration marks hugging the dust slot
+        p.setPen(QPen(QColor("#2f4962"), 1.0))
+        for mark_db in (6.0, -6.0, -12.0, -24.0, -42.0, MIN_FADER_DB):
+            my = self.db_to_y(mark_db)
+            p.drawLine(QPointF(cx - 10.5, my), QPointF(cx - 5.0, my))
+            p.drawLine(QPointF(cx + 5.0, my), QPointF(cx + 10.5, my))
+
+        # Prominent 0.0 dB unity gold calibration wings
+        unity_y = self.db_to_y(0.0)
+        p.setPen(QPen(QColor("#ffd166"), 1.5))
+        p.drawLine(QPointF(1.5, unity_y), QPointF(cx - 5.0, unity_y))
+        p.drawLine(QPointF(cx + 5.0, unity_y), QPointF(w - 1.5, unity_y))
+
+        # 2. Recessed console dust-guard track slot
+        slot_w = 5.2
+        slot_top = top_y - 4.0
+        slot_h = (bot_y - top_y) + 8.0
+        slot_rect = QRectF(cx - slot_w * 0.5, slot_top, slot_w, slot_h)
+
+        # Outer machined bezel highlight (bottom/right light catch)
+        p.setPen(QPen(QColor("#2c465e"), 1.0))
+        p.setBrush(QColor("#070d14"))
+        p.drawRoundedRect(slot_rect, 2.6, 2.6)
+
+        # Inner recessed shadow along top/left lip of slot
+        p.setPen(QPen(QColor(0, 0, 0, 180), 1.0))
+        p.drawLine(
+            QPointF(slot_rect.left() + 1.0, slot_rect.top() + 2.0),
+            QPointF(slot_rect.left() + 1.0, slot_rect.bottom() - 2.0),
+        )
+
+        # Center mechanical dust-brush slit
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#020508"))
+        p.drawRect(QRectF(cx - 0.8, slot_top + 2.5, 1.6, slot_h - 5.0))
+
+        # Subtle glowing level filament in the lower slot below the cap
+        if bot_y - cap_y > 2.0:
+            glow_top = cap_y + cap_h * 0.25
+            glow_bot = bot_y + 2.0
+            if glow_bot > glow_top:
+                glow_grad = QLinearGradient(QPointF(cx, glow_top), QPointF(cx, glow_bot))
+                c_top = QColor(self._accent)
+                c_top.setAlpha(175)
+                c_bot = QColor(self._accent)
+                c_bot.setAlpha(65)
+                glow_grad.setColorAt(0.0, c_top)
+                glow_grad.setColorAt(1.0, c_bot)
+                p.setBrush(QBrush(glow_grad))
+                p.drawRoundedRect(
+                    QRectF(cx - 0.9, glow_top, 1.8, glow_bot - glow_top),
+                    0.9,
+                    0.9,
+                )
+
+        # 3. Hardware sculpted metallic fader cap geometry (preserves sleek ~0.60 W:H console ratio)
+        cap_w = max(17.5, min(w - 6.0, cap_h * 0.60))
         cap_rect = QRectF(cx - cap_w * 0.5, cap_y - cap_h * 0.5, cap_w, cap_h)
-        grad = QLinearGradient(cap_rect.topLeft(), cap_rect.bottomLeft())
-        grad.setColorAt(0.0, QColor("#6b8aa6"))
-        grad.setColorAt(0.42, QColor("#3c5873"))
-        grad.setColorAt(0.50, QColor("#283d52"))
-        grad.setColorAt(0.58, QColor("#3c5873"))
-        grad.setColorAt(1.0, QColor("#56738e"))
 
-        p.setPen(QPen(QColor("#8cb3d6") if (self._dragging or self.underMouse()) else QColor("#1b2b3b"), 1.1))
-        p.setBrush(QBrush(grad))
-        p.drawRoundedRect(cap_rect, 3.5, 3.5)
+        # Multi-layer soft cast drop shadow onto console faceplate (overhead lighting)
+        p.setPen(Qt.PenStyle.NoPen)
+        for dx, dy, grow, alpha in (
+            (1.2, 4.2, 1.8, 42),
+            (0.8, 3.0, 1.0, 82),
+            (0.4, 1.8, 0.3, 130),
+        ):
+            sh = cap_rect.adjusted(-grow + dx, -grow * 0.4 + dy, grow + dx, grow * 0.6 + dy)
+            p.setBrush(QColor(2, 6, 12, alpha))
+            p.drawRoundedRect(sh, 3.8, 3.8)
 
+        # Palette: warm machined titanium/champagne for Master Bus, brushed aluminum-slate for channels
+        if self._is_master:
+            cheek_stops = (
+                (0.00, "#d8ccb6"),
+                (0.08, "#a69880"),
+                (0.32, "#756958"),
+                (0.50, "#5e5344"),
+                (0.72, "#7e715e"),
+                (0.90, "#b5a78f"),
+                (0.94, "#4b4236"),
+                (1.00, "#241f18"),
+            )
+            saddle_stops = (
+                (0.00, "#e7decb"),
+                (0.07, "#9c8e78"),
+                (0.22, "#595042"),
+                (0.42, "#352f27"),
+                (0.50, "#231e18"),
+                (0.58, "#3a332a"),
+                (0.76, "#786c5a"),
+                (0.89, "#c4b69e"),
+                (0.95, "#6b604f"),
+                (1.00, "#2b251d"),
+            )
+            ridge_hi_top = QColor(255, 245, 225, 42)
+            ridge_hi_bot = QColor(255, 248, 232, 74)
+            border_idle = QColor("#1a1610")
+            border_active = QColor("#ffd166")
+        else:
+            cheek_stops = (
+                (0.00, "#c8d6e4"),
+                (0.08, "#8fa4b8"),
+                (0.32, "#607488"),
+                (0.50, "#4b5d70"),
+                (0.72, "#687d92"),
+                (0.90, "#9db2c6"),
+                (0.94, "#3b4c5d"),
+                (1.00, "#1c2630"),
+            )
+            saddle_stops = (
+                (0.00, "#dce7f2"),
+                (0.07, "#859bb0"),
+                (0.22, "#46596c"),
+                (0.42, "#283747"),
+                (0.50, "#192531"),
+                (0.58, "#2c3d4e"),
+                (0.76, "#647a90"),
+                (0.89, "#b1c5d8"),
+                (0.95, "#596e83"),
+                (1.00, "#22303e"),
+            )
+            ridge_hi_top = QColor(235, 245, 255, 40)
+            ridge_hi_bot = QColor(235, 245, 255, 72)
+            border_idle = QColor("#101a24")
+            border_active = QColor("#99c2e8")
+
+        # 4. Outer machined cap body (forms the brushed-metal left/right side cheeks & underside lip)
+        cheek_grad = QLinearGradient(cap_rect.topLeft(), cap_rect.bottomLeft())
+        for pos, hx in cheek_stops:
+            cheek_grad.setColorAt(pos, QColor(hx))
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(cheek_grad))
+        p.drawRoundedRect(cap_rect, 2.8, 2.8)
+
+        # Subtle metallic glint along the left & right outer cheek edges
+        p.setPen(QPen(QColor(255, 255, 255, 42), 0.9))
+        p.drawLine(
+            QPointF(cap_rect.left() + 1.1, cap_rect.top() + 2.5),
+            QPointF(cap_rect.left() + 1.1, cap_rect.bottom() - 3.5),
+        )
+        p.setPen(QPen(QColor(0, 0, 0, 65), 0.9))
+        p.drawLine(
+            QPointF(cap_rect.right() - 1.1, cap_rect.top() + 2.5),
+            QPointF(cap_rect.right() - 1.1, cap_rect.bottom() - 3.5),
+        )
+
+        # 5. Recessed concave finger saddle (inset between the brushed-metal side cheeks)
+        cheek_w = max(2.0, min(2.8, cap_w * 0.105))
+        saddle_rect = QRectF(
+            cap_rect.left() + cheek_w,
+            cap_rect.top() + 0.8,
+            cap_w - cheek_w * 2.0,
+            cap_h - 3.4,
+        )
+        saddle_grad = QLinearGradient(saddle_rect.topLeft(), saddle_rect.bottomLeft())
+        for pos, hx in saddle_stops:
+            saddle_grad.setColorAt(pos, QColor(hx))
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(saddle_grad))
+        p.drawRoundedRect(saddle_rect, 1.4, 1.4)
+
+        # Crisp step seams separating outer side cheeks from the recessed concave saddle
+        p.setPen(QPen(QColor(6, 10, 16, 155), 0.9))
+        p.drawLine(
+            QPointF(saddle_rect.left(), saddle_rect.top() + 1.0),
+            QPointF(saddle_rect.left(), saddle_rect.bottom() - 0.5),
+        )
+        p.drawLine(
+            QPointF(saddle_rect.right(), saddle_rect.top() + 1.0),
+            QPointF(saddle_rect.right(), saddle_rect.bottom() - 0.5),
+        )
+        p.setPen(QPen(QColor(255, 255, 255, 48), 0.7))
+        p.drawLine(
+            QPointF(saddle_rect.left() - 0.9, saddle_rect.top() + 1.5),
+            QPointF(saddle_rect.left() - 0.9, saddle_rect.bottom() - 1.0),
+        )
+        p.drawLine(
+            QPointF(saddle_rect.right() + 0.9, saddle_rect.top() + 1.5),
+            QPointF(saddle_rect.right() + 0.9, saddle_rect.bottom() - 1.0),
+        )
+
+        # 6. Precision horizontal milled grip ridges across upper & lower concave slopes
+        ridge_left = saddle_rect.left() + 0.8
+        ridge_right = saddle_rect.right() - 0.8
+        ridge_dark = QColor(6, 10, 16, 130)
+        pitch = 2.4
+
+        # Upper concave slope ridges
+        y_r = saddle_rect.top() + 2.8
+        upper_limit = cap_y - 3.2
+        while y_r <= upper_limit:
+            p.setPen(QPen(ridge_dark, 0.95))
+            p.drawLine(QPointF(ridge_left, y_r), QPointF(ridge_right, y_r))
+            p.setPen(QPen(ridge_hi_top, 0.8))
+            p.drawLine(QPointF(ridge_left, y_r + 0.95), QPointF(ridge_right, y_r + 0.95))
+            y_r += pitch
+
+        # Lower concave slope ridges (catch brighter overhead specular light)
+        y_r = cap_y + 3.2
+        lower_limit = saddle_rect.bottom() - 2.6
+        while y_r <= lower_limit:
+            p.setPen(QPen(ridge_dark, 0.95))
+            p.drawLine(QPointF(ridge_left, y_r), QPointF(ridge_right, y_r))
+            p.setPen(QPen(ridge_hi_bot, 0.85))
+            p.drawLine(QPointF(ridge_left, y_r + 0.95), QPointF(ridge_right, y_r + 0.95))
+            y_r += pitch
+
+        # 7. Crisp overhead specular highlight on top chamfered lip & bottom ridge
+        top_hi_alpha = 215 if (self._dragging or self._hovered) else 170
+        p.setPen(QPen(QColor(255, 255, 255, top_hi_alpha), 1.0))
+        p.drawLine(
+            QPointF(cap_rect.left() + 2.2, cap_rect.top() + 0.9),
+            QPointF(cap_rect.right() - 2.2, cap_rect.top() + 0.9),
+        )
+        p.setPen(QPen(QColor(255, 255, 255, 95), 0.9))
+        p.drawLine(
+            QPointF(cap_rect.left() + 2.2, cap_rect.bottom() - 3.0),
+            QPointF(cap_rect.right() - 2.2, cap_rect.bottom() - 3.0),
+        )
+
+        # 8. Outer cap contour border
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(border_active if (self._dragging or self._hovered) else border_idle, 1.05))
+        p.drawRoundedRect(cap_rect, 2.8, 2.8)
+
+        # 9. Laser-engraved recessed center pointer line
         if abs(db) <= 0.05:
             line_col = QColor("#ffd166")
         elif db > 0.05:
-            line_col = QColor("#fc8181")
+            line_col = QColor("#ff7878")
         else:
-            line_col = QColor("#f0f6fc")
-        p.setPen(QPen(line_col, 2.0))
-        p.drawLine(QPointF(cap_rect.left() + 3.0, cap_y), QPointF(cap_rect.right() - 3.0, cap_y))
+            line_col = QColor("#f4f8fc")
+
+        # Subtle dark recess shadow hugging the pointer line
+        p.setPen(QPen(QColor(4, 8, 14, 185), 3.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+        p.drawLine(QPointF(cap_rect.left() + 1.5, cap_y), QPointF(cap_rect.right() - 1.5, cap_y))
+        # High-contrast inlaid center pointer bar
+        p.setPen(QPen(line_col, 1.9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+        p.drawLine(QPointF(cap_rect.left() + 1.8, cap_y), QPointF(cap_rect.right() - 1.8, cap_y))
 
 
 class _FaderScaleTicks(QWidget):
@@ -547,19 +814,23 @@ class _FaderScaleTicks(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        major_dbs = {db for db, _ in self._ticks}
-
-        # Subtle minor graduation hash marks (e.g. every 3 dB, or 1.5 dB on tall master faders)
-        top_y, bot_y, _ = self._fader._track_bounds()
-        px_per_db = (bot_y - top_y) / max(1.0, float(MAX_FADER_DB - MIN_FADER_DB))
-        step = self._minor_step * 0.5 if px_per_db >= 4.0 else self._minor_step
+        # Taper-aware minor graduation hash marks:
+        # Use 1.5 dB half-steps only in the high-resolution upper mixing zone (+6..-18 dB)
+        # when tall enough (e.g. Master Bus), and clean 3 dB steps elsewhere.
+        major_ys = [self._fader.db_to_y(db) for db, _ in self._ticks]
+        span_0_m6 = abs(self._fader.db_to_y(-6.0) - self._fader.db_to_y(0.0))
+        use_fine_upper = span_0_m6 >= 28.0
         minor_pen = QPen(QColor("#4f6e8c"), 0.9)
         p.setPen(minor_pen)
+        last_minor_y = -1e9
         db = float(MAX_FADER_DB)
         while db >= float(MIN_FADER_DB) - 1e-6:
-            if not any(abs(db - m) < 0.05 for m in major_dbs):
-                my = self._fader.db_to_y(db)
+            my = self._fader.db_to_y(db)
+            near_major = any(abs(my - maj_y) < 3.8 for maj_y in major_ys)
+            if not near_major and (my - last_minor_y) >= 5.2:
                 p.drawLine(QPointF(0.0, my), QPointF(3.0, my))
+                last_minor_y = my
+            step = (self._minor_step * 0.5) if (use_fine_upper and db > -18.0) else self._minor_step
             db -= step
 
         # Major ticks + non-overlapping labels (prioritize 0.0 dB unity and +6 / -inf endpoints)
@@ -595,12 +866,12 @@ class _FaderScaleTicks(QWidget):
 class FaderWithScale(QWidget):
     """Combined DawFader + aligned painted dB scale."""
 
-    def __init__(self, ticks, accent_color="#4da3ff", minor_step_db=3.0, parent=None):
+    def __init__(self, ticks, accent_color="#4da3ff", minor_step_db=3.0, is_master=False, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        self.fader = DawFader(accent_color=accent_color, parent=self)
+        layout.setSpacing(4)
+        self.fader = DawFader(accent_color=accent_color, is_master=is_master, parent=self)
         self._ticks = _FaderScaleTicks(self.fader, ticks, minor_step_db=minor_step_db, parent=self)
         layout.addWidget(self.fader)
         layout.addWidget(self._ticks)
