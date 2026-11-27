@@ -635,3 +635,217 @@ int dsp_is_silent_i16(const int16_t *pcm, size_t n_samples, int threshold) {
     }
     return 1;
 }
+
+/* Decode 32-bit little-endian IEEE-754 float WAV bytes to mono double. */
+size_t dsp_decode_f32_to_mono_f64(
+    const uint8_t *raw,
+    size_t nbytes,
+    int nchannels,
+    double *out
+) {
+    if (!raw || !out || nbytes == 0 || nchannels <= 0) {
+        return 0;
+    }
+    size_t frame_bytes = (size_t)4 * (size_t)nchannels;
+    size_t n_frames = nbytes / frame_bytes;
+    const float *fp = (const float *)raw;
+    if (nchannels == 1) {
+        for (size_t i = 0; i < n_frames; ++i) {
+            double v = (double)fp[i];
+            out[i] = isfinite(v) ? v : 0.0;
+        }
+    } else if (nchannels == 2) {
+        for (size_t i = 0; i < n_frames; ++i) {
+            size_t j = i * 2;
+            double v0 = (double)fp[j];
+            double v1 = (double)fp[j + 1];
+            if (!isfinite(v0)) v0 = 0.0;
+            if (!isfinite(v1)) v1 = 0.0;
+            out[i] = (v0 + v1) * 0.5;
+        }
+    } else {
+        double inv_ch = 1.0 / (double)nchannels;
+        for (size_t f = 0; f < n_frames; ++f) {
+            size_t base = f * (size_t)nchannels;
+            double total = 0.0;
+            for (int c = 0; c < nchannels; ++c) {
+                double v = (double)fp[base + (size_t)c];
+                if (isfinite(v)) {
+                    total += v;
+                }
+            }
+            out[f] = total * inv_ch;
+        }
+    }
+    return n_frames;
+}
+
+/* Decode 64-bit little-endian IEEE-754 double WAV bytes to mono double. */
+size_t dsp_decode_f64_to_mono_f64(
+    const uint8_t *raw,
+    size_t nbytes,
+    int nchannels,
+    double *out
+) {
+    if (!raw || !out || nbytes == 0 || nchannels <= 0) {
+        return 0;
+    }
+    size_t frame_bytes = (size_t)8 * (size_t)nchannels;
+    size_t n_frames = nbytes / frame_bytes;
+    const double *dp = (const double *)raw;
+    if (nchannels == 1) {
+        for (size_t i = 0; i < n_frames; ++i) {
+            double v = dp[i];
+            out[i] = isfinite(v) ? v : 0.0;
+        }
+    } else {
+        double inv_ch = 1.0 / (double)nchannels;
+        for (size_t f = 0; f < n_frames; ++f) {
+            size_t base = f * (size_t)nchannels;
+            double total = 0.0;
+            for (int c = 0; c < nchannels; ++c) {
+                double v = dp[base + (size_t)c];
+                if (isfinite(v)) {
+                    total += v;
+                }
+            }
+            out[f] = total * inv_ch;
+        }
+    }
+    return n_frames;
+}
+
+/* Stereo-linked zero-latency peak brickwall master limiter with pre-gain & smooth release. */
+void dsp_master_limiter_inplace(
+    double *left,
+    double *right,
+    size_t n,
+    double sample_rate,
+    double pre_gain,
+    double ceiling_db,
+    double release_ms,
+    double *env_io
+) {
+    if (!left || !right || !env_io || n == 0) {
+        return;
+    }
+    double sr = sample_rate > 1.0 ? sample_rate : 1.0;
+    double rel_samples = release_ms * 0.001 * sr;
+    if (rel_samples < 1.0) rel_samples = 1.0;
+    double release_c = exp(-1.0 / rel_samples);
+    double one_minus_rel = 1.0 - release_c;
+    double ceiling_lin = pow(10.0, ceiling_db / 20.0);
+    double env = *env_io;
+
+    for (size_t i = 0; i < n; ++i) {
+        double lv = left[i] * pre_gain;
+        double rv = right[i] * pre_gain;
+        if (!isfinite(lv)) lv = 0.0;
+        if (!isfinite(rv)) rv = 0.0;
+        double al = lv >= 0.0 ? lv : -lv;
+        double ar = rv >= 0.0 ? rv : -rv;
+        double pk = al >= ar ? al : ar;
+        if (pk > env) {
+            env = pk;
+        } else {
+            env = release_c * env + one_minus_rel * pk;
+        }
+        if (env > ceiling_lin && env > 1e-12) {
+            double g = ceiling_lin / env;
+            left[i] = lv * g;
+            right[i] = rv * g;
+        } else {
+            left[i] = lv;
+            right[i] = rv;
+        }
+    }
+    *env_io = env;
+}
+
+/*
+ * Apply master gain, optionally meter L/R VU & true peaks, optionally clamp to
+ * [-1.0, 1.0] (1 for live paFloat32, 0 for unclipped 32-bit float WAV bounce),
+ * and pack interleaved stereo IEEE-754 float32 samples.
+ */
+void dsp_master_pack_f32(
+    const double *master_left,
+    const double *master_right,
+    size_t n,
+    double master_gain,
+    int clamp_output,
+    float *out_f32,
+    int compute_meters,
+    double *out_vu_l,
+    double *out_vu_r,
+    double *out_pk_l,
+    double *out_pk_r
+) {
+    if (!master_left || !master_right || !out_f32 || n == 0) {
+        return;
+    }
+
+    double l_sq = 0.0;
+    double r_sq = 0.0;
+    double l_pk = 0.0;
+    double r_pk = 0.0;
+
+    for (size_t j = 0; j < n; ++j) {
+        double lv = master_left[j] * master_gain;
+        double rv = master_right[j] * master_gain;
+        if (!isfinite(lv)) lv = 0.0;
+        if (!isfinite(rv)) rv = 0.0;
+
+        if (compute_meters) {
+            l_sq += lv * lv;
+            r_sq += rv * rv;
+            double al = lv >= 0.0 ? lv : -lv;
+            double ar = rv >= 0.0 ? rv : -rv;
+            if (al > l_pk) l_pk = al;
+            if (ar > r_pk) r_pk = ar;
+        }
+
+        if (clamp_output) {
+            if (lv > 1.0) lv = 1.0;
+            else if (lv < -1.0) lv = -1.0;
+            if (rv > 1.0) rv = 1.0;
+            else if (rv < -1.0) rv = -1.0;
+        }
+
+        out_f32[j * 2] = (float)lv;
+        out_f32[j * 2 + 1] = (float)rv;
+    }
+
+    if (compute_meters) {
+        double inv_n = 1.0 / (double)n;
+        if (out_vu_l) *out_vu_l = sqrt(l_sq * inv_n) * SQRT2_VAL;
+        if (out_vu_r) *out_vu_r = sqrt(r_sq * inv_n) * SQRT2_VAL;
+        if (out_pk_l) *out_pk_l = l_pk;
+        if (out_pk_r) *out_pk_r = r_pk;
+    }
+}
+
+/* Convert mono IEEE-754 float32 samples into 24-bit signed little-endian PCM bytes. */
+void dsp_pack_mono_f32_to_i24(
+    const float *in_f32,
+    size_t n,
+    uint8_t *out_bytes
+) {
+    if (!in_f32 || !out_bytes || n == 0) {
+        return;
+    }
+    const double scale = 8388608.0;
+    size_t off = 0;
+    for (size_t i = 0; i < n; ++i) {
+        double v = (double)in_f32[i];
+        if (!isfinite(v)) v = 0.0;
+        if (v > 1.0) v = 1.0;
+        else if (v < -1.0) v = -1.0;
+        int64_t q = (int64_t)llrint(v * scale);
+        if (q > 8388607LL) q = 8388607LL;
+        else if (q < -8388608LL) q = -8388608LL;
+        uint32_t u = (uint32_t)(int32_t)q;
+        out_bytes[off++] = (uint8_t)(u & 0xFFu);
+        out_bytes[off++] = (uint8_t)((u >> 8) & 0xFFu);
+        out_bytes[off++] = (uint8_t)((u >> 16) & 0xFFu);
+    }
+}

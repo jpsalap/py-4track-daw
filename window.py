@@ -31,6 +31,8 @@ from Delay import DelayProcessor, DelayWindow
 from Tremolo import TremoloProcessor, TremoloWindow
 from Chorus import ChorusProcessor, ChorusWindow
 from Compressor import CompressorProcessor, CompressorWindow
+from MasterLimiter import MasterLimiterProcessor
+from wav_io import open_wav_read, open_wav_write
 
 
 if getattr(sys, "frozen", False):
@@ -66,12 +68,13 @@ def format_fader_db(db):
     return f"{val:.1f} dB"
 
 
-def format_audio_meta(sample_rate, bit_depth, channels):
-    """Format WAV metadata concisely (e.g. '44.1 kHz · 16-bit · Stereo')."""
+def format_audio_meta(sample_rate, bit_depth, channels, sample_format="pcm"):
+    """Format WAV metadata concisely (e.g. '44.1 kHz · 16-bit · Stereo' or '48 kHz · 32f · Stereo')."""
     khz = sample_rate / 1000.0
     sr_txt = f"{int(khz)} kHz" if abs(khz - round(khz)) < 1e-3 else f"{khz:.1f} kHz"
     ch_txt = "Mono" if channels == 1 else ("Stereo" if channels == 2 else f"{channels}ch")
-    return f"{sr_txt} · {bit_depth}-bit · {ch_txt}"
+    depth_txt = f"{bit_depth}f" if sample_format == "float" else f"{bit_depth}-bit"
+    return f"{sr_txt} · {depth_txt} · {ch_txt}"
 
 ChannelSnapshot = namedtuple(
     "ChannelSnapshot",
@@ -107,6 +110,86 @@ def _is_pcm_silent(pcm_bytes, threshold=4):
     return max(abs(v) for v in check) < threshold
 
 
+def pack_recorded_mono(raw_bytes, captured_fmt, target_bitdepth=16, target_sample_format="pcm"):
+    """Convert captured mono input bytes ('int16' or 'float32') to target WAV format bytes."""
+    if not raw_bytes:
+        return b""
+    if target_sample_format == "float":
+        if captured_fmt == "float32":
+            return raw_bytes
+        src = array.array("h")
+        src.frombytes(raw_bytes[: (len(raw_bytes) // 2) * 2])
+        scale = 1.0 / 32768.0
+        out = array.array("f", (s * scale for s in src))
+        return out.tobytes()
+
+    if target_bitdepth == 24:
+        if captured_fmt == "float32":
+            n = len(raw_bytes) // 4
+            if n == 0:
+                return b""
+            src = array.array("f")
+            src.frombytes(raw_bytes[: n * 4])
+            if _dsp is not None and _dsp.AVAILABLE and getattr(_dsp, "HAS_FLOAT_IO", False):
+                out_u8 = _dsp.alloc_u8(n * 3)
+                _dsp.LIB.dsp_pack_mono_f32_to_i24(_dsp.f32_ptr(src), n, _dsp.u8_ptr(out_u8))
+                return out_u8.tobytes()
+            out_24 = bytearray(n * 3)
+            off = 0
+            isfinite = math.isfinite
+            for v in src:
+                fv = float(v)
+                if not isfinite(fv):
+                    fv = 0.0
+                elif fv > 1.0:
+                    fv = 1.0
+                elif fv < -1.0:
+                    fv = -1.0
+                q = int(round(fv * 8388608.0))
+                if q > 8388607:
+                    q = 8388607
+                elif q < -8388608:
+                    q = -8388608
+                u = q & 0xFFFFFF
+                out_24[off] = u & 0xFF
+                out_24[off + 1] = (u >> 8) & 0xFF
+                out_24[off + 2] = (u >> 16) & 0xFF
+                off += 3
+            return bytes(out_24)
+        # Widening 16-bit fallback -> 24-bit signed little-endian PCM
+        n = len(raw_bytes) // 2
+        out_24 = bytearray(n * 3)
+        for i in range(n):
+            out_24[i * 3] = 0
+            out_24[i * 3 + 1] = raw_bytes[i * 2]
+            out_24[i * 3 + 2] = raw_bytes[i * 2 + 1]
+        return bytes(out_24)
+
+    # 16-bit integer PCM
+    if captured_fmt == "int16":
+        return raw_bytes
+    n = len(raw_bytes) // 4
+    src = array.array("f")
+    src.frombytes(raw_bytes[: n * 4])
+    out16 = array.array("h", [0] * n)
+    isfinite = math.isfinite
+    for i, v in enumerate(src):
+        fv = float(v)
+        if not isfinite(fv):
+            fv = 0.0
+        elif fv > 1.0:
+            fv = 1.0
+        elif fv < -1.0:
+            fv = -1.0
+        q = int(round(fv * 32768.0))
+        if q > 32767:
+            q = 32767
+        elif q < -32768:
+            q = -32768
+        out16[i] = q
+    return out16.tobytes()
+
+
 def _estimate_delay_tail_frames(delay_procs, session_rate, step_frames, max_tail_sec=15.0):
     """Compute (min_tail_frames, max_tail_frames) accounting for delay time and feedback decay."""
     max_delay_ms = 0.0
@@ -129,10 +212,54 @@ def _estimate_delay_tail_frames(delay_procs, session_rate, step_frames, max_tail
     return min_tail_frames, min(cap_frames, tail_frames)
 
 
-def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels):
-    """Decode PCM WAV bytes (8/16/24/32-bit, mono or multi-channel) to mono floats in [-1.0, 1.0]."""
+def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels, sample_format="pcm"):
+    """Decode WAV bytes (8/16/24/32-bit integer PCM or 32/64-bit IEEE float) to mono float64."""
     if not raw_bytes:
         return []
+
+    if sample_format == "float":
+        if sampwidth not in (4, 8) or nchannels <= 0:
+            raise ValueError(f"Unsupported IEEE Float WAV sample width: {sampwidth} bytes")
+        frame_bytes = sampwidth * nchannels
+        n_frames = len(raw_bytes) // frame_bytes
+        if n_frames == 0:
+            return []
+        if _dsp is not None and _dsp.AVAILABLE and getattr(_dsp, "HAS_FLOAT_IO", False):
+            out = _dsp.alloc_f64(n_frames)
+            if sampwidth == 4:
+                _dsp.LIB.dsp_decode_f32_to_mono_f64(
+                    raw_bytes, len(raw_bytes), nchannels, _dsp.f64_ptr(out)
+                )
+            else:
+                _dsp.LIB.dsp_decode_f64_to_mono_f64(
+                    raw_bytes, len(raw_bytes), nchannels, _dsp.f64_ptr(out)
+                )
+            return out
+
+        usable = n_frames * frame_bytes
+        arr = array.array("f" if sampwidth == 4 else "d")
+        arr.frombytes(raw_bytes[:usable])
+        isfinite = math.isfinite
+        if nchannels == 1:
+            return [float(v) if isfinite(v) else 0.0 for v in arr]
+        inv_ch = 1.0 / float(nchannels)
+        if nchannels == 2:
+            out = [0.0] * n_frames
+            for f in range(n_frames):
+                v0 = float(arr[f * 2])
+                v1 = float(arr[f * 2 + 1])
+                out[f] = ((v0 if isfinite(v0) else 0.0) + (v1 if isfinite(v1) else 0.0)) * 0.5
+            return out
+        out = [0.0] * n_frames
+        for f in range(n_frames):
+            base = f * nchannels
+            total = 0.0
+            for c in range(nchannels):
+                v = float(arr[base + c])
+                if isfinite(v):
+                    total += v
+            out[f] = total * inv_ch
+        return out
 
     if _dsp is not None and _dsp.AVAILABLE and sampwidth in (1, 2, 3, 4) and nchannels > 0:
         frame_bytes = sampwidth * nchannels
@@ -256,6 +383,7 @@ class StreamingWavReader:
         self.wf = wf
         self.nch = wf.getnchannels()
         self.sw = wf.getsampwidth()
+        self.sample_format = wf.getsampleformat() if hasattr(wf, "getsampleformat") else "pcm"
         self.src_rate = max(1, wf.getframerate())
         self.dst_rate = max(1, int(dst_rate))
         self.step = self.src_rate / float(self.dst_rate)
@@ -270,7 +398,7 @@ class StreamingWavReader:
             return []
         if self.src_rate == self.dst_rate:
             raw = self.wf.readframes(out_frames)
-            return decode_pcm_to_mono_float(raw, self.sw, self.nch) if raw else []
+            return decode_pcm_to_mono_float(raw, self.sw, self.nch, self.sample_format) if raw else []
 
         needed = int(math.floor(self._pos + (out_frames - 1) * self.step)) + 2
         while not self._eof and len(self._buf) < needed:
@@ -279,7 +407,7 @@ class StreamingWavReader:
             if not raw:
                 self._eof = True
                 break
-            self._buf.extend(decode_pcm_to_mono_float(raw, self.sw, self.nch))
+            self._buf.extend(decode_pcm_to_mono_float(raw, self.sw, self.nch, self.sample_format))
 
         buf = self._buf
         avail = len(buf)
@@ -417,9 +545,10 @@ def extract_waveform_peaks(filepath, num_bins=2400):
     Fast stdlib WAV envelope extractor for pro DAW waveform display.
     Returns (bins_list, duration_sec) where each bin is (min_val, max_val, rms_val) in [-1.0, 1.0].
     """
-    with wave.open(filepath, "rb") as wf:
+    with open_wav_read(filepath) as wf:
         nch = wf.getnchannels()
         sw = wf.getsampwidth()
+        sfmt = wf.getsampleformat()
         fr = max(1, wf.getframerate())
         nframes = wf.getnframes()
         duration_sec = nframes / float(fr)
@@ -440,7 +569,7 @@ def extract_waveform_peaks(filepath, num_bins=2400):
             raw = wf.readframes(count)
             if not raw:
                 break
-            mono = decode_pcm_to_mono_float(raw, sw, nch)
+            mono = decode_pcm_to_mono_float(raw, sw, nch, sfmt)
             if mono:
                 lo = 0.0
                 hi = 0.0
@@ -471,6 +600,9 @@ def mix_stereo_chunk(
     out_bit_depth=16,
     dither_tpdf=False,
     dither_rng=None,
+    master_limiter=None,
+    out_format="pcm",
+    clamp_float=True,
 ):
     """
     Process per-channel mono float chunks through enabled effects, polarity inversion,
@@ -649,13 +781,107 @@ def mix_stereo_chunk(
                 master_left[j] += s * l_gain
                 master_right[j] += s * r_gain
 
-    # Apply master fader, measure stereo master bus VU + pre-clip peaks, dither/round, clip, and pack PCM
+    # Apply master fader, optional master safety limiter, metering, dither/round, clip, and pack output
     m_gain = float(master_gain)
+    if master_limiter is not None:
+        master_limiter.process_stereo_inplace(
+            master_left, master_right, max_len, sample_rate, pre_gain=m_gain
+        )
+        pack_gain = 1.0
+    else:
+        pack_gain = m_gain
+
+    want_m_vu = out_master_levels is not None and len(out_master_levels) >= 2
+    want_m_pk = out_master_peaks is not None and len(out_master_peaks) >= 2
+
+    if out_format == "float32":
+        clamp_flag = 1 if clamp_float else 0
+        if use_c and getattr(_dsp, "HAS_FLOAT_IO", False):
+            out_f32 = _dsp.alloc_f32(max_len * 2)
+            if want_m_vu or want_m_pk:
+                vl_c = ctypes.c_double(0.0)
+                vr_c = ctypes.c_double(0.0)
+                pl_c = ctypes.c_double(0.0)
+                pr_c = ctypes.c_double(0.0)
+                _dsp.LIB.dsp_master_pack_f32(
+                    ml_ptr,
+                    mr_ptr,
+                    max_len,
+                    pack_gain,
+                    clamp_flag,
+                    _dsp.f32_ptr(out_f32),
+                    1,
+                    ctypes.byref(vl_c),
+                    ctypes.byref(vr_c),
+                    ctypes.byref(pl_c),
+                    ctypes.byref(pr_c),
+                )
+                if want_m_vu:
+                    out_master_levels[0] = vl_c.value
+                    out_master_levels[1] = vr_c.value
+                if want_m_pk:
+                    out_master_peaks[0] = pl_c.value
+                    out_master_peaks[1] = pr_c.value
+            else:
+                _dsp.LIB.dsp_master_pack_f32(
+                    ml_ptr,
+                    mr_ptr,
+                    max_len,
+                    pack_gain,
+                    clamp_flag,
+                    _dsp.f32_ptr(out_f32),
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            return out_f32.tobytes()
+
+        stereo_f32 = array.array("f", [0.0] * (max_len * 2))
+        l_sq = 0.0
+        r_sq = 0.0
+        l_pk = 0.0
+        r_pk = 0.0
+        isfinite = math.isfinite
+        for j in range(max_len):
+            lv = master_left[j] * pack_gain
+            rv = master_right[j] * pack_gain
+            if not isfinite(lv):
+                lv = 0.0
+            if not isfinite(rv):
+                rv = 0.0
+            if want_m_vu or want_m_pk:
+                l_sq += lv * lv
+                r_sq += rv * rv
+                al = lv if lv >= 0.0 else -lv
+                ar = rv if rv >= 0.0 else -rv
+                if al > l_pk:
+                    l_pk = al
+                if ar > r_pk:
+                    r_pk = ar
+            if clamp_flag:
+                if lv > 1.0:
+                    lv = 1.0
+                elif lv < -1.0:
+                    lv = -1.0
+                if rv > 1.0:
+                    rv = 1.0
+                elif rv < -1.0:
+                    rv = -1.0
+            stereo_f32[j * 2] = lv
+            stereo_f32[j * 2 + 1] = rv
+        if want_m_vu:
+            out_master_levels[0] = math.sqrt(l_sq * inv_len) * sqrt2
+            out_master_levels[1] = math.sqrt(r_sq * inv_len) * sqrt2
+        if want_m_pk:
+            out_master_peaks[0] = l_pk
+            out_master_peaks[1] = r_pk
+        return stereo_f32.tobytes()
+
     bit_depth = int(out_bit_depth) if int(out_bit_depth) in (16, 24, 32) else 16
     use_dither = bool(dither_tpdf) and (bit_depth < 32)
     sampwidth = bit_depth // 8
-    want_m_vu = out_master_levels is not None and len(out_master_levels) >= 2
-    want_m_pk = out_master_peaks is not None and len(out_master_peaks) >= 2
 
     if use_c:
         out_u8 = _dsp.alloc_u8(max_len * 2 * sampwidth)
@@ -669,7 +895,7 @@ def mix_stereo_chunk(
                 ml_ptr,
                 mr_ptr,
                 max_len,
-                m_gain,
+                pack_gain,
                 bit_depth,
                 1 if use_dither else 0,
                 rng_ptr,
@@ -691,7 +917,7 @@ def mix_stereo_chunk(
                 ml_ptr,
                 mr_ptr,
                 max_len,
-                m_gain,
+                pack_gain,
                 bit_depth,
                 1 if use_dither else 0,
                 rng_ptr,
@@ -722,8 +948,8 @@ def mix_stereo_chunk(
     off24 = 0
 
     for j in range(max_len):
-        lv = master_left[j] * m_gain
-        rv = master_right[j] * m_gain
+        lv = master_left[j] * pack_gain
+        rv = master_right[j] * pack_gain
         if not math.isfinite(lv):
             lv = 0.0
         if not math.isfinite(rv):
@@ -1120,6 +1346,8 @@ class WaveformTimeline:
     SCROLL_H = 10
     MIN_ZOOM = 1.0
     MAX_ZOOM = 32.0
+    MIN_VZOOM = 1.0
+    MAX_VZOOM = 16.0
 
     def __init__(self, parent, on_seek, bg="#0e1822"):
         self.on_seek = on_seek
@@ -1131,6 +1359,7 @@ class WaveformTimeline:
 
         # Horizontal zoom & viewport pan state
         self._zoom = 1.0
+        self._vzoom = 1.0
         self._view_start = 0.0
         self._scroll_dragging = False
         self._scroll_drag_offset = 0.0
@@ -1193,14 +1422,14 @@ class WaveformTimeline:
             font=("Helvetica", 9, "bold"),
         ).pack(side=tk.RIGHT)
 
-        # Compact studio zoom controls: [ - ] [ 1.0x ] [ + ] [ Fit ]
+        # Compact studio horizontal + vertical waveform zoom controls
         zoom_bar = tk.Frame(top_bar, bg="#1b2d3e")
-        zoom_bar.pack(side=tk.RIGHT, padx=(0, 14))
+        zoom_bar.pack(side=tk.RIGHT, padx=(0, 12))
 
-        self._make_zoom_btn(zoom_bar, "Fit", self.reset_zoom, padx=6).pack(
-            side=tk.RIGHT, padx=(3, 0)
+        self._make_zoom_btn(zoom_bar, "Fit", self.reset_zoom, padx=5).pack(
+            side=tk.RIGHT, padx=(2, 0)
         )
-        self._make_zoom_btn(zoom_bar, "+", self.zoom_in, padx=6).pack(
+        self._make_zoom_btn(zoom_bar, "+", self.zoom_in, padx=5).pack(
             side=tk.RIGHT, padx=(2, 0)
         )
 
@@ -1219,15 +1448,58 @@ class WaveformTimeline:
         zoom_lbl.pack(side=tk.RIGHT, padx=(2, 0))
         zoom_lbl.bind("<Button-1>", lambda _e: self.reset_zoom())
 
-        self._make_zoom_btn(zoom_bar, "−", self.zoom_out, padx=6).pack(side=tk.RIGHT)
+        self._make_zoom_btn(zoom_bar, "−", self.zoom_out, padx=5).pack(side=tk.RIGHT)
 
         tk.Label(
             zoom_bar,
-            text="ZOOM",
+            text="H-ZOOM",
             bg="#1b2d3e",
             fg="#6e8fad",
             font=("Helvetica", 7, "bold"),
-        ).pack(side=tk.RIGHT, padx=(0, 5))
+        ).pack(side=tk.RIGHT, padx=(0, 4))
+
+        tk.Label(
+            zoom_bar,
+            text="│",
+            bg="#1b2d3e",
+            fg="#36536e",
+            font=("Helvetica", 8),
+        ).pack(side=tk.RIGHT, padx=(4, 6))
+
+        self._make_zoom_btn(zoom_bar, "1×", self.reset_vertical_zoom, padx=5).pack(
+            side=tk.RIGHT, padx=(2, 0)
+        )
+        self._make_zoom_btn(zoom_bar, "Fit", self.fit_vertical_zoom, padx=5).pack(
+            side=tk.RIGHT, padx=(2, 0)
+        )
+        self._make_zoom_btn(zoom_bar, "+", self.vzoom_in, padx=5).pack(
+            side=tk.RIGHT, padx=(2, 0)
+        )
+
+        self.vzoom_var = tk.StringVar(value="1.0×")
+        vzoom_lbl = tk.Label(
+            zoom_bar,
+            textvariable=self.vzoom_var,
+            bg="#12202d",
+            fg="#8cf5c0",
+            font=("Helvetica", 8, "bold"),
+            width=5,
+            cursor="hand2",
+            highlightthickness=1,
+            highlightbackground="#33506b",
+        )
+        vzoom_lbl.pack(side=tk.RIGHT, padx=(2, 0))
+        vzoom_lbl.bind("<Button-1>", lambda _e: self.reset_vertical_zoom())
+
+        self._make_zoom_btn(zoom_bar, "−", self.vzoom_out, padx=5).pack(side=tk.RIGHT)
+
+        tk.Label(
+            zoom_bar,
+            text="V-ZOOM",
+            bg="#1b2d3e",
+            fg="#6e8fad",
+            font=("Helvetica", 7, "bold"),
+        ).pack(side=tk.RIGHT, padx=(0, 4))
 
         # Main 4-track waveform canvas
         self.canvas = tk.Canvas(
@@ -1411,6 +1683,48 @@ class WaveformTimeline:
         self._view_start = 0.0
         self.zoom_var.set("1.0×")
         self.redraw_waveforms()
+
+    def get_vertical_zoom(self):
+        return self._vzoom
+
+    def set_vertical_zoom(self, factor):
+        new_vz = max(self.MIN_VZOOM, min(self.MAX_VZOOM, float(factor)))
+        if abs(new_vz - self._vzoom) < 1e-4:
+            return
+        self._vzoom = new_vz
+        self.vzoom_var.set(f"{new_vz:.1f}×" if new_vz < 10.0 else f"{new_vz:.0f}×")
+        self.redraw_waveforms()
+
+    def vzoom_in(self):
+        self.set_vertical_zoom(self._vzoom * 1.4)
+
+    def vzoom_out(self):
+        self.set_vertical_zoom(self._vzoom / 1.4)
+
+    def reset_vertical_zoom(self):
+        self.set_vertical_zoom(1.0)
+
+    def fit_vertical_zoom(self):
+        """Auto-scale waveform display vertically so loudest loaded peak fills ~92% of lane height."""
+        max_pk = 0.0
+        for track in self._tracks:
+            if track is None:
+                continue
+            for it in track[0]:
+                if isinstance(it, tuple):
+                    p = max(abs(it[0]), abs(it[1]))
+                else:
+                    p = abs(float(it))
+                if p > max_pk:
+                    max_pk = p
+        if max_pk <= 1e-4:
+            self.reset_vertical_zoom()
+            return
+        target = max(self.MIN_VZOOM, min(self.MAX_VZOOM, 0.92 / max_pk))
+        if abs(self._vzoom - target) < 0.05 and self._vzoom > 1.05:
+            self.reset_vertical_zoom()
+        else:
+            self.set_vertical_zoom(target)
 
     def zoom_at_x(self, factor, x):
         _, span = self._lane_span()
@@ -1792,16 +2106,17 @@ class WaveformTimeline:
                                     v = float(item)
                                     lo_v, hi_v, rms_v = -v, v, v * 0.65
 
+                            vz = self._vzoom
                             px = x_start + 1.0 + frac_p * inner_w
-                            y_hi = wf_mid - max(0.0, hi_v) * max_amp
-                            y_lo = wf_mid - min(0.0, lo_v) * max_amp
+                            y_hi = wf_mid - min(1.0, max(0.0, hi_v * vz)) * max_amp
+                            y_lo = wf_mid - max(-1.0, min(0.0, lo_v * vz)) * max_amp
                             if y_lo - y_hi < 1.2:
                                 y_hi = wf_mid - 0.6
                                 y_lo = wf_mid + 0.6
                             pk_top.extend((px, y_hi))
                             pk_bot.append((px, y_lo))
 
-                            r_amp = max(0.5, rms_v * max_amp)
+                            r_amp = max(0.5, min(1.0, rms_v * vz) * max_amp)
                             rms_top.extend((px, wf_mid - r_amp))
                             rms_bot.append((px, wf_mid + r_amp))
 
@@ -1964,7 +2279,10 @@ class Window:
     def __init__(self, start_mainloop=True):
         self.buffer = 1024
         self.bitdepth = 16
+        self.rec_bitdepth = 16
+        self.rec_sample_format = "pcm"
         self.bounce_bitdepth = 16
+        self.bounce_sample_format = "pcm"
         self.bounce_dither = True
         self.channels = 2
         self.rate = 44100
@@ -1990,9 +2308,11 @@ class Window:
         self._channel_true_peaks = [0.0, 0.0, 0.0, 0.0]
         self._master_true_peaks = [0.0, 0.0]
 
-        # Master bus volume (linear gain, 1.0 = 0.0 dB unity)
+        # Master bus volume (linear gain, 1.0 = 0.0 dB unity) & optional safety limiter
         self._master_lock = threading.Lock()
         self._master_volume = 1.0
+        self._master_limiter_enabled = False
+        self._master_limiter = MasterLimiterProcessor()
 
         # Session playhead, scrubbing & live recording waveform state
         self._seek_lock = threading.Lock()
@@ -2610,6 +2930,84 @@ class Window:
                 )
         return cv
 
+    def _make_meter_ticks_canvas(
+        self,
+        parent,
+        bg,
+        meter_len,
+        major_ticks,
+        minor_step_db=3.0,
+        width=24,
+        pad_y=3.0,
+    ):
+        """Independent dBFS meter scale ruler (0 to -60 dBFS) aligned to ChannelMeter."""
+        cv = tk.Canvas(
+            parent,
+            width=width,
+            height=meter_len + 2,  # +2 accounts for 1px top/bottom meter highlight border
+            bg=bg,
+            bd=0,
+            highlightthickness=0,
+        )
+        top_y = float(pad_y) + 1.0
+        span_y = max(10.0, float(meter_len) - 2.0 * float(pad_y))
+
+        def _db_to_y(db_val):
+            return top_y + ((0.0 - float(db_val)) / 60.0) * span_y
+
+        major_dbs = {db for db, _ in major_ticks}
+
+        # Minor graduation marks pointing right toward the meter bar
+        db = 0.0
+        last_minor_y = -1e9
+        while db >= -60.0 - 1e-6:
+            if not any(abs(db - m) < 0.05 for m in major_dbs):
+                y = _db_to_y(db)
+                if y - last_minor_y >= 4.8:
+                    cv.create_line(width - 3, y, width, y, fill="#4f6e8c", width=1)
+                    last_minor_y = y
+            db -= float(minor_step_db)
+
+        # Major ticks + right-aligned dBFS labels with overlap guard
+        min_gap = 10.5
+        drawn_ys = []
+        priority = [t for t in major_ticks if t[0] in (0.0, -6.0, -12.0, -24.0, -60.0)]
+        others = [t for t in major_ticks if t[0] not in (0.0, -6.0, -12.0, -24.0, -60.0)]
+        label_allowed = set()
+        for tick_db, _ in priority + others:
+            y = _db_to_y(tick_db)
+            if all(abs(y - py) >= min_gap for py in drawn_ys):
+                drawn_ys.append(y)
+                label_allowed.add(tick_db)
+
+        for tick_db, tick_txt in major_ticks:
+            y = _db_to_y(tick_db)
+            show_lbl = tick_db in label_allowed
+            is_clip = tick_db >= -0.05
+            is_hot = -6.05 <= tick_db <= -5.95
+            if is_clip:
+                col = "#ff7a85"
+            elif is_hot:
+                col = "#f5c542"
+            elif show_lbl:
+                col = "#9cb8d1"
+            else:
+                col = "#5d7d9c"
+
+            tick_w = 5 if show_lbl else 3
+            cv.create_line(width - tick_w, y, width, y, fill=col, width=1)
+            if show_lbl:
+                text_y = max(5.5, min(float(meter_len) - 3.5, y))
+                cv.create_text(
+                    width - 6,
+                    text_y,
+                    text=tick_txt,
+                    fill=col,
+                    font=("Helvetica", 7, "bold" if (is_clip or is_hot) else "normal"),
+                    anchor="e",
+                )
+        return cv
+
     def _build_channel_strips(self):
         T = self.THEME
 
@@ -2783,9 +3181,29 @@ class Window:
 
             fader_len = 148
 
-            # Real-time vertical VU LED meter next to the volume fader
+            # Independent dBFS scale + real-time vertical VU LED meter next to the volume fader
+            ch_meter_ticks = (
+                (0.0, "0"),
+                (-6.0, "-6"),
+                (-12.0, "-12"),
+                (-18.0, "-18"),
+                (-24.0, "-24"),
+                (-36.0, "-36"),
+                (-48.0, "-48"),
+                (-60.0, "-60"),
+            )
+            m_ticks_cv = self._make_meter_ticks_canvas(
+                fader_row,
+                bg=T["bg_strip"],
+                meter_len=fader_len,
+                major_ticks=ch_meter_ticks,
+                minor_step_db=3.0,
+                width=24,
+            )
+            m_ticks_cv.pack(side=tk.LEFT, padx=(0, 2))
+
             meter = ChannelMeter(fader_row, width=16, height=fader_len, segments=22)
-            meter.canvas.pack(side=tk.LEFT, padx=(6, 6))
+            meter.canvas.pack(side=tk.LEFT, padx=(0, 6))
             self._channel_meters.append(meter)
 
             vol_scale = tk.Scale(
@@ -2997,30 +3415,56 @@ class Window:
         self.master_vol_badge.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(3, 0))
 
         # Stereo L/R VU meters + Master Fader + dB ticks (sized to fill Master Bus strip)
-        fader_len = 332
+        fader_len = 302
         bus_row = tk.Frame(strip, bg="#263e54")
         bus_row.pack(expand=True, pady=(2, 4))
 
         meters_col = tk.Frame(bus_row, bg="#263e54")
-        meters_col.pack(side=tk.LEFT, padx=(4, 8))
+        meters_col.pack(side=tk.LEFT, padx=(0, 6))
 
         lr_pair = tk.Frame(meters_col, bg="#263e54")
         lr_pair.pack()
 
-        meter_l = ChannelMeter(lr_pair, width=16, height=fader_len, segments=42)
-        meter_r = ChannelMeter(lr_pair, width=16, height=fader_len, segments=42)
+        master_meter_ticks = (
+            (0.0, "0"),
+            (-3.0, "-3"),
+            (-6.0, "-6"),
+            (-9.0, "-9"),
+            (-12.0, "-12"),
+            (-18.0, "-18"),
+            (-24.0, "-24"),
+            (-30.0, "-30"),
+            (-36.0, "-36"),
+            (-42.0, "-42"),
+            (-48.0, "-48"),
+            (-54.0, "-54"),
+            (-60.0, "-60"),
+        )
+        m_bus_ticks = self._make_meter_ticks_canvas(
+            lr_pair,
+            bg="#263e54",
+            meter_len=fader_len,
+            major_ticks=master_meter_ticks,
+            minor_step_db=1.5,
+            width=24,
+        )
+        m_bus_ticks.pack(side=tk.LEFT, padx=(0, 2))
+
+        meter_l = ChannelMeter(lr_pair, width=16, height=fader_len, segments=38)
+        meter_r = ChannelMeter(lr_pair, width=16, height=fader_len, segments=38)
         meter_l.canvas.pack(side=tk.LEFT, padx=(0, 3))
         meter_r.canvas.pack(side=tk.LEFT)
         self._master_meters = [meter_l, meter_r]
 
         lr_labels = tk.Frame(meters_col, bg="#263e54")
         lr_labels.pack(fill=tk.X, pady=(3, 0))
+        tk.Frame(lr_labels, bg="#263e54", width=26, height=1).pack(side=tk.LEFT)
         tk.Label(
             lr_labels, text="L", bg="#263e54", fg=T["text_muted"], font=("Helvetica", 8, "bold")
-        ).pack(side=tk.LEFT, padx=(5, 0))
+        ).pack(side=tk.LEFT, padx=(4, 0))
         tk.Label(
             lr_labels, text="R", bg="#263e54", fg=T["text_muted"], font=("Helvetica", 8, "bold")
-        ).pack(side=tk.RIGHT, padx=(0, 5))
+        ).pack(side=tk.RIGHT, padx=(0, 4))
 
         fader_col = tk.Frame(bus_row, bg="#263e54")
         fader_col.pack(side=tk.LEFT, anchor="n")
@@ -3073,7 +3517,7 @@ class Window:
         )
         ticks_cv.pack(side=tk.LEFT)
 
-        # Unity reset shortcut button at bottom of Master Bus strip
+        # Unity reset & Master Safety Limiter at bottom of Master Bus strip
         reset_btn = self._make_flat_button(
             strip,
             text="0.0 dB Unity",
@@ -3085,7 +3529,24 @@ class Window:
             font_spec=("Helvetica", 8, "bold"),
             pady=5,
         )
-        reset_btn.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
+        reset_btn.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 8))
+
+        self._master_lim_var = tk.BooleanVar(value=False)
+        lim_pad = self._make_toggle_pad(
+            strip,
+            text="LIM -0.3 dB",
+            var=self._master_lim_var,
+            accent_color="#48d18a",
+            off_bg="#1a2e3e",
+            off_hover_bg="#243f54",
+            off_fg="#9cb8d1",
+            off_border="#35526d",
+            on_bg="#1f5c43",
+            on_fg="#ffffff",
+            on_border="#68d391",
+            on_change=self._on_master_limiter_toggle,
+        )
+        lim_pad.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
 
     def _build_master_panel(self):
         T = self.THEME
@@ -3205,13 +3666,13 @@ class Window:
             wraplength=192,
             justify=tk.CENTER,
             padx=8,
-            pady=12,
+            pady=7,
             highlightthickness=1,
             highlightbackground="#38546e",
         ).pack(padx=12, fill=tk.X)
 
         # Divider
-        tk.Frame(panel, bg=T["divider"], height=1).pack(fill=tk.X, padx=12, pady=10)
+        tk.Frame(panel, bg=T["divider"], height=1).pack(fill=tk.X, padx=12, pady=6)
 
         # Bounce / Export section
         tk.Label(
@@ -3236,14 +3697,14 @@ class Window:
             highlightbackground="#45698a",
             highlightcolor="#63b3ed",
         )
-        self.nameBox.pack(padx=12, pady=(0, 8), ipady=4, fill=tk.X)
+        self.nameBox.pack(padx=12, pady=(0, 6), ipady=3, fill=tk.X)
         self.nameBox.bind("<Return>", lambda _e: self.root.focus_set())
         self.nameBox.bind("<Escape>", lambda _e: self.root.focus_set())
 
-        # Export bit depth & TPDF dither controls
+        # Recording & Bounce bit depth + TPDF dither controls
         tk.Label(
             panel,
-            text="BOUNCE FORMAT",
+            text="REC / BOUNCE FORMAT",
             bg=T["bg_strip"],
             fg=T["text_muted"],
             font=self.font_section,
@@ -3258,20 +3719,74 @@ class Window:
             highlightthickness=1,
             highlightbackground="#38546e",
         )
-        fmt_box.pack(padx=12, pady=(0, 8), fill=tk.X)
+        fmt_box.pack(padx=12, pady=(0, 7), fill=tk.X)
+
+        rec_fmt_row = tk.Frame(fmt_box, bg=T["bg_well"])
+        rec_fmt_row.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(
+            rec_fmt_row,
+            text="REC",
+            bg=T["bg_well"],
+            fg="#f27a85",
+            font=("Helvetica", 7, "bold"),
+            width=4,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        self._rec_depth_btns = {}
+
+        def _refresh_rec_fmt():
+            cur_rec = (self.rec_bitdepth, self.rec_sample_format)
+            for key, lbl in self._rec_depth_btns.items():
+                if key == cur_rec:
+                    lbl.config(bg="#8f242f", fg="#ffffff", highlightbackground="#ff7a85")
+                else:
+                    lbl.config(bg="#1d3042", fg="#9cb8d1", highlightbackground="#33506b")
+
+        def _select_rec_fmt(depth, sfmt):
+            self.rec_bitdepth = depth
+            self.rec_sample_format = sfmt
+            _refresh_rec_fmt()
+
+        for col_i, (depth, sfmt, text_lbl) in enumerate(
+            ((16, "pcm", "16-bit"), (24, "pcm", "24-bit"), (32, "float", "32f"))
+        ):
+            rbtn = tk.Label(
+                rec_fmt_row,
+                text=text_lbl,
+                bg="#1d3042",
+                fg="#9cb8d1",
+                font=("Helvetica", 8, "bold"),
+                pady=2,
+                cursor="hand2",
+                highlightthickness=1,
+                highlightbackground="#33506b",
+            )
+            rbtn.bind("<Button-1>", lambda _e, d=depth, sf=sfmt: _select_rec_fmt(d, sf))
+            rbtn.grid(row=0, column=col_i + 1, sticky="ew", padx=(3, 0))
+            rec_fmt_row.columnconfigure(col_i + 1, weight=1, uniform="recdepth")
+            self._rec_depth_btns[(depth, sfmt)] = rbtn
+        _refresh_rec_fmt()
 
         depth_row = tk.Frame(fmt_box, bg=T["bg_well"])
-        depth_row.pack(fill=tk.X, pady=(0, 5))
+        depth_row.pack(fill=tk.X, pady=(0, 4))
         self._depth_btns = {}
 
         def _refresh_export_fmt():
-            bd = self.bounce_bitdepth
-            for d, lbl in self._depth_btns.items():
-                if d == bd:
+            cur_key = (self.bounce_bitdepth, self.bounce_sample_format)
+            for key, lbl in self._depth_btns.items():
+                if key == cur_key:
                     lbl.config(bg="#245994", fg="#ffffff", highlightbackground="#63b3ed")
                 else:
                     lbl.config(bg="#1d3042", fg="#9cb8d1", highlightbackground="#33506b")
-            if bd >= 32:
+            if self.bounce_sample_format == "float":
+                self._dither_lbl.config(
+                    text="○  TPDF Dither (N/A · 32f Float)",
+                    bg="#182735",
+                    fg="#637e96",
+                    highlightbackground="#2b4257",
+                    cursor="arrow",
+                )
+            elif self.bounce_bitdepth >= 32:
                 self._dither_lbl.config(
                     text="○  TPDF Dither (N/A at 32-bit)",
                     bg="#182735",
@@ -3296,24 +3811,31 @@ class Window:
                     cursor="hand2",
                 )
 
-        def _select_bitdepth(depth):
+        def _select_bitdepth(depth, sfmt):
             self.bounce_bitdepth = depth
-            if depth == 16:
+            self.bounce_sample_format = sfmt
+            if depth == 16 and sfmt == "pcm":
                 self.bounce_dither = True
-            elif depth >= 24:
+            else:
                 self.bounce_dither = False
             _refresh_export_fmt()
 
         def _toggle_dither(_e=None):
-            if self.bounce_bitdepth >= 32:
+            if self.bounce_bitdepth >= 32 or self.bounce_sample_format == "float":
                 return
             self.bounce_dither = not self.bounce_dither
             _refresh_export_fmt()
 
-        for col_i, depth in enumerate((16, 24, 32)):
+        fmt_choices = (
+            (16, "pcm", "16-bit"),
+            (24, "pcm", "24-bit"),
+            (32, "pcm", "32i"),
+            (32, "float", "32f"),
+        )
+        for col_i, (depth, sfmt, text_lbl) in enumerate(fmt_choices):
             btn = tk.Label(
                 depth_row,
-                text=f"{depth}-bit",
+                text=text_lbl,
                 bg="#1d3042",
                 fg="#9cb8d1",
                 font=("Helvetica", 8, "bold"),
@@ -3322,10 +3844,10 @@ class Window:
                 highlightthickness=1,
                 highlightbackground="#33506b",
             )
-            btn.bind("<Button-1>", lambda _e, d=depth: _select_bitdepth(d))
-            btn.grid(row=0, column=col_i, sticky="ew", padx=(0 if col_i == 0 else 4, 0))
+            btn.bind("<Button-1>", lambda _e, d=depth, sf=sfmt: _select_bitdepth(d, sf))
+            btn.grid(row=0, column=col_i, sticky="ew", padx=(0 if col_i == 0 else 3, 0))
             depth_row.columnconfigure(col_i, weight=1, uniform="bitdepth")
-            self._depth_btns[depth] = btn
+            self._depth_btns[(depth, sfmt)] = btn
 
         self._dither_lbl = tk.Label(
             fmt_box,
@@ -3482,6 +4004,80 @@ class Window:
                 return self._master_volume
         return 1.0
 
+    def _get_master_limiter_enabled(self):
+        if hasattr(self, "_master_lock"):
+            with self._master_lock:
+                return bool(getattr(self, "_master_limiter_enabled", False))
+        return False
+
+    def _on_master_limiter_toggle(self, enabled):
+        flag = bool(enabled)
+        if flag and hasattr(self, "_master_limiter"):
+            self._master_limiter.reset()
+        with self._master_lock:
+            self._master_limiter_enabled = flag
+
+    def _open_output_stream(self, pa, preferred_rate):
+        """Open stereo PyAudio output stream preferring paFloat32, falling back to paInt16."""
+        rates = [int(preferred_rate)]
+        try:
+            dev_rate = int(pa.get_default_output_device_info().get("defaultSampleRate", 44100))
+            if dev_rate > 0 and dev_rate not in rates:
+                rates.append(dev_rate)
+        except Exception:
+            pass
+
+        last_exc = None
+        for pa_fmt, out_fmt, frame_bytes in (
+            (pyaudio.paFloat32, "float32", 8),
+            (pyaudio.paInt16, "pcm", 4),
+        ):
+            for sr in rates:
+                try:
+                    stream = pa.open(
+                        format=pa_fmt,
+                        channels=2,
+                        rate=sr,
+                        output=True,
+                        frames_per_buffer=self.buffer,
+                    )
+                    return stream, sr, out_fmt, frame_bytes
+                except OSError as exc:
+                    last_exc = exc
+        raise last_exc if last_exc is not None else OSError("Could not open audio output stream")
+
+    def _open_input_stream(self, pa, preferred_rate, target_bitdepth=16, target_sample_format="pcm"):
+        """Open mono PyAudio input stream (prefers paFloat32 for 24-bit/32f capture, paInt16 fallback)."""
+        rates = [int(preferred_rate)]
+        try:
+            dev_rate = int(pa.get_default_input_device_info().get("defaultSampleRate", 44100))
+            if dev_rate > 0 and dev_rate not in rates:
+                rates.append(dev_rate)
+        except Exception:
+            pass
+
+        prefer_float = (target_sample_format == "float") or (int(target_bitdepth) >= 24)
+        fmts = (
+            ((pyaudio.paFloat32, "float32", 4), (pyaudio.paInt16, "int16", 2))
+            if prefer_float
+            else ((pyaudio.paInt16, "int16", 2),)
+        )
+        last_exc = None
+        for pa_fmt, cap_fmt, frame_bytes in fmts:
+            for sr in rates:
+                try:
+                    stream = pa.open(
+                        format=pa_fmt,
+                        channels=1,
+                        rate=sr,
+                        input=True,
+                        frames_per_buffer=self.buffer,
+                    )
+                    return stream, sr, cap_fmt, frame_bytes
+                except OSError as exc:
+                    last_exc = exc
+        raise last_exc if last_exc is not None else OSError("Could not open audio input stream")
+
     def _on_master_vol_change(self, value):
         db = float(value)
         gain = db_to_linear(db)
@@ -3505,7 +4101,7 @@ class Window:
             if not path:
                 continue
             try:
-                with wave.open(path, "rb") as wf:
+                with open_wav_read(path) as wf:
                     sr = max(1, wf.getframerate())
                     dur = wf.getnframes() / float(sr)
                     if dur > max_dur:
@@ -3774,15 +4370,18 @@ class Window:
             return
 
         try:
-            with wave.open(filepath, "rb") as wf:
+            with open_wav_read(filepath) as wf:
                 channels = wf.getnchannels()
                 samplefreq = wf.getframerate()
                 sampwidth = wf.getsampwidth()
+                samplefmt = wf.getsampleformat()
                 bitdepth = sampwidth * 8
                 if channels <= 0 or samplefreq <= 0:
                     raise ValueError(f"Invalid WAV header (channels={channels}, rate={samplefreq})")
-                if sampwidth not in (1, 2, 3, 4):
+                if samplefmt == "pcm" and sampwidth not in (1, 2, 3, 4):
                     raise ValueError(f"Unsupported WAV bit depth: {bitdepth}-bit")
+                if samplefmt == "float" and sampwidth not in (4, 8):
+                    raise ValueError(f"Unsupported IEEE Float WAV bit depth: {bitdepth}-bit")
                 length = int(wf.getnframes() / samplefreq)
         except Exception as exc:
             messagebox.showerror("Error loading WAV", f"Could not open file:\n{exc}", parent=self.root)
@@ -3794,7 +4393,7 @@ class Window:
             short_name = short_name[:14] + "..."
         self._ch_widgets[channel_idx]["file_var"].set(short_name)
         self._ch_widgets[channel_idx]["meta_var"].set(
-            format_audio_meta(samplefreq, bitdepth, channels)
+            format_audio_meta(samplefreq, bitdepth, channels, samplefmt)
         )
 
         mins, secs = divmod(length, 60)
@@ -3947,6 +4546,8 @@ class Window:
 
         for ch in self.channel_states:
             ch.reset_effects()
+        if hasattr(self, "_master_limiter"):
+            self._master_limiter.reset()
 
         self._set_status("Playing...")
         self._ui_call(self._set_pause_lit, False)
@@ -3991,7 +4592,7 @@ class Window:
             for idx, ch in enumerate(self.channel_states):
                 path = ch.get_filepath()
                 if path:
-                    wf = wave.open(path, "rb")
+                    wf = open_wav_read(path)
                     wav_handles[idx] = wf
                     fr = wf.getframerate()
                     if fr > 0 and (session_rate is None or fr > session_rate):
@@ -4001,24 +4602,9 @@ class Window:
                 session_rate = self.rate
 
             pa = pyaudio.PyAudio()
-            try:
-                stream = pa.open(
-                    format=pyaudio.paInt16,
-                    channels=2,
-                    rate=session_rate,
-                    output=True,
-                    frames_per_buffer=self.buffer,
-                )
-            except OSError:
-                dev_rate = int(pa.get_default_output_device_info().get("defaultSampleRate", 44100))
-                session_rate = dev_rate
-                stream = pa.open(
-                    format=pyaudio.paInt16,
-                    channels=2,
-                    rate=session_rate,
-                    output=True,
-                    frames_per_buffer=self.buffer,
-                )
+            stream, session_rate, out_fmt, out_frame_bytes = self._open_output_stream(
+                pa, session_rate
+            )
 
             for idx, wf in enumerate(wav_handles):
                 if wf is not None:
@@ -4031,6 +4617,8 @@ class Window:
                         rdr.seek(target_sec)
                 for ch_s in self.channel_states:
                     ch_s.reset_effects()
+                if hasattr(self, "_master_limiter"):
+                    self._master_limiter.reset()
                 frames_played = int(round(target_sec * session_rate))
                 in_tail = False
                 tail_frames_remaining = 0
@@ -4137,6 +4725,11 @@ class Window:
                     for idx in delay_indices:
                         chunks[idx] = [0.0] * tail_chunk_len
 
+                active_limiter = (
+                    self._master_limiter
+                    if self._get_master_limiter_enabled() and hasattr(self, "_master_limiter")
+                    else None
+                )
                 pcm_bytes = mix_stereo_chunk(
                     chunks,
                     snapshots,
@@ -4146,6 +4739,9 @@ class Window:
                     out_master_levels=master_levels,
                     out_peaks=chunk_true_peaks,
                     out_master_peaks=master_true_peaks,
+                    master_limiter=active_limiter,
+                    out_format=out_fmt,
+                    clamp_float=True,
                 )
                 self._set_meter_peaks(
                     chunk_levels, master_levels, chunk_true_peaks, master_true_peaks
@@ -4153,13 +4749,13 @@ class Window:
 
                 if in_tail and tail_frames_emitted > min_tail_frames and pcm_bytes:
                     # Stop tail early once past one full delay cycle and virtually silent
-                    if _is_pcm_silent(pcm_bytes, 4):
+                    if max(master_true_peaks[0], master_true_peaks[1]) < 1.2e-4:
                         print("Audio ended")
                         break
 
                 if pcm_bytes:
                     stream.write(pcm_bytes)
-                    frames_played += len(pcm_bytes) // 4  # 2 channels * 2 bytes
+                    frames_played += len(pcm_bytes) // out_frame_bytes
                     if hasattr(self, "_seek_lock") and not self._stop_event.is_set():
                         with self._seek_lock:
                             if self._pending_seek_sec is None:
@@ -4283,19 +4879,21 @@ class Window:
 
         for ch in self.channel_states:
             ch.reset_effects()
+        if hasattr(self, "_master_limiter"):
+            self._master_limiter.reset()
 
         self._set_status("Recording 00:00")
         self._ui_call(self._set_rec_lit, True)
         t = threading.Thread(
             target=self._rec_worker,
-            args=(armed_indices, base_name),
+            args=(armed_indices, base_name, self.rec_bitdepth, self.rec_sample_format),
             name="MixerRecThread",
             daemon=True,
         )
         self._active_thread = t
         t.start()
 
-    def _rec_worker(self, armed_indices, base_name):
+    def _rec_worker(self, armed_indices, base_name, rec_bitdepth=16, rec_sample_format="pcm"):
         pa = None
         in_stream = None
         out_stream = None
@@ -4306,27 +4904,15 @@ class Window:
         rec_err = None
 
         try:
-            print(f"Recording started on channel(s): {[i + 1 for i in armed_indices]}")
+            rec_sfmt = "float" if rec_sample_format == "float" else "pcm"
+            rec_bd = 32 if rec_sfmt == "float" else (24 if int(rec_bitdepth) == 24 else 16)
+            rec_tag = "32f" if rec_sfmt == "float" else f"{rec_bd}-bit"
+            print(f"Recording started ({rec_tag}) on channel(s): {[i + 1 for i in armed_indices]}")
             session_rate = self.rate
             pa = pyaudio.PyAudio()
-            try:
-                in_stream = pa.open(
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=session_rate,
-                    input=True,
-                    frames_per_buffer=self.buffer,
-                )
-            except OSError:
-                dev_rate = int(pa.get_default_input_device_info().get("defaultSampleRate", 44100))
-                session_rate = dev_rate
-                in_stream = pa.open(
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=session_rate,
-                    input=True,
-                    frames_per_buffer=self.buffer,
-                )
+            in_stream, session_rate, cap_fmt, in_frame_bytes = self._open_input_stream(
+                pa, session_rate, rec_bd, rec_sfmt
+            )
 
             # Open non-armed loaded channels for synchronized overdub playback
             has_overdub = False
@@ -4335,23 +4921,30 @@ class Window:
                     continue
                 path = ch.get_filepath()
                 if path:
-                    wf = wave.open(path, "rb")
+                    wf = open_wav_read(path)
                     wav_handles[idx] = wf
                     readers[idx] = StreamingWavReader(wf, session_rate)
                     has_overdub = True
 
+            overdub_out_fmt = "pcm"
             if has_overdub:
-                try:
-                    out_stream = pa.open(
-                        format=pyaudio.paInt16,
-                        channels=2,
-                        rate=session_rate,
-                        output=True,
-                        frames_per_buffer=self.buffer,
-                    )
-                except Exception as exc:
-                    print(f"Overdub monitor unavailable, recording without playback: {exc}")
-                    out_stream = None
+                last_od_exc = None
+                for pa_fmt, fmt_name in ((pyaudio.paFloat32, "float32"), (pyaudio.paInt16, "pcm")):
+                    try:
+                        out_stream = pa.open(
+                            format=pa_fmt,
+                            channels=2,
+                            rate=session_rate,
+                            output=True,
+                            frames_per_buffer=self.buffer,
+                        )
+                        overdub_out_fmt = fmt_name
+                        break
+                    except Exception as exc:
+                        out_stream = None
+                        last_od_exc = exc
+                if out_stream is None:
+                    print(f"Overdub monitor unavailable, recording without playback: {last_od_exc}")
 
             frames_recorded = 0
             last_ui_update = 0.0
@@ -4377,24 +4970,43 @@ class Window:
             while not self._stop_event.is_set():
                 raw_in = in_stream.read(self.buffer, exception_on_overflow=False)
                 recorded_frames.append(raw_in)
-                frames_recorded += len(raw_in) // 2
+                frames_recorded += len(raw_in) // in_frame_bytes
 
                 # Compute live VU RMS + true sample peak for armed microphone input channels
-                in_pcm = array.array("h")
-                in_pcm.frombytes(raw_in)
-                if in_pcm:
-                    in_sq = 0
-                    in_max = 0
-                    for v in in_pcm:
-                        in_sq += v * v
-                        av = v if v >= 0 else -v
-                        if av > in_max:
-                            in_max = av
-                    in_vu = math.sqrt(in_sq / float(len(in_pcm))) * (1.4142135623730951 / 32768.0)
-                    in_pk = in_max / 32768.0
+                if cap_fmt == "float32":
+                    in_arr = array.array("f")
+                    in_arr.frombytes(raw_in[: (len(raw_in) // 4) * 4])
+                    if in_arr:
+                        in_sq = 0.0
+                        in_max = 0.0
+                        for v in in_arr:
+                            fv = float(v)
+                            if math.isfinite(fv):
+                                in_sq += fv * fv
+                                av = fv if fv >= 0.0 else -fv
+                                if av > in_max:
+                                    in_max = av
+                        in_vu = math.sqrt(in_sq / float(len(in_arr))) * 1.4142135623730951
+                        in_pk = in_max
+                    else:
+                        in_vu = 0.0
+                        in_pk = 0.0
                 else:
-                    in_vu = 0.0
-                    in_pk = 0.0
+                    in_pcm = array.array("h")
+                    in_pcm.frombytes(raw_in[: (len(raw_in) // 2) * 2])
+                    if in_pcm:
+                        in_sq = 0
+                        in_max = 0
+                        for v in in_pcm:
+                            in_sq += v * v
+                            av = v if v >= 0 else -v
+                            if av > in_max:
+                                in_max = av
+                        in_vu = math.sqrt(in_sq / float(len(in_pcm))) * (1.4142135623730951 / 32768.0)
+                        in_pk = in_max / 32768.0
+                    else:
+                        in_vu = 0.0
+                        in_pk = 0.0
 
                 for i in range(4):
                     chunk_levels[i] = 0.0
@@ -4455,6 +5067,11 @@ class Window:
                                         chunks[idx] = [0.0] * tail_len
 
                     if not close_overdub:
+                        active_limiter = (
+                            self._master_limiter
+                            if self._get_master_limiter_enabled() and hasattr(self, "_master_limiter")
+                            else None
+                        )
                         pcm_bytes = mix_stereo_chunk(
                             chunks,
                             snapshots,
@@ -4464,9 +5081,12 @@ class Window:
                             out_master_levels=master_levels,
                             out_peaks=chunk_true_peaks,
                             out_master_peaks=master_true_peaks,
+                            master_limiter=active_limiter,
+                            out_format=overdub_out_fmt,
+                            clamp_float=True,
                         )
                         if overdub_in_tail and overdub_tail_emitted > overdub_min_tail and pcm_bytes:
-                            if _is_pcm_silent(pcm_bytes, 4):
+                            if max(master_true_peaks[0], master_true_peaks[1]) < 1.2e-4:
                                 close_overdub = True
                         if not close_overdub and pcm_bytes:
                             out_stream.write(pcm_bytes)
@@ -4521,24 +5141,24 @@ class Window:
             if not raw_all:
                 self._set_status("Recording cancelled")
             else:
+                out_bytes = pack_recorded_mono(raw_all, cap_fmt, rec_bd, rec_sfmt)
                 saved_files = []
                 out_targets = unique_recording_paths(BASE_DIR, base_name, armed_indices)
                 for idx, (filename, out_path) in zip(armed_indices, out_targets):
-                    with wave.open(out_path, "wb") as wf_out:
-                        wf_out.setnchannels(1)
-                        wf_out.setsampwidth(2)
-                        wf_out.setframerate(session_rate)
-                        wf_out.writeframes(raw_all)
+                    with open_wav_write(
+                        out_path, 1, session_rate, bit_depth=rec_bd, sample_format=rec_sfmt
+                    ) as wf_out:
+                        wf_out.writeframes(out_bytes)
                     self.channel_states[idx].set_filepath(out_path)
                     short_name = filename if len(filename) <= 17 else filename[:14] + "..."
                     self._ui_call(self._ch_widgets[idx]["file_var"].set, short_name)
                     if "meta_var" in self._ch_widgets[idx]:
                         self._ui_call(
                             self._ch_widgets[idx]["meta_var"].set,
-                            format_audio_meta(session_rate, 16, 1),
+                            format_audio_meta(session_rate, rec_bd, 1, rec_sfmt),
                         )
                     saved_files.append(filename)
-                    print(f"Saved recording to {out_path}")
+                    print(f"Saved recording ({rec_tag}) to {out_path}")
 
                 if hasattr(self, "_rec_wave_lock"):
                     with self._rec_wave_lock:
@@ -4716,24 +5336,46 @@ class Window:
             self._ui_call(self._set_bounce_progress, 0.0, "Bouncing... 0%", "#48d18a")
         t = threading.Thread(
             target=self._bounce_worker,
-            args=(out_path, self.bounce_bitdepth, self.bounce_dither),
+            args=(out_path, self.bounce_bitdepth, self.bounce_dither, self.bounce_sample_format),
             name="MixerBounceThread",
             daemon=True,
         )
         self._active_thread = t
         t.start()
 
-    def _bounce_worker(self, out_path, bounce_bit_depth=None, bounce_dither=None):
+    def _bounce_worker(
+        self, out_path, bounce_bit_depth=None, bounce_dither=None, bounce_sample_format=None
+    ):
         wav_handles = [None] * 4
         readers = [None] * 4
         use_c = _dsp is not None and _dsp.AVAILABLE
         chunk_size = 65536 if use_c else 4096
         tail_step = 4096
-        bit_depth = int(bounce_bit_depth if bounce_bit_depth is not None else getattr(self, "bounce_bitdepth", self.bitdepth))
-        if bit_depth not in (16, 24, 32):
-            bit_depth = 16
+        sample_format = (
+            bounce_sample_format
+            if bounce_sample_format in ("pcm", "float")
+            else getattr(self, "bounce_sample_format", "pcm")
+        )
+        if sample_format == "float":
+            bit_depth = 32
+        else:
+            bit_depth = int(
+                bounce_bit_depth
+                if bounce_bit_depth is not None
+                else getattr(self, "bounce_bitdepth", self.bitdepth)
+            )
+            if bit_depth not in (16, 24, 32):
+                bit_depth = 16
         sampwidth = bit_depth // 8
-        use_dither = bool(bounce_dither if bounce_dither is not None else getattr(self, "bounce_dither", bit_depth == 16)) and (bit_depth < 32)
+        use_dither = (
+            sample_format == "pcm"
+            and bool(
+                bounce_dither
+                if bounce_dither is not None
+                else getattr(self, "bounce_dither", bit_depth == 16)
+            )
+            and (bit_depth < 32)
+        )
         dither_rng = ctypes.c_uint64((time.time_ns() ^ 0xA0761D6478BD642F) & 0xFFFFFFFFFFFFFFFF or 1)
         cancelled = False
         wrote_output = False
@@ -4741,7 +5383,14 @@ class Window:
         bounce_err_msg = None
 
         try:
-            dither_tag = "TPDF Dither" if use_dither else "No Dither"
+            limiter_on = self._get_master_limiter_enabled() and hasattr(self, "_master_limiter")
+            offline_limiter = self._master_limiter.clone_for_offline() if limiter_on else None
+            if sample_format == "float":
+                dither_tag = "32-bit IEEE Float (Limited)" if limiter_on else "32-bit IEEE Float (Unclipped)"
+            else:
+                dither_tag = "TPDF Dither" if use_dither else "No Dither"
+                if limiter_on:
+                    dither_tag += " · Limiter"
             print(f"Bouncing {bit_depth}-bit ({dither_tag}) audio to {out_path}...")
             session_rate = None
             snapshots = [ch.snapshot() for ch in self.channel_states]
@@ -4753,7 +5402,7 @@ class Window:
                 if snap.filepath:
                     if os.path.realpath(snap.filepath) == out_real:
                         raise ValueError("Cannot overwrite a WAV file that is currently loaded in a channel.")
-                    wf = wave.open(snap.filepath, "rb")
+                    wf = open_wav_read(snap.filepath)
                     wav_handles[idx] = wf
                     fr = wf.getframerate()
                     if fr > 0 and (session_rate is None or fr > session_rate):
@@ -4792,14 +5441,14 @@ class Window:
             in_tail = False
             tail_peaks = [0.0, 0.0]
             frame_bytes = 2 * sampwidth
+            out_fmt_arg = "float32" if sample_format == "float" else "pcm"
 
             fx_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="BounceFX") if use_c else None
             try:
-                with wave.open(out_path, "wb") as bounce_wf:
+                with open_wav_write(
+                    out_path, 2, int(session_rate), bit_depth=bit_depth, sample_format=sample_format
+                ) as bounce_wf:
                     wrote_output = True
-                    bounce_wf.setnchannels(2)
-                    bounce_wf.setsampwidth(sampwidth)
-                    bounce_wf.setframerate(int(session_rate))
 
                     while True:
                         if self._stop_event.is_set():
@@ -4848,6 +5497,9 @@ class Window:
                             out_bit_depth=bit_depth,
                             dither_tpdf=use_dither,
                             dither_rng=dither_rng,
+                            master_limiter=offline_limiter,
+                            out_format=out_fmt_arg,
+                            clamp_float=False,
                         )
                         if in_tail and tail_frames_emitted > min_tail_frames and pcm_bytes:
                             if max(tail_peaks[0], tail_peaks[1]) < 1.2e-4:
@@ -4885,11 +5537,12 @@ class Window:
                     self._ui_call(self._set_bounce_progress, 0.0, "Bounce cancelled", "#f5c542")
                 self._set_status("Bounce cancelled")
             else:
-                meta_txt = f"{format_audio_meta(int(session_rate), bit_depth, 2)} · {dither_tag}"
+                depth_label = "32f" if sample_format == "float" else f"{bit_depth}-bit"
+                meta_txt = f"{format_audio_meta(int(session_rate), bit_depth, 2, sample_format)} · {dither_tag}"
                 print(f"Bounce completed successfully ({meta_txt})")
                 if hasattr(self, "_bounce_canvas"):
-                    self._ui_call(self._set_bounce_progress, 1.0, f"Bounce complete ({bit_depth}-bit)", "#7ef2b8")
-                self._set_status(f"Bounced ({bit_depth}-bit): {os.path.basename(out_path)}")
+                    self._ui_call(self._set_bounce_progress, 1.0, f"Bounce complete ({depth_label})", "#7ef2b8")
+                self._set_status(f"Bounced ({depth_label}): {os.path.basename(out_path)}")
                 bounce_done_msg = f"Mix successfully exported to:\n{out_path}\n\nFormat: {meta_txt}"
 
         except Exception as exc:
