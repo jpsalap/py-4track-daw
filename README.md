@@ -66,7 +66,7 @@ Each of the four channels processes audio through a deterministic real-time sign
 
 To explore how real-time audio engines eliminate Python interpreter overhead while preserving deterministic, bit-exact DSP math, two acceleration approaches were implemented and benchmarked against the pure-Python baseline on the same 4-track mixed-sample-rate workload (3 tracks at 44.1 kHz stereo + 1 track at 48 kHz mono resampled to 44.1 kHz, Python 3.15 on macOS x86_64):
 
-| Workload (4 tracks, mixed 44.1 / 48 kHz) | Pure Python (Baseline) | NumPy (`feat/numpy-dsp-accel`) | Native C (`main` / `feat/c-dsp-accel`) |
+| Workload (4 tracks, mixed 44.1 / 48 kHz) | Pure Python (Tier 3) | NumPy (Tier 2 Fallback) | Native C (Tier 1 Default) |
 | :--- | :---: | :---: | :---: |
 | **15 s mix, No FX** | `1.155 s` (13.0× RT) | `0.081 s` (185× RT) | **`0.022 s`** (**698× RT**) |
 | **15 s mix, Chorus + Tremolo + Delay** (12 FX) | `5.309 s` (3.3× RT) | `0.228 s` (76.7× RT) | **`0.093 s`** (**188× RT**) |
@@ -74,12 +74,11 @@ To explore how real-time audio engines eliminate Python interpreter overhead whi
 | **3-minute song, Chorus + Tremolo + Delay** (12 FX) | *~64 s est.* | `2.14 s` (85.3× RT) | **`0.79 s`** (**230× RT**) |
 | **3-minute song, ALL 16 FX** (incl. Compressor) | *~65 s est.* | `8.57 s` (21.3× RT) | **`1.19 s`** (**153× RT**) |
 | **Output Parity vs. Pure Python** | Reference | **`0 LSB`** (bit-exact) | **`0 LSB`** (bit-exact) |
-| **Extra Dependencies / `.app` Size Overhead** | None (0 KB) | `numpy` (~30–50 MB in `.app`) | **33 KB** (`.dylib`, stdlib `ctypes`) |
+| **Extra Dependencies / `.app` Size Overhead** | None (0 KB) | Optional `numpy` (excluded from `.app`) | **~52 KB** (`.dylib`, stdlib `ctypes`) |
 
 ### Architectural Takeaways
 * **Why NumPy bottlenecks on the Compressor:** Non-recursive effects (`Tremolo`, `Chorus`) and fixed-lag `Delay` (processed in dependency-free blocks of size `≤ delay_samples`) vectorize cleanly into NumPy C ufuncs (77–185× realtime). However, the dynamic range `Compressor` uses a **sample-by-sample asymmetric attack/release envelope follower** (`if |x[i]| > env: ... else: ...`), whose per-sample state dependency cannot be vectorized in pure NumPy and falls back to a Python loop — dropping a 3-minute 16-FX bounce from `2.14 s` to `8.57 s`.
-* **Why Native C was merged into `main`:** Compiling the exact IEEE-754 double-precision DSP inner loops to a 33 KB shared library (`dsp_accel.c`) handles *both* non-recursive and recursive DSP at full C speed (**153–698× realtime**), releases Python's GIL inside `ctypes.CDLL` so `_bounce_worker` can run all 4 channel FX chains in parallel via a `ThreadPoolExecutor`, requires zero extra Python packages, and automatically falls back to pure Python on platforms without a compiled binary.
-* The NumPy implementation is preserved on GitHub on the **`feat/numpy-dsp-accel`** branch as a reference/comparison implementation.
+* **3-Tier Automatic Fallback (`C → NumPy → Pure Python`):** `dsp_accel.py` loads the compiled C shared library (`libminidaw_dsp`) first for full speed (**153–698× realtime**) and GIL-free 4-core offline FX via `ThreadPoolExecutor`. When running from source on an OS/architecture without a compiled binary, it automatically falls back to **NumPy** if installed (excluded from `.app` bundles to avoid 30–50 MB overhead), and finally to **Pure Python** with zero external dependencies. The active tier is shown in the `STATUS` header badge (`DSP: C` / `DSP: NumPy` / `DSP: Python`) and can be overridden via `MINIDAW_DSP_BACKEND=c|numpy|python|auto`.
 
 ---
 
