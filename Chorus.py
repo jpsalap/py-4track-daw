@@ -68,6 +68,8 @@ class ChorusProcessor:
             if self._buf_len > 0:
                 if _dsp is not None and _dsp.AVAILABLE:
                     self._buffer = _dsp.alloc_f64(self._buf_len)
+                elif _dsp is not None and _dsp.USE_NUMPY:
+                    self._buffer = _dsp.alloc_np_f64(self._buf_len)
                 else:
                     self._buffer = [0.0] * self._buf_len
             self._write_idx = 0
@@ -85,6 +87,8 @@ class ChorusProcessor:
             self._buf_len = int(sr * self.MAX_DELAY_SEC) + 4
             if _dsp is not None and _dsp.AVAILABLE:
                 self._buffer = _dsp.alloc_f64(self._buf_len)
+            elif _dsp is not None and _dsp.USE_NUMPY:
+                self._buffer = _dsp.alloc_np_f64(self._buf_len)
             else:
                 self._buffer = [0.0] * self._buf_len
             self._write_idx = 0
@@ -126,6 +130,35 @@ class ChorusProcessor:
             self._write_idx = w_idx.value
             self._phase = phase_c.value
             return out_arr
+
+        if _dsp is not None and _dsp.USE_NUMPY:
+            np = _dsp.NP
+            x = np.asarray(samples, dtype=np.float64)
+            buf_len = self._buf_len
+            hist = self._buffer
+            if not isinstance(hist, np.ndarray) or len(hist) != buf_len:
+                hist = np.zeros(buf_len, dtype=np.float64)
+
+            ext = np.concatenate((hist, x))
+            two_pi = 2.0 * math.pi
+            phase_inc = two_pi * rate / float(sample_rate)
+            phases = self._phase + phase_inc * np.arange(n, dtype=np.float64)
+
+            ms_to_samples = sample_rate * 0.001
+            base_samples = base_delay_ms * ms_to_samples
+            depth_samples = depth_ms * ms_to_samples
+            max_d = float(buf_len - 2)
+
+            d = np.clip(base_samples + depth_samples * np.sin(phases), 1.0, max_d)
+            read_pos = (np.arange(n, dtype=np.float64) + buf_len) - d
+            idx0 = read_pos.astype(np.intp)
+            frac = read_pos - idx0
+            wet = ext[idx0] * (1.0 - frac) + ext[idx0 + 1] * frac
+            out = x * (1.0 - mix) + wet * mix
+
+            self._buffer = ext[-buf_len:].copy()
+            self._phase = float((self._phase + phase_inc * n) % two_pi)
+            return out
 
         buf = self._buffer
         buf_len = self._buf_len

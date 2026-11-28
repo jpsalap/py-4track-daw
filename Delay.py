@@ -54,6 +54,8 @@ class DelayProcessor:
             if self._buf_len > 0:
                 if _dsp is not None and _dsp.AVAILABLE:
                     self._buffer = _dsp.alloc_f64(self._buf_len)
+                elif _dsp is not None and _dsp.USE_NUMPY:
+                    self._buffer = _dsp.alloc_np_f64(self._buf_len)
                 else:
                     self._buffer = [0.0] * self._buf_len
             self._write_idx = 0
@@ -69,6 +71,8 @@ class DelayProcessor:
             self._buf_len = int(sr * self.MAX_DELAY_SEC) + 2
             if _dsp is not None and _dsp.AVAILABLE:
                 self._buffer = _dsp.alloc_f64(self._buf_len)
+            elif _dsp is not None and _dsp.USE_NUMPY:
+                self._buffer = _dsp.alloc_np_f64(self._buf_len)
             else:
                 self._buffer = [0.0] * self._buf_len
             self._write_idx = 0
@@ -106,6 +110,61 @@ class DelayProcessor:
             )
             self._write_idx = w_idx.value
             return out_arr
+
+        if _dsp is not None and _dsp.USE_NUMPY:
+            np = _dsp.NP
+            x = np.asarray(samples, dtype=np.float64)
+            buf = self._buffer
+            buf_len = self._buf_len
+            if not isinstance(buf, np.ndarray) or len(buf) != buf_len:
+                buf = np.zeros(buf_len, dtype=np.float64)
+                self._buffer = buf
+
+            delay_samples = int(delay_ms * sample_rate * 0.001)
+            if delay_samples < 1:
+                delay_samples = 1
+            elif delay_samples >= buf_len:
+                delay_samples = buf_len - 1
+
+            dry = 1.0 - mix
+            out = np.empty(n, dtype=np.float64)
+            write_idx = self._write_idx
+            pos = 0
+
+            while pos < n:
+                k = n - pos
+                if k > delay_samples:
+                    k = delay_samples
+
+                read_idx = write_idx - delay_samples
+                if read_idx < 0:
+                    read_idx += buf_len
+
+                if read_idx + k <= buf_len:
+                    delayed = buf[read_idx : read_idx + k].copy()
+                else:
+                    first = buf_len - read_idx
+                    delayed = np.concatenate((buf[read_idx:], buf[: k - first]))
+
+                x_blk = x[pos : pos + k]
+                fb_val = np.clip(x_blk + delayed * feedback, -1.5, 1.5)
+
+                if write_idx + k <= buf_len:
+                    buf[write_idx : write_idx + k] = fb_val
+                else:
+                    first = buf_len - write_idx
+                    buf[write_idx:] = fb_val[:first]
+                    buf[: k - first] = fb_val[first:]
+
+                out[pos : pos + k] = x_blk * dry + delayed * mix
+
+                write_idx += k
+                if write_idx >= buf_len:
+                    write_idx -= buf_len
+                pos += k
+
+            self._write_idx = write_idx
+            return out
 
         buf = self._buffer
         buf_len = self._buf_len

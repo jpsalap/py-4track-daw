@@ -39,6 +39,7 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        "numpy",
         "tkinter",
         "_tkinter",
         "PySide6.Qt3DCore",

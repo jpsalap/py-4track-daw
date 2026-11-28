@@ -80,6 +80,40 @@ class MasterLimiterProcessor:
             ceiling_lin = 10.0 ** (ceiling_db / 20.0)
             env = self._env
 
+            if _dsp is not None and _dsp.USE_NUMPY:
+                np = _dsp.NP
+                lv = np.asarray(left[:n], dtype=np.float64) * gain
+                rv = np.asarray(right[:n], dtype=np.float64) * gain
+                lv = np.where(np.isfinite(lv), lv, 0.0)
+                rv = np.where(np.isfinite(rv), rv, 0.0)
+                pk_list = np.maximum(np.abs(lv), np.abs(rv)).tolist()
+                env_list = [0.0] * n
+                for i in range(n):
+                    pk = pk_list[i]
+                    if pk > env:
+                        env = pk
+                    else:
+                        env = release_c * env + one_minus_rel * pk
+                    env_list[i] = env
+                self._env = env
+
+                env_arr = np.asarray(env_list, dtype=np.float64)
+                above = (env_arr > ceiling_lin) & (env_arr > 1e-12)
+                if np.any(above):
+                    g = np.ones(n, dtype=np.float64)
+                    g[above] = ceiling_lin / env_arr[above]
+                    lv = lv * g
+                    rv = rv * g
+                if isinstance(left, np.ndarray):
+                    left[:n] = lv
+                else:
+                    left[:n] = lv.tolist()
+                if isinstance(right, np.ndarray):
+                    right[:n] = rv
+                else:
+                    right[:n] = rv.tolist()
+                return
+
             for i in range(n):
                 lv = left[i] * gain
                 rv = right[i] * gain

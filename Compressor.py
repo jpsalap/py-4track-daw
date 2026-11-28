@@ -129,6 +129,30 @@ class CompressorProcessor:
         makeup_lin = 10.0 ** (makeup_db / 20.0)
 
         env = self._env
+
+        if _dsp is not None and _dsp.USE_NUMPY:
+            np = _dsp.NP
+            x = np.asarray(samples, dtype=np.float64)
+            ax_list = np.abs(x).tolist()
+            env_list = [0.0] * n
+            for i in range(n):
+                ax = ax_list[i]
+                if ax > env:
+                    env = attack_c * env + one_minus_att * ax
+                else:
+                    env = release_c * env + one_minus_rel * ax
+                env_list[i] = env
+            self._env = env
+
+            if slope < 0.0:
+                env_arr = np.asarray(env_list, dtype=np.float64)
+                above = env_arr > thresh_lin
+                if np.any(above):
+                    gain = np.full(n, makeup_lin, dtype=np.float64)
+                    gain[above] = np.power(env_arr[above] * inv_thresh, slope) * makeup_lin
+                    return x * gain
+            return x * makeup_lin
+
         out = [0.0] * n
 
         for i in range(n):

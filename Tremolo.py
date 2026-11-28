@@ -77,6 +77,16 @@ class TremoloProcessor:
         phase_inc = two_pi * rate / float(sample_rate)
         phase = self._phase
 
+        if _dsp is not None and _dsp.USE_NUMPY:
+            np = _dsp.NP
+            x = np.asarray(samples, dtype=np.float64)
+            self._phase = float((phase + phase_inc * n) % two_pi)
+            if depth <= 0.0:
+                return x.copy()
+            phases = phase + phase_inc * np.arange(n, dtype=np.float64)
+            gain = (1.0 - depth) + (0.5 * depth) * (1.0 + np.sin(phases))
+            return x * gain
+
         if depth <= 0.0:
             self._phase = (phase + phase_inc * n) % two_pi
             return list(samples)

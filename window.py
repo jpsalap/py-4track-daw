@@ -198,6 +198,12 @@ def _is_pcm_silent(pcm_bytes, threshold=4):
         return True
     if _dsp is not None and _dsp.AVAILABLE:
         return bool(_dsp.LIB.dsp_is_silent_i16(pcm_bytes, len(pcm_bytes) // 2, int(threshold)))
+    if _dsp is not None and _dsp.USE_NUMPY:
+        np = _dsp.NP
+        arr = np.frombuffer(pcm_bytes[: (len(pcm_bytes) // 2) * 2], dtype="<i2")
+        if arr.size == 0:
+            return True
+        return int(np.max(np.abs(arr.astype(np.int32)))) < int(threshold)
     check = array.array("h")
     check.frombytes(pcm_bytes)
     return max(abs(v) for v in check) < threshold
@@ -207,9 +213,14 @@ def pack_recorded_mono(raw_bytes, captured_fmt, target_bitdepth=16, target_sampl
     """Convert captured mono input bytes ('int16' or 'float32') to target WAV format bytes."""
     if not raw_bytes:
         return b""
+    use_np = _dsp is not None and _dsp.USE_NUMPY
     if target_sample_format == "float":
         if captured_fmt == "float32":
             return raw_bytes
+        if use_np:
+            np = _dsp.NP
+            arr = np.frombuffer(raw_bytes[: (len(raw_bytes) // 2) * 2], dtype="<i2").astype(np.float64)
+            return (arr * (1.0 / 32768.0)).astype("<f4").tobytes()
         src = array.array("h")
         src.frombytes(raw_bytes[: (len(raw_bytes) // 2) * 2])
         scale = 1.0 / 32768.0
@@ -221,12 +232,20 @@ def pack_recorded_mono(raw_bytes, captured_fmt, target_bitdepth=16, target_sampl
             n = len(raw_bytes) // 4
             if n == 0:
                 return b""
-            src = array.array("f")
-            src.frombytes(raw_bytes[: n * 4])
             if _dsp is not None and _dsp.AVAILABLE and getattr(_dsp, "HAS_FLOAT_IO", False):
+                src = array.array("f")
+                src.frombytes(raw_bytes[: n * 4])
                 out_u8 = _dsp.alloc_u8(n * 3)
                 _dsp.LIB.dsp_pack_mono_f32_to_i24(_dsp.f32_ptr(src), n, _dsp.u8_ptr(out_u8))
                 return out_u8.tobytes()
+            if use_np:
+                np = _dsp.NP
+                arr = np.frombuffer(raw_bytes[: n * 4], dtype="<f4").astype(np.float64)
+                arr = np.where(np.isfinite(arr), np.clip(arr, -1.0, 1.0), 0.0)
+                q = np.clip(np.rint(arr * 8388608.0), -8388608.0, 8388607.0).astype("<i4")
+                return q.view(np.uint8).reshape(n, 4)[:, :3].tobytes()
+            src = array.array("f")
+            src.frombytes(raw_bytes[: n * 4])
             out_24 = bytearray(n * 3)
             off = 0
             isfinite = math.isfinite
@@ -250,6 +269,12 @@ def pack_recorded_mono(raw_bytes, captured_fmt, target_bitdepth=16, target_sampl
                 off += 3
             return bytes(out_24)
         n = len(raw_bytes) // 2
+        if use_np:
+            np = _dsp.NP
+            b = np.frombuffer(raw_bytes[: n * 2], dtype=np.uint8).reshape(n, 2)
+            out_np = np.zeros((n, 3), dtype=np.uint8)
+            out_np[:, 1:3] = b
+            return out_np.tobytes()
         out_24 = bytearray(n * 3)
         for i in range(n):
             out_24[i * 3] = 0
@@ -260,6 +285,12 @@ def pack_recorded_mono(raw_bytes, captured_fmt, target_bitdepth=16, target_sampl
     if captured_fmt == "int16":
         return raw_bytes
     n = len(raw_bytes) // 4
+    if use_np:
+        np = _dsp.NP
+        arr = np.frombuffer(raw_bytes[: n * 4], dtype="<f4").astype(np.float64)
+        arr = np.where(np.isfinite(arr), np.clip(arr, -1.0, 1.0), 0.0)
+        q = np.clip(np.rint(arr * 32768.0), -32768.0, 32767.0).astype("<i2")
+        return q.tobytes()
     src = array.array("f")
     src.frombytes(raw_bytes[: n * 4])
     out16 = array.array("h", [0] * n)
@@ -283,8 +314,9 @@ def pack_recorded_mono(raw_bytes, captured_fmt, target_bitdepth=16, target_sampl
 
 def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels, sample_format="pcm"):
     """Decode WAV bytes (8/16/24/32-bit integer PCM or 32/64-bit IEEE float) to mono float64."""
+    use_np = _dsp is not None and _dsp.USE_NUMPY
     if not raw_bytes:
-        return []
+        return _dsp.NP.empty(0, dtype=_dsp.NP.float64) if use_np else []
 
     if sample_format == "float":
         if sampwidth not in (4, 8) or nchannels <= 0:
@@ -292,7 +324,7 @@ def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels, sample_format="pcm
         frame_bytes = sampwidth * nchannels
         n_frames = len(raw_bytes) // frame_bytes
         if n_frames == 0:
-            return []
+            return _dsp.NP.empty(0, dtype=_dsp.NP.float64) if use_np else []
         if _dsp is not None and _dsp.AVAILABLE and getattr(_dsp, "HAS_FLOAT_IO", False):
             out = _dsp.alloc_f64(n_frames)
             if sampwidth == 4:
@@ -304,6 +336,16 @@ def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels, sample_format="pcm
                     raw_bytes, len(raw_bytes), nchannels, _dsp.f64_ptr(out)
                 )
             return out
+
+        if use_np:
+            np = _dsp.NP
+            usable = n_frames * frame_bytes
+            dtype = "<f4" if sampwidth == 4 else "<f8"
+            arr = np.frombuffer(memoryview(raw_bytes)[:usable], dtype=dtype).astype(np.float64)
+            arr = np.where(np.isfinite(arr), arr, 0.0)
+            if nchannels == 1:
+                return arr
+            return arr.reshape(n_frames, nchannels).mean(axis=1)
 
         usable = n_frames * frame_bytes
         arr = array.array("f" if sampwidth == 4 else "d")
@@ -340,6 +382,37 @@ def decode_pcm_to_mono_float(raw_bytes, sampwidth, nchannels, sample_format="pcm
             raw_bytes, len(raw_bytes), sampwidth, nchannels, _dsp.f64_ptr(out)
         )
         return out
+
+    if use_np and sampwidth in (1, 2, 3, 4) and nchannels > 0:
+        np = _dsp.NP
+        frame_bytes = sampwidth * nchannels
+        n_frames = len(raw_bytes) // frame_bytes
+        if n_frames == 0:
+            return np.empty(0, dtype=np.float64)
+        used = n_frames * frame_bytes
+        buf = memoryview(raw_bytes)[:used]
+        if sampwidth == 2:
+            pcm = np.frombuffer(buf, dtype="<i2").astype(np.float64)
+            scale = 1.0 / 32768.0
+        elif sampwidth == 1:
+            pcm = np.frombuffer(buf, dtype=np.uint8).astype(np.float64) - 128.0
+            scale = 1.0 / 128.0
+        elif sampwidth == 4:
+            pcm = np.frombuffer(buf, dtype="<i4").astype(np.float64)
+            scale = 1.0 / 2147483648.0
+        else:
+            b = np.frombuffer(buf, dtype=np.uint8).reshape(n_frames * nchannels, 3)
+            vals = (
+                b[:, 0].astype(np.int32)
+                | (b[:, 1].astype(np.int32) << 8)
+                | (b[:, 2].astype(np.int32) << 16)
+            )
+            vals = np.where(vals & 0x800000, vals - 0x1000000, vals)
+            pcm = vals.astype(np.float64)
+            scale = 1.0 / 8388608.0
+        if nchannels == 1:
+            return pcm * scale
+        return pcm.reshape(n_frames, nchannels).mean(axis=1) * scale
 
     if sampwidth == 2:
         usable = (len(raw_bytes) // (2 * nchannels)) * (2 * nchannels)
@@ -457,19 +530,88 @@ class StreamingWavReader:
         self.dst_rate = max(1, int(dst_rate))
         self.step = self.src_rate / float(self.dst_rate)
         self._use_c = _dsp is not None and _dsp.AVAILABLE
-        self._buf = array.array("d") if self._use_c else []
+        self._use_np = (not self._use_c) and (_dsp is not None and _dsp.USE_NUMPY)
+        if self._use_c:
+            self._buf = array.array("d")
+        elif self._use_np:
+            self._buf = _dsp.NP.empty(0, dtype=_dsp.NP.float64)
+        else:
+            self._buf = []
         self._pos = 0.0
         self._eof = False
 
     def read(self, out_frames):
         """Read and resample up to out_frames mono floats at dst_rate with zero drift."""
         if out_frames <= 0:
-            return []
+            return _dsp.NP.empty(0, dtype=_dsp.NP.float64) if self._use_np else []
         if self.src_rate == self.dst_rate:
             raw = self.wf.readframes(out_frames)
-            return decode_pcm_to_mono_float(raw, self.sw, self.nch, self.sample_format) if raw else []
+            if not raw:
+                return _dsp.NP.empty(0, dtype=_dsp.NP.float64) if self._use_np else []
+            return decode_pcm_to_mono_float(raw, self.sw, self.nch, self.sample_format)
 
         needed = int(math.floor(self._pos + (out_frames - 1) * self.step)) + 2
+        if self._use_np:
+            np = _dsp.NP
+            chunks = [self._buf] if self._buf.size > 0 else []
+            cur_len = int(self._buf.size)
+            while not self._eof and cur_len < needed:
+                to_read = max(256, needed - cur_len)
+                raw = self.wf.readframes(to_read)
+                if not raw:
+                    self._eof = True
+                    break
+                dec = decode_pcm_to_mono_float(raw, self.sw, self.nch, self.sample_format)
+                if len(dec) > 0:
+                    chunks.append(dec)
+                    cur_len += len(dec)
+            if not chunks:
+                self._buf = np.empty(0, dtype=np.float64)
+                return np.empty(0, dtype=np.float64)
+            buf = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
+            avail = int(buf.size)
+            if avail == 0:
+                self._buf = buf
+                return np.empty(0, dtype=np.float64)
+
+            if self._pos >= avail:
+                count = 0
+            else:
+                max_steps = int(math.floor((avail - 1e-12 - self._pos) / self.step)) + 1
+                count = min(out_frames, max(0, max_steps))
+            if count <= 0:
+                self._buf = buf
+                return np.empty(0, dtype=np.float64)
+
+            positions = self._pos + np.arange(count, dtype=np.float64) * self.step
+            i0 = positions.astype(np.intp)
+            valid = i0 < avail
+            if not np.all(valid):
+                positions = positions[valid]
+                i0 = i0[valid]
+                count = int(i0.size)
+            if count == 0:
+                self._buf = buf
+                return np.empty(0, dtype=np.float64)
+
+            frac = positions - i0
+            i1 = np.minimum(i0 + 1, avail - 1)
+            out = buf[i0] * (1.0 - frac) + buf[i1] * frac
+            pos = self._pos + count * self.step
+
+            drop = int(pos)
+            if drop > 0:
+                if drop >= avail:
+                    self._buf = np.empty(0, dtype=np.float64)
+                    self._pos = 0.0 if self._eof else (pos - avail)
+                else:
+                    self._buf = buf[drop:].copy()
+                    self._pos = pos - drop
+            else:
+                self._buf = buf
+                self._pos = pos
+            return out
+
         while not self._eof and len(self._buf) < needed:
             to_read = max(256, needed - len(self._buf))
             raw = self.wf.readframes(to_read)
@@ -532,7 +674,12 @@ class StreamingWavReader:
         """Seek to target_sec preserving fractional sample alignment."""
         exact_frame = max(0.0, float(target_sec) * self.src_rate)
         nframes = self.wf.getnframes()
-        empty = array.array("d") if self._use_c else []
+        if self._use_c:
+            empty = array.array("d")
+        elif self._use_np:
+            empty = _dsp.NP.empty(0, dtype=_dsp.NP.float64)
+        else:
+            empty = []
         if exact_frame >= nframes:
             self.wf.setpos(nframes)
             self._buf = empty
@@ -585,6 +732,7 @@ def extract_waveform_peaks(filepath, num_bins=2400, start_sec=None, end_sec=None
         sample_cap = 256 if start_sec is None else 512
         envelope = [(0.0, 0.0, 0.0)] * bins
 
+        use_np = _dsp is not None and _dsp.USE_NUMPY
         if frames_per_bin <= sample_cap:
             # Contiguous read: seek once and decode chunks sequentially (very fast when zoomed in!)
             wf.setpos(win_start_f)
@@ -597,17 +745,23 @@ def extract_waveform_peaks(filepath, num_bins=2400, start_sec=None, end_sec=None
                 if not raw:
                     break
                 mono = decode_pcm_to_mono_float(raw, sw, nch, sfmt)
-                if mono:
-                    lo = 0.0
-                    hi = 0.0
-                    sum_sq = 0.0
-                    for s in mono:
-                        if s < lo:
-                            lo = s
-                        if s > hi:
-                            hi = s
-                        sum_sq += s * s
-                    rms = math.sqrt(sum_sq / float(len(mono)))
+                if len(mono) > 0:
+                    if use_np and isinstance(mono, _dsp.NP.ndarray):
+                        np = _dsp.NP
+                        lo = min(0.0, float(np.min(mono)))
+                        hi = max(0.0, float(np.max(mono)))
+                        rms = math.sqrt(float(np.dot(mono, mono)) / float(mono.size))
+                    else:
+                        lo = 0.0
+                        hi = 0.0
+                        sum_sq = 0.0
+                        for s in mono:
+                            if s < lo:
+                                lo = s
+                            if s > hi:
+                                hi = s
+                            sum_sq += s * s
+                        rms = math.sqrt(sum_sq / float(len(mono)))
                     envelope[b] = (max(-1.0, lo), min(1.0, hi), min(1.0, rms))
         else:
             for b in range(bins):
@@ -619,17 +773,23 @@ def extract_waveform_peaks(filepath, num_bins=2400, start_sec=None, end_sec=None
                 if not raw:
                     break
                 mono = decode_pcm_to_mono_float(raw, sw, nch, sfmt)
-                if mono:
-                    lo = 0.0
-                    hi = 0.0
-                    sum_sq = 0.0
-                    for s in mono:
-                        if s < lo:
-                            lo = s
-                        if s > hi:
-                            hi = s
-                        sum_sq += s * s
-                    rms = math.sqrt(sum_sq / float(len(mono)))
+                if len(mono) > 0:
+                    if use_np and isinstance(mono, _dsp.NP.ndarray):
+                        np = _dsp.NP
+                        lo = min(0.0, float(np.min(mono)))
+                        hi = max(0.0, float(np.max(mono)))
+                        rms = math.sqrt(float(np.dot(mono, mono)) / float(mono.size))
+                    else:
+                        lo = 0.0
+                        hi = 0.0
+                        sum_sq = 0.0
+                        for s in mono:
+                            if s < lo:
+                                lo = s
+                            if s > hi:
+                                hi = s
+                            sum_sq += s * s
+                        rms = math.sqrt(sum_sq / float(len(mono)))
                     envelope[b] = (max(-1.0, lo), min(1.0, hi), min(1.0, rms))
 
         return envelope, duration_sec
@@ -681,11 +841,19 @@ def mix_stereo_chunk(
 
     any_solo = any(snap.solo for snap in snapshots)
     use_c = _dsp is not None and _dsp.AVAILABLE
-    master_left = _dsp.alloc_f64(max_len) if use_c else [0.0] * max_len
-    master_right = _dsp.alloc_f64(max_len) if use_c else [0.0] * max_len
+    use_np = (not use_c) and (_dsp is not None and _dsp.USE_NUMPY)
     if use_c:
+        master_left = _dsp.alloc_f64(max_len)
+        master_right = _dsp.alloc_f64(max_len)
         ml_ptr = _dsp.f64_ptr(master_left)
         mr_ptr = _dsp.f64_ptr(master_right)
+    elif use_np:
+        np = _dsp.NP
+        master_left = np.zeros(max_len, dtype=np.float64)
+        master_right = np.zeros(max_len, dtype=np.float64)
+    else:
+        master_left = [0.0] * max_len
+        master_right = [0.0] * max_len
     half_pi = math.pi * 0.5
     sqrt2 = 1.4142135623730951
     inv_len = 1.0 / float(max_len)
@@ -713,15 +881,22 @@ def mix_stereo_chunk(
     prepared = []
     for i, snap in enumerate(snapshots):
         chunk = channel_chunks[i]
-        if not chunk:
+        if len(chunk) == 0:
             if snap.filepath and (snap.delay_enabled or snap.chorus_enabled):
-                samples = _dsp.alloc_f64(max_len) if use_c else [0.0] * max_len
+                if use_c:
+                    samples = _dsp.alloc_f64(max_len)
+                elif use_np:
+                    samples = np.zeros(max_len, dtype=np.float64)
+                else:
+                    samples = [0.0] * max_len
             else:
                 continue
         elif len(chunk) < max_len:
             pad_len = max_len - len(chunk)
             if use_c:
                 samples = _dsp.as_f64_array(chunk) + _dsp.alloc_f64(pad_len)
+            elif use_np:
+                samples = np.concatenate((np.asarray(chunk, dtype=np.float64), np.zeros(pad_len, dtype=np.float64)))
             else:
                 samples = list(chunk) + [0.0] * pad_len
         else:
@@ -730,7 +905,7 @@ def mix_stereo_chunk(
 
     has_parallel_fx = (
         fx_executor is not None
-        and use_c
+        and (use_c or use_np)
         and sum(
             1
             for _, s, _ in prepared
@@ -799,6 +974,14 @@ def mix_stereo_chunk(
                     None,
                     None,
                 )
+        elif use_np:
+            s_np = np.asarray(samples, dtype=np.float64)
+            master_left += s_np * l_gain
+            master_right += s_np * r_gain
+            if want_vu:
+                out_levels[i] = math.sqrt(float(np.dot(s_np, s_np)) * inv_len) * sqrt2 * abs_gain
+            if want_pk:
+                out_peaks[i] = float(np.max(np.abs(s_np))) * abs_gain
         elif want_vu or want_pk:
             sum_sq = 0.0
             ch_peak = 0.0
@@ -874,6 +1057,25 @@ def mix_stereo_chunk(
                     None,
                     None,
                 )
+            return out_f32.tobytes()
+
+        if use_np:
+            lv = master_left * pack_gain
+            rv = master_right * pack_gain
+            lv = np.where(np.isfinite(lv), lv, 0.0)
+            rv = np.where(np.isfinite(rv), rv, 0.0)
+            if want_m_vu:
+                out_master_levels[0] = math.sqrt(float(np.dot(lv, lv)) * inv_len) * sqrt2
+                out_master_levels[1] = math.sqrt(float(np.dot(rv, rv)) * inv_len) * sqrt2
+            if want_m_pk:
+                out_master_peaks[0] = float(np.max(np.abs(lv)))
+                out_master_peaks[1] = float(np.max(np.abs(rv)))
+            if clamp_flag:
+                lv = np.clip(lv, -1.0, 1.0)
+                rv = np.clip(rv, -1.0, 1.0)
+            out_f32 = np.empty(max_len * 2, dtype="<f4")
+            out_f32[0::2] = lv
+            out_f32[1::2] = rv
             return out_f32.tobytes()
 
         stereo_f32 = array.array("f", [0.0] * (max_len * 2))
@@ -967,6 +1169,55 @@ def mix_stereo_chunk(
                 None,
             )
         return out_u8.tobytes()
+
+    if use_np:
+        if bit_depth == 24:
+            scale, q_min, q_max = 8388608.0, -8388608.0, 8388607.0
+        elif bit_depth == 32:
+            scale, q_min, q_max = 2147483648.0, -2147483648.0, 2147483647.0
+        else:
+            scale, q_min, q_max = 32768.0, -32768.0, 32767.0
+
+        lv = master_left * pack_gain
+        rv = master_right * pack_gain
+        lv = np.where(np.isfinite(lv), lv, 0.0)
+        rv = np.where(np.isfinite(rv), rv, 0.0)
+        if want_m_vu:
+            out_master_levels[0] = math.sqrt(float(np.dot(lv, lv)) * inv_len) * sqrt2
+            out_master_levels[1] = math.sqrt(float(np.dot(rv, rv)) * inv_len) * sqrt2
+        if want_m_pk:
+            out_master_peaks[0] = float(np.max(np.abs(lv)))
+            out_master_peaks[1] = float(np.max(np.abs(rv)))
+
+        sl = np.clip(lv, -1.0, 1.0) * scale
+        sr = np.clip(rv, -1.0, 1.0) * scale
+        if use_dither:
+            if dither_rng is not None:
+                seed = int(dither_rng.value) & 0xFFFFFFFFFFFFFFFF
+                rng = np.random.default_rng(seed)
+                dither_rng.value = int(rng.integers(1, (1 << 63) - 1))
+            else:
+                rng = np.random.default_rng()
+            sl = sl + (rng.random(max_len) - rng.random(max_len))
+            sr = sr + (rng.random(max_len) - rng.random(max_len))
+
+        ql = np.clip(np.rint(sl), q_min, q_max)
+        qr = np.clip(np.rint(sr), q_min, q_max)
+
+        if bit_depth == 16:
+            out16 = np.empty(max_len * 2, dtype="<i2")
+            out16[0::2] = ql.astype(np.int16)
+            out16[1::2] = qr.astype(np.int16)
+            return out16.tobytes()
+        if bit_depth == 32:
+            out32 = np.empty(max_len * 2, dtype="<i4")
+            out32[0::2] = ql.astype(np.int32)
+            out32[1::2] = qr.astype(np.int32)
+            return out32.tobytes()
+        out32 = np.empty(max_len * 2, dtype="<i4")
+        out32[0::2] = ql.astype(np.int32)
+        out32[1::2] = qr.astype(np.int32)
+        return out32.view(np.uint8).reshape(max_len * 2, 4)[:, :3].tobytes()
 
     if bit_depth == 24:
         scale, q_min, q_max = 8388608.0, -8388608, 8388607
@@ -2133,10 +2384,43 @@ class Window:
         tb_layout.addStretch(1)
         body_layout.addWidget(transport_bay)
 
-        # Status screen
+        # Status screen + DSP backend indicator
+        status_hdr_row = QHBoxLayout()
+        status_hdr_row.setContentsMargins(0, 0, 0, 0)
+        status_hdr_row.setSpacing(6)
         s_lbl = QLabel("STATUS", body)
         s_lbl.setProperty("class", "sectionLbl")
-        body_layout.addWidget(s_lbl)
+        status_hdr_row.addWidget(s_lbl)
+        status_hdr_row.addStretch(1)
+
+        dsp_backend = getattr(_dsp, "BACKEND", "Python") if _dsp is not None else "Python"
+        dsp_detail = (
+            getattr(_dsp, "BACKEND_DETAIL", "Pure-Python DSP fallback")
+            if _dsp is not None
+            else "Pure-Python DSP fallback"
+        )
+        dsp_fg = (
+            "#48d18a" if dsp_backend == "C" else ("#63b3ed" if dsp_backend == "NumPy" else "#f6ad55")
+        )
+        dsp_border = (
+            "#2d6b4c" if dsp_backend == "C" else ("#2c5b82" if dsp_backend == "NumPy" else "#7a5429")
+        )
+        self.dsp_badge_label = QLabel(f"DSP: {dsp_backend}", body)
+        self.dsp_badge_label.setToolTip(dsp_detail)
+        self.dsp_badge_label.setStyleSheet(
+            f"background-color: {T['bg_well']}; color: {dsp_fg}; "
+            f"border: 1px solid {dsp_border}; border-radius: 3px; "
+            "padding: 1px 5px; font-size: 9px; font-weight: 700;"
+        )
+        self._themed_wells.append(
+            (
+                self.dsp_badge_label,
+                f"color: {dsp_fg}; border: 1px solid {dsp_border}; border-radius: 3px; "
+                "padding: 1px 5px; font-size: 9px; font-weight: 700;",
+            )
+        )
+        status_hdr_row.addWidget(self.dsp_badge_label)
+        body_layout.addLayout(status_hdr_row)
 
         self.status_label = QLabel("Ready", body)
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3142,7 +3426,7 @@ class Window:
                     if rdr is None:
                         continue
                     mono = rdr.read(self.buffer)
-                    if not mono:
+                    if len(mono) == 0:
                         continue
                     any_data = True
                     chunks[idx] = mono
@@ -3450,7 +3734,7 @@ class Window:
                         if rdr is None:
                             continue
                         mono = rdr.read(self.buffer)
-                        if not mono:
+                        if len(mono) == 0:
                             continue
                         any_data = True
                         chunks[idx] = mono
@@ -3738,7 +4022,8 @@ class Window:
         wav_handles = [None] * 4
         readers = [None] * 4
         use_c = _dsp is not None and _dsp.AVAILABLE
-        chunk_size = 65536 if use_c else 4096
+        use_np = (not use_c) and (_dsp is not None and _dsp.USE_NUMPY)
+        chunk_size = 65536 if (use_c or use_np) else 4096
         tail_step = 4096
         sample_format = (
             bounce_sample_format
@@ -3829,7 +4114,11 @@ class Window:
             out_fmt_arg = "float32" if sample_format == "float" else "pcm"
 
             cancelled = False
-            fx_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="BounceFX") if use_c else None
+            fx_pool = (
+                ThreadPoolExecutor(max_workers=4, thread_name_prefix="BounceFX")
+                if (use_c or use_np)
+                else None
+            )
             try:
                 with open_wav_write(
                     out_path, 2, int(session_rate), bit_depth=bit_depth, sample_format=sample_format
@@ -3847,7 +4136,7 @@ class Window:
                             if rdr is None:
                                 continue
                             mono = rdr.read(chunk_size)
-                            if not mono:
+                            if len(mono) == 0:
                                 continue
                             any_data = True
                             chunks[idx] = mono
@@ -3867,7 +4156,12 @@ class Window:
                             tail_chunk_len = min(tail_step, tail_frames_remaining)
                             tail_frames_remaining -= tail_chunk_len
                             tail_frames_emitted += tail_chunk_len
-                            zero_chunk = _dsp.alloc_f64(tail_chunk_len) if use_c else [0.0] * tail_chunk_len
+                            if use_c:
+                                zero_chunk = _dsp.alloc_f64(tail_chunk_len)
+                            elif use_np:
+                                zero_chunk = _dsp.alloc_np_f64(tail_chunk_len)
+                            else:
+                                zero_chunk = [0.0] * tail_chunk_len
                             for idx in delay_indices_init:
                                 chunks[idx] = zero_chunk
 
