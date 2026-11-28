@@ -1,7 +1,11 @@
 """
-Optional native C DSP accelerator loader (libminidaw_dsp.dylib / .so / .dll).
-Provides zero-copy ctypes bindings over array.array('d') / array.array('h')
-with graceful fallback to None when the shared library is unavailable.
+Optional DSP accelerator loader with 3-tier automatic fallback:
+  1. Native C shared library (libminidaw_dsp.dylib / .so / .dll) via ctypes
+  2. Vectorized NumPy fallback (if numpy is installed and C is unavailable)
+  3. Pure-Python fallback (zero external dependencies)
+
+Set environment variable MINIDAW_DSP_BACKEND=c|numpy|python|auto to override
+selection (primarily for testing and benchmarking).
 """
 import array
 import ctypes
@@ -243,8 +247,61 @@ def _load_library():
     return None, False, False
 
 
-LIB, HAS_FLOAT_IO, HAS_LIMITER = _load_library()
+def _init_backend():
+    pref = os.environ.get("MINIDAW_DSP_BACKEND", "auto").strip().lower()
+    if pref not in ("auto", "c", "numpy", "python"):
+        pref = "auto"
+
+    if pref in ("auto", "c"):
+        lib, has_float_io, has_limiter = _load_library()
+        if lib is not None:
+            return (
+                lib,
+                has_float_io,
+                has_limiter,
+                None,
+                "C",
+                "Native C DSP accelerator (libminidaw_dsp)",
+            )
+
+    if pref in ("auto", "c", "numpy"):
+        try:
+            import numpy as _np
+
+            return (
+                None,
+                False,
+                False,
+                _np,
+                "NumPy",
+                f"NumPy {getattr(_np, '__version__', '')} vectorized DSP fallback (native C library unavailable)".strip(),
+            )
+        except Exception:
+            pass
+
+    return (
+        None,
+        False,
+        False,
+        None,
+        "Python",
+        "Pure-Python DSP fallback (native C library and NumPy unavailable)",
+    )
+
+
+LIB, HAS_FLOAT_IO, HAS_LIMITER, NP, BACKEND, BACKEND_DETAIL = _init_backend()
 AVAILABLE = LIB is not None
+USE_NUMPY = (not AVAILABLE) and (NP is not None)
+
+
+def as_np_f64(samples):
+    """Return samples as a float64 NumPy ndarray without copying if already one."""
+    return NP.asarray(samples, dtype=NP.float64)
+
+
+def alloc_np_f64(n):
+    """Return a zero-initialized float64 NumPy ndarray of length n."""
+    return NP.zeros(n, dtype=NP.float64)
 
 
 def as_f64_array(samples):
