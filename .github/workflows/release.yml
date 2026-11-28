@@ -1,0 +1,136 @@
+name: Build & Release macOS Apps (Legacy Tkinter)
+
+on:
+  push:
+    tags:
+      - "v1.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional existing release tag to attach builds to (e.g. v1.4.1). Leave empty to only save workflow artifacts."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: Build Legacy macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13 (Tcl/Tk 8.6)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install PortAudio via Homebrew
+        run: |
+          brew install portaudio
+          echo "PORTAUDIO_PREFIX=$(brew --prefix portaudio)" >> "$GITHUB_ENV"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          CFLAGS="-I${PORTAUDIO_PREFIX}/include" \
+          LDFLAGS="-L${PORTAUDIO_PREFIX}/lib" \
+          pip install --no-cache-dir pyaudio pyinstaller
+
+      - name: Build universal C DSP library
+        run: |
+          clang -O3 -shared -fPIC -Wall -Wextra -Wconversion -Wshadow \
+            -arch x86_64 -arch arm64 \
+            -o libminidaw_dsp.dylib dsp_accel.c -lm
+          lipo -info libminidaw_dsp.dylib
+
+      - name: Smoke test C DSP & Tk 8.6 runtime
+        run: |
+          python -c "
+          import platform, tkinter, dsp_accel, pyaudio, window
+          print('Platform:', platform.machine(), '| Tk:', tkinter.TkVersion, '| Backend:', dsp_accel.BACKEND)
+          assert tkinter.TkVersion < 9.0, f'Expected Tk 8.6 for legacy UI sizing, got {tkinter.TkVersion}'
+          assert dsp_accel.BACKEND == 'C', f'Expected C backend, got {dsp_accel.BACKEND}'
+          assert dsp_accel.AVAILABLE and dsp_accel.HAS_FLOAT_IO and dsp_accel.HAS_LIMITER
+          print('Legacy Tkinter smoke test PASSED')
+          "
+
+      - name: Build Mini-DAW.app with PyInstaller
+        run: |
+          pyinstaller --clean --noconfirm Mini-DAW.spec
+
+      - name: Verify app bundle & package zip
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          BUNDLE_VER=$(plutil -extract CFBundleShortVersionString raw dist/Mini-DAW.app/Contents/Info.plist)
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME}"
+          elif [ -n "${INPUT_TAG}" ]; then
+            VERSION="${INPUT_TAG}"
+          else
+            VERSION="v${BUNDLE_VER}"
+          fi
+          echo "Packaging Legacy Mini-DAW ${VERSION} (bundle ${BUNDLE_VER}, arch ${ARCH})"
+
+          lipo -info dist/Mini-DAW.app/Contents/MacOS/Mini-DAW
+          lipo -info dist/Mini-DAW.app/Contents/Frameworks/libminidaw_dsp.dylib
+          lipo -info dist/Mini-DAW.app/Contents/Frameworks/libportaudio.dylib
+
+          # Confirm native executable matches runner architecture
+          file dist/Mini-DAW.app/Contents/MacOS/Mini-DAW | grep -q "${ARCH}"
+          # Confirm numpy was not accidentally bundled
+          test ! -d dist/Mini-DAW.app/Contents/Frameworks/numpy
+
+          ZIP_NAME="Mini-DAW-${VERSION}-macOS-${ARCH}.zip"
+          ditto -c -k --sequesterRsrc --keepParent dist/Mini-DAW.app "dist/${ZIP_NAME}"
+          ls -lh "dist/${ZIP_NAME}"
+          echo "ZIP_PATH=dist/${ZIP_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mini-DAW-legacy-macOS-${{ matrix.arch }}
+          path: ${{ env.ZIP_PATH }}
+          retention-days: 14
+
+  publish-release:
+    name: Attach assets to GitHub Release
+    needs: build-macos
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download macOS build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }}
+        run: |
+          ls -lh release-assets/
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" release-assets/*.zip --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${TAG}" release-assets/*.zip \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Mini-DAW ${TAG} — Legacy Tkinter Edition" \
+              --generate-notes \
+              --latest=false
+          fi
